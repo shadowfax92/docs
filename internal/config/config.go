@@ -13,17 +13,20 @@ type Config struct {
 	Token string `yaml:"token"`
 }
 
-func configDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "docs")
-}
-
-func configPath() string {
-	return filepath.Join(configDir(), "config.yaml")
+func configDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "docs"), nil
 }
 
 func Load() (*Config, error) {
-	data, err := os.ReadFile(configPath())
+	dir, err := configDir()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("config not found — run 'docs config' to set up")
@@ -41,12 +44,16 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) Save() error {
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
+	dir, err := configDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(), data, 0600)
+	return os.WriteFile(filepath.Join(dir, "config.yaml"), data, 0600)
 }

@@ -8,9 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/shadowfax/docs/internal/config"
 )
+
+var httpClient = &http.Client{Timeout: 2 * time.Minute}
 
 type Response struct {
 	URL string `json:"url"`
@@ -58,7 +61,7 @@ func Upload(cfg *config.Config, filePath string) (*Response, error) {
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Filename", filename)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)
 	}

@@ -3,17 +3,23 @@ interface Env {
   AUTH_TOKEN: string;
 }
 
-interface DocMeta {
-  filename: string;
-  contentType: string;
-  uploadedAt: string;
-}
-
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const bytes = new Uint8Array(8);
+  const bytes = new Uint8Array(10);
   crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
+  // Use rejection sampling to avoid modulo bias
+  let result = "";
+  for (const b of bytes) {
+    if (b < 248 && result.length < 8) {
+      result += chars[b % chars.length];
+    }
+  }
+  while (result.length < 8) {
+    const extra = new Uint8Array(1);
+    crypto.getRandomValues(extra);
+    if (extra[0] < 248) result += chars[extra[0] % chars.length];
+  }
+  return result;
 }
 
 function getContentType(filename: string): string {
@@ -33,13 +39,35 @@ function isMarkdown(filename: string): boolean {
   return ext === "md" || ext === "markdown";
 }
 
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^\w.\-]/g, "_");
+}
+
+async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(a);
+  const key = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode("verify"));
+  const check = await crypto.subtle.sign("HMAC", key, encoder.encode("verify"));
+  // Compare using the actual values
+  const aBytes = encoder.encode(a.padEnd(256));
+  const bBytes = encoder.encode(b.padEnd(256));
+  if (aBytes.length !== bBytes.length) return false;
+  let result = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    result |= aBytes[i] ^ bBytes[i];
+  }
+  return result === 0;
+}
+
 function markdownWrapper(markdown: string, title: string): string {
+  const safeTitle = title.replace(/[<>&"']/g, (c) => `&#${c.charCodeAt(0)};`);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
+  <title>${safeTitle}</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.6.1/github-markdown-light.min.css">
   <style>
     body {
@@ -61,6 +89,7 @@ function markdownWrapper(markdown: string, title: string): string {
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script>
     const raw = ${JSON.stringify(markdown)};
+    marked.setOptions({ breaks: true, gfm: true });
     document.getElementById('content').innerHTML = marked.parse(raw);
   </script>
 </body>
@@ -90,22 +119,28 @@ export default {
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
   const auth = request.headers.get("Authorization");
-  if (!auth || auth !== `Bearer ${env.AUTH_TOKEN}`) {
+  const expected = `Bearer ${env.AUTH_TOKEN}`;
+  if (!auth || !(await timingSafeEqual(auth, expected))) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  const filename = request.headers.get("X-Filename") || "file";
+  const rawFilename = request.headers.get("X-Filename") || "file";
+  const filename = sanitizeFilename(rawFilename);
   const contentType = request.headers.get("Content-Type") || getContentType(filename);
   const id = generateId();
   const key = `${id}/${filename}`;
 
-  await env.DOCS_BUCKET.put(key, request.body, {
-    customMetadata: {
-      filename,
-      contentType,
-      uploadedAt: new Date().toISOString(),
-    },
-  });
+  try {
+    await env.DOCS_BUCKET.put(key, request.body, {
+      customMetadata: {
+        filename,
+        contentType,
+        uploadedAt: new Date().toISOString(),
+      },
+    });
+  } catch {
+    return new Response("Storage error", { status: 500 });
+  }
 
   const baseUrl = new URL(request.url).origin;
   return Response.json({
@@ -115,7 +150,12 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleGet(id: string, env: Env): Promise<Response> {
-  const list = await env.DOCS_BUCKET.list({ prefix: `${id}/` });
+  let list;
+  try {
+    list = await env.DOCS_BUCKET.list({ prefix: `${id}/` });
+  } catch {
+    return new Response("Storage error", { status: 500 });
+  }
   if (!list.objects.length) {
     return new Response("Not found", { status: 404 });
   }
@@ -125,9 +165,9 @@ async function handleGet(id: string, env: Env): Promise<Response> {
     return new Response("Not found", { status: 404 });
   }
 
-  const meta = obj.customMetadata as unknown as DocMeta;
-  const filename = meta?.filename || list.objects[0].key.split("/").pop() || "file";
-  const contentType = meta?.contentType || getContentType(filename);
+  const meta = obj.customMetadata ?? {};
+  const filename = meta.filename || list.objects[0].key.split("/").pop() || "file";
+  const contentType = meta.contentType || getContentType(filename);
 
   if (isMarkdown(filename)) {
     const text = await obj.text();
@@ -144,7 +184,7 @@ async function handleGet(id: string, env: Env): Promise<Response> {
   headers.set("Content-Type", contentType);
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
   if (contentType === "application/pdf") {
-    headers.set("Content-Disposition", `inline; filename="${filename}"`);
+    headers.set("Content-Disposition", `inline; filename="${sanitizeFilename(filename)}"`);
   }
 
   return new Response(obj.body, { headers });

@@ -48,25 +48,28 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	copyToClipboard(resp.URL)
-
 	green := color.New(color.FgGreen, color.Bold)
 	green.Println(resp.URL)
-	color.New(color.FgHiBlack).Fprintln(os.Stderr, "Copied to clipboard")
+
+	if err := copyToClipboard(resp.URL); err != nil {
+		color.New(color.FgYellow).Fprintln(os.Stderr, "Could not copy to clipboard")
+	} else {
+		color.New(color.FgHiBlack).Fprintln(os.Stderr, "Copied to clipboard")
+	}
 
 	return nil
 }
 
-func copyToClipboard(text string) {
-	var cmd *exec.Cmd
+func copyToClipboard(text string) error {
+	var c *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("pbcopy")
+		c = exec.Command("pbcopy")
 	case "linux":
-		cmd = exec.Command("xclip", "-selection", "clipboard")
+		c = exec.Command("xclip", "-selection", "clipboard")
 	default:
-		return
+		return fmt.Errorf("unsupported platform")
 	}
-	cmd.Stdin = strings.NewReader(text)
-	_ = cmd.Run()
+	c.Stdin = strings.NewReader(text)
+	return c.Run()
 }
