@@ -4,6 +4,6 @@ compatibility_date = "2024-12-01"
 
 [[r2_buckets]]
 binding = "DOCS_BUCKET"
-bucket_name = "docs"
+bucket_name = "docs-cli"
 
 # Set AUTH_TOKEN via: npx wrangler secret put AUTH_TOKEN
