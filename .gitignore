@@ -5,3 +5,4 @@ worker/node_modules/
 worker/dist/
 worker/.wrangler/
 .DS_Store
+**/*.env
