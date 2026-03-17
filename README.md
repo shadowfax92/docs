@@ -1,6 +1,6 @@
 <div align="center">
 
-# docs
+# 📎 docs
 
 **Share documents with short, clean URLs.**
 
