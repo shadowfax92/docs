@@ -14,6 +14,8 @@ import (
 	"github.com/shadowfax/docs/internal/upload"
 )
 
+var docName string
+
 var uploadCmd = &cobra.Command{
 	Use:   "upload <file>",
 	Short: "Upload a file and get a short URL",
@@ -22,6 +24,7 @@ var uploadCmd = &cobra.Command{
 }
 
 func init() {
+	uploadCmd.Flags().StringVarP(&docName, "name", "n", "", "document name shown in link previews")
 	rootCmd.AddCommand(uploadCmd)
 }
 
@@ -43,7 +46,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 
 	color.New(color.FgCyan).Fprintf(os.Stderr, "Uploading %s...\n", filePath)
 
-	resp, err := upload.Upload(cfg, filePath)
+	resp, err := upload.Upload(cfg, filePath, docName)
 	if err != nil {
 		return err
 	}

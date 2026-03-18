@@ -38,7 +38,7 @@ func IsSupported(filename string) bool {
 	return ok
 }
 
-func Upload(cfg *config.Config, filePath string) (*Response, error) {
+func Upload(cfg *config.Config, filePath string, docName string) (*Response, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file: %w", err)
@@ -60,6 +60,9 @@ func Upload(cfg *config.Config, filePath string) (*Response, error) {
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Filename", filename)
+	if docName != "" {
+		req.Header.Set("X-Doc-Name", docName)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
