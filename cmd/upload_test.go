@@ -42,9 +42,12 @@ func TestRunUploadAcceptsMarkdownDirectory(t *testing.T) {
 
 	writeUploadConfig(t, server.URL, "secret")
 	previousDocName := docName
+	previousFolderUpload := folderUpload
 	docName = "Folder Docs"
+	folderUpload = true
 	t.Cleanup(func() {
 		docName = previousDocName
+		folderUpload = previousFolderUpload
 	})
 
 	if err := runUpload(nil, []string{sourceDir}); err != nil {
@@ -58,6 +61,25 @@ func TestRunUploadAcceptsMarkdownDirectory(t *testing.T) {
 	}
 	if strings.Contains(uploaded, "ignored") {
 		t.Fatalf("uploaded markdown included non-markdown file:\n%s", uploaded)
+	}
+}
+
+func TestRunUploadRequiresFolderFlagForDirectory(t *testing.T) {
+	sourceDir := t.TempDir()
+	writeUploadTestFile(t, filepath.Join(sourceDir, "intro.md"), "hello\n")
+
+	previousFolderUpload := folderUpload
+	folderUpload = false
+	t.Cleanup(func() {
+		folderUpload = previousFolderUpload
+	})
+
+	err := runUpload(nil, []string{sourceDir})
+	if err == nil {
+		t.Fatal("runUpload returned nil error")
+	}
+	if !strings.Contains(err.Error(), "pass --folder") {
+		t.Fatalf("error = %q, want --folder guidance", err.Error())
 	}
 }
 

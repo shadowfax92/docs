@@ -16,16 +16,18 @@ import (
 )
 
 var docName string
+var folderUpload bool
 
 var uploadCmd = &cobra.Command{
-	Use:   "upload <file-or-markdown-folder>",
-	Short: "Upload a file or Markdown folder and get a short URL",
+	Use:   "upload [--folder] <file-or-markdown-folder>",
+	Short: "Upload a file or combine a Markdown folder and get a short URL",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runUpload,
 }
 
 func init() {
 	uploadCmd.Flags().StringVarP(&docName, "name", "n", "", "document name shown in link previews")
+	uploadCmd.Flags().BoolVar(&folderUpload, "folder", false, "recursively combine a Markdown folder before uploading")
 	rootCmd.AddCommand(uploadCmd)
 }
 
@@ -42,6 +44,12 @@ func runUpload(cmd *cobra.Command, args []string) error {
 
 	if !info.IsDir() && !upload.IsSupported(filePath) {
 		return fmt.Errorf("unsupported file type (supported: pdf, html, md)")
+	}
+	if info.IsDir() && !folderUpload {
+		return fmt.Errorf("%s is a directory; pass --folder to combine markdown files", filePath)
+	}
+	if !info.IsDir() && folderUpload {
+		return fmt.Errorf("--folder requires a directory")
 	}
 
 	cfg, err := config.Load()

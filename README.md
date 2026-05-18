@@ -65,13 +65,13 @@ token: your-auth-token
 docs upload report.pdf           # upload PDF, get short URL
 docs upload page.html            # upload HTML page
 docs upload notes.md             # upload Markdown (rendered with GitHub CSS)
-docs upload ./guides             # combine Markdown files recursively
-docs upload ./guides --name Docs # set link preview title
+docs upload --folder ./guides    # combine Markdown files recursively
+docs upload --folder ./guides --name Docs # set link preview title
 ```
 
 The URL is printed and copied to your clipboard automatically.
 
-When uploading a directory, `docs` recursively collects `.md` and `.markdown` files, ignores other files, sorts by relative path, and uploads one generated Markdown document. The generated document starts with a table of contents that mirrors the folder hierarchy and links to each file section.
+When uploading a directory with `--folder`, `docs` recursively collects `.md` and `.markdown` files, ignores other files, sorts by relative path, and uploads one generated Markdown document. The generated document starts with a table of contents that mirrors the folder hierarchy and links to each file section.
 
 ## Supported Uploads
 
@@ -80,7 +80,7 @@ When uploading a directory, `docs` recursively collects `.md` and `.markdown` fi
 | `.pdf` | Displayed inline in browser's PDF viewer |
 | `.html`, `.htm` | Served as-is with original formatting |
 | `.md`, `.markdown` | Rendered with GitHub-flavored Markdown (light theme) |
-| Directory containing `.md` / `.markdown` files | Combined into one Markdown page with a linked table of contents |
+| Directory containing `.md` / `.markdown` files, with `--folder` | Combined into one Markdown page with a linked table of contents |
 
 ## How It Works
 
@@ -111,7 +111,8 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 
 | Command | Description |
 |---------|-------------|
-| `docs upload <file-or-markdown-folder>` | Upload a file or Markdown folder and get a short URL |
+| `docs upload <file>` | Upload a file and get a short URL |
+| `docs upload --folder <markdown-folder>` | Combine and upload a Markdown folder |
 | `docs config` | Set worker URL and auth token |
 | `docs help` | Show help |
 
