@@ -52,8 +52,13 @@ func Upload(cfg *config.Config, filePath string, docName string) (*Response, err
 		return nil, fmt.Errorf("unsupported file type: %s (supported: pdf, html, md)", ext)
 	}
 
+	return UploadContent(cfg, filename, contentType, f, docName)
+}
+
+// UploadContent sends an already-prepared document body through the upload API.
+func UploadContent(cfg *config.Config, filename string, contentType string, content io.Reader, docName string) (*Response, error) {
 	url := strings.TrimRight(cfg.URL, "/") + "/upload"
-	req, err := http.NewRequest(http.MethodPut, url, f)
+	req, err := http.NewRequest(http.MethodPut, url, content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
