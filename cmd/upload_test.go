@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -124,7 +125,60 @@ func TestRunUploadAcceptsArbitraryRegularFile(t *testing.T) {
 	}
 }
 
+func TestRunUploadRecordsHistory(t *testing.T) {
+	sourceDir := t.TempDir()
+	filePath := filepath.Join(sourceDir, "notes.md")
+	if err := os.WriteFile(filePath, []byte("# Notes\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"url":"https://example.test/notes","id":"notes"}`))
+	}))
+	defer server.Close()
+
+	home := writeUploadConfigWithHome(t, server.URL, "secret")
+	previousDocName := docName
+	previousFolderUpload := folderUpload
+	docName = "Project Notes"
+	folderUpload = false
+	t.Cleanup(func() {
+		docName = previousDocName
+		folderUpload = previousFolderUpload
+	})
+
+	if err := runUpload(nil, []string{filePath}); err != nil {
+		t.Fatalf("runUpload returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
+	if err != nil {
+		t.Fatalf("ReadFile uploads.json: %v", err)
+	}
+	var entries []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+		ID   string `json:"id"`
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal uploads.json: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	if entries[0].Name != "Project Notes" || entries[0].URL != "https://example.test/notes" || entries[0].ID != "notes" || entries[0].Path != filePath {
+		t.Fatalf("entry = %+v, want recorded upload", entries[0])
+	}
+}
+
 func writeUploadConfig(t *testing.T, url string, token string) {
+	t.Helper()
+	_ = writeUploadConfigWithHome(t, url, token)
+}
+
+func writeUploadConfigWithHome(t *testing.T, url string, token string) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -136,6 +190,7 @@ func writeUploadConfig(t *testing.T, url string, token string) {
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(config), 0o600); err != nil {
 		t.Fatalf("WriteFile config: %v", err)
 	}
+	return home
 }
 
 func writeUploadTestFile(t *testing.T, path string, contents string) {

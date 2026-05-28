@@ -69,11 +69,15 @@ docs upload notes.md             # upload Markdown (rendered with GitHub CSS)
 docs upload archive.zip          # upload any file with a download page
 docs upload --folder ./guides    # combine Markdown files recursively
 docs upload --folder ./guides --name Docs # set link preview title
+docs list                        # show the last 10 uploads
+docs list --days 30              # show uploads from the last 30 days
 ```
 
 The URL is printed and copied to your clipboard automatically.
 
 When uploading a directory with `--folder`, `docs` recursively collects `.md` and `.markdown` files, ignores other files, sorts by relative path, and uploads one generated Markdown document. The generated document starts with a table of contents that mirrors the folder hierarchy and links to each file section.
+
+Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history file stores the upload time, display name, URL, ID, and source path. If history recording fails, the upload still succeeds.
 
 ## Supported Uploads
 
@@ -117,6 +121,8 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 |---------|-------------|
 | `docs upload <file>` | Upload a file and get a short URL |
 | `docs upload --folder <markdown-folder>` | Combine and upload a Markdown folder |
+| `docs list` | Show the last 10 uploads |
+| `docs list --days <n>` | Show uploads from the last `n` days |
 | `docs config` | Set worker URL and auth token |
 | `docs help` | Show help |
 

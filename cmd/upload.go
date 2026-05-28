@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
 	"github.com/shadowfax/docs/internal/config"
+	"github.com/shadowfax/docs/internal/history"
 	"github.com/shadowfax/docs/internal/markdown"
 	"github.com/shadowfax/docs/internal/upload"
 )
@@ -73,6 +76,10 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		color.New(color.FgHiBlack).Fprintln(os.Stderr, "Copied to clipboard")
 	}
 
+	if err := recordUploadHistory(filePath, info, docName, resp); err != nil {
+		color.New(color.FgYellow).Fprintln(os.Stderr, "Could not record upload history")
+	}
+
 	return nil
 }
 
@@ -87,6 +94,30 @@ func uploadPath(cfg *config.Config, filePath string, info os.FileInfo, docName s
 	}
 	filename := markdown.CombinedFilename(filePath)
 	return upload.UploadContent(cfg, filename, "text/markdown", strings.NewReader(combined), docName)
+}
+
+func recordUploadHistory(filePath string, info os.FileInfo, docName string, resp *upload.Response) error {
+	store, err := history.NewDefaultStore()
+	if err != nil {
+		return err
+	}
+	return store.Append(history.Entry{
+		UploadedAt: time.Now().UTC(),
+		Name:       uploadHistoryName(filePath, info, docName),
+		URL:        resp.URL,
+		ID:         resp.ID,
+		Path:       filePath,
+	})
+}
+
+func uploadHistoryName(filePath string, info os.FileInfo, docName string) string {
+	if docName != "" {
+		return docName
+	}
+	if info.IsDir() {
+		return markdown.CombinedFilename(filePath)
+	}
+	return filepath.Base(filePath)
 }
 
 func copyToClipboard(text string) error {
