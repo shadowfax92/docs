@@ -46,6 +46,11 @@ function isPdf(filename: string): boolean {
   return fileExt(filename) === "pdf";
 }
 
+function isHtml(filename: string): boolean {
+  const ext = fileExt(filename);
+  return ext === "html" || ext === "htm";
+}
+
 function sanitizeFilename(name: string): string {
   return name.replace(/[^\w.\-]/g, "_");
 }
@@ -56,6 +61,22 @@ function escapeHtml(s: string): string {
 
 function titleFromFilename(filename: string): string {
   return filename.replace(/\.[^.]+$/, "").replace(/[_-]/g, " ");
+}
+
+function formatBytes(size: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  if (unit === 0) return `${value} ${units[unit]}`;
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+function contentDisposition(disposition: "inline" | "attachment", filename: string): string {
+  return `${disposition}; filename="${sanitizeFilename(filename)}"`;
 }
 
 async function timingSafeEqual(a: string, b: string): Promise<boolean> {
@@ -151,6 +172,88 @@ ${ogTags(pageUrl, title, desc, "article")}
 </html>`;
 }
 
+function downloadWrapper(filename: string, title: string, pageUrl: string, contentType: string, size: number, downloadUrl: string): string {
+  const safeTitle = escapeHtml(title);
+  const safeFilename = escapeHtml(filename);
+  const safeType = escapeHtml(contentType);
+  const safeSize = escapeHtml(formatBytes(size));
+  const safeDownloadUrl = escapeHtml(downloadUrl);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${safeTitle}</title>
+${ogTags(pageUrl, title, `Download ${filename}`, "article")}
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #f6f8fa;
+      color: #1f2328;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    main {
+      width: min(100%, 520px);
+      padding: 28px;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 12px 32px rgba(31, 35, 40, 0.08);
+    }
+    h1 {
+      margin: 0 0 16px;
+      font-size: 20px;
+      line-height: 1.3;
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 8px 16px;
+      margin: 0 0 24px;
+      font-size: 14px;
+    }
+    dt { color: #59636e; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 16px;
+      border-radius: 6px;
+      background: #0969da;
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    a:hover { background: #0757b8; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${safeTitle}</h1>
+    <dl>
+      <dt>File</dt>
+      <dd>${safeFilename}</dd>
+      <dt>Type</dt>
+      <dd>${safeType}</dd>
+      <dt>Size</dt>
+      <dd>${safeSize}</dd>
+    </dl>
+    <a href="${safeDownloadUrl}">Download</a>
+  </main>
+</body>
+</html>`;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -171,8 +274,12 @@ export default {
     const parts = path.split("/");
     const id = parts[0];
     const isRaw = parts[1] === "raw";
+    const isDownload = parts[1] === "download";
+    if (parts.length > 2 || (parts[1] && !isRaw && !isDownload)) {
+      return new Response("Not found", { status: 404 });
+    }
 
-    return handleGet(id, isRaw, url.origin, env);
+    return handleGet(id, isRaw, isDownload, url.origin, env);
   },
 } satisfies ExportedHandler<Env>;
 
@@ -210,7 +317,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleGet(id: string, raw: boolean, origin: string, env: Env): Promise<Response> {
+async function handleGet(id: string, raw: boolean, download: boolean, origin: string, env: Env): Promise<Response> {
   let list;
   try {
     list = await env.DOCS_BUCKET.list({ prefix: `${id}/` });
@@ -232,13 +339,11 @@ async function handleGet(id: string, raw: boolean, origin: string, env: Env): Pr
   const title = meta.docName || titleFromFilename(filename);
   const pageUrl = `${origin}/${id}`;
 
-  if (raw) {
+  if (raw || download) {
     const headers = new Headers();
     headers.set("Content-Type", contentType);
     headers.set("Cache-Control", "public, max-age=31536000, immutable");
-    if (isPdf(filename)) {
-      headers.set("Content-Disposition", `inline; filename="${sanitizeFilename(filename)}"`);
-    }
+    headers.set("Content-Disposition", contentDisposition(download ? "attachment" : "inline", filename));
     return new Response(obj.body, { headers });
   }
 
@@ -264,9 +369,19 @@ async function handleGet(id: string, raw: boolean, origin: string, env: Env): Pr
     });
   }
 
-  // HTML and other files: serve as-is
-  const headers = new Headers();
-  headers.set("Content-Type", contentType);
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
-  return new Response(obj.body, { headers });
+  if (isHtml(filename)) {
+    const headers = new Headers();
+    headers.set("Content-Type", contentType);
+    headers.set("Cache-Control", "public, max-age=31536000, immutable");
+    return new Response(obj.body, { headers });
+  }
+
+  const downloadUrl = `${origin}/${id}/download`;
+  const html = downloadWrapper(filename, title, pageUrl, contentType, obj.size, downloadUrl);
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
 }

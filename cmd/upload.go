@@ -42,14 +42,14 @@ func runUpload(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot access %s: %w", filePath, err)
 	}
 
-	if !info.IsDir() && !upload.IsSupported(filePath) {
-		return fmt.Errorf("unsupported file type (supported: pdf, html, md)")
-	}
 	if info.IsDir() && !folderUpload {
 		return fmt.Errorf("%s is a directory; pass --folder to combine markdown files", filePath)
 	}
 	if !info.IsDir() && folderUpload {
 		return fmt.Errorf("--folder requires a directory")
+	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", filePath)
 	}
 
 	cfg, err := config.Load()

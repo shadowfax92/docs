@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,16 +29,6 @@ var extToContentType = map[string]string{
 	".markdown": "text/markdown",
 }
 
-func SupportedExtensions() []string {
-	return []string{".pdf", ".html", ".htm", ".md", ".markdown"}
-}
-
-func IsSupported(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	_, ok := extToContentType[ext]
-	return ok
-}
-
 func Upload(cfg *config.Config, filePath string, docName string) (*Response, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -46,13 +37,36 @@ func Upload(cfg *config.Config, filePath string, docName string) (*Response, err
 	defer f.Close()
 
 	filename := filepath.Base(filePath)
-	ext := strings.ToLower(filepath.Ext(filename))
-	contentType, ok := extToContentType[ext]
-	if !ok {
-		return nil, fmt.Errorf("unsupported file type: %s (supported: pdf, html, md)", ext)
+	contentType, err := detectContentType(filename, f)
+	if err != nil {
+		return nil, err
 	}
 
 	return UploadContent(cfg, filename, contentType, f, docName)
+}
+
+// detectContentType chooses renderable document types by extension, then falls back to standard MIME detection for arbitrary downloads.
+func detectContentType(filename string, f *os.File) (string, error) {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if contentType, ok := extToContentType[ext]; ok {
+		return contentType, nil
+	}
+	if contentType := mime.TypeByExtension(ext); contentType != "" {
+		return contentType, nil
+	}
+
+	var sample [512]byte
+	n, err := f.Read(sample[:])
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("failed to detect content type: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("failed to rewind file: %w", err)
+	}
+	if n == 0 {
+		return "application/octet-stream", nil
+	}
+	return http.DetectContentType(sample[:n]), nil
 }
 
 // UploadContent sends an already-prepared document body through the upload API.

@@ -83,6 +83,47 @@ func TestRunUploadRequiresFolderFlagForDirectory(t *testing.T) {
 	}
 }
 
+func TestRunUploadAcceptsArbitraryRegularFile(t *testing.T) {
+	sourceDir := t.TempDir()
+	filePath := filepath.Join(sourceDir, "archive.unknown")
+	if err := os.WriteFile(filePath, []byte{0, 1, 2, 3, 4}, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Content-Type") != "application/octet-stream" {
+			t.Fatalf("Content-Type = %q, want application/octet-stream", r.Header.Get("Content-Type"))
+		}
+		if r.Header.Get("X-Filename") != "archive.unknown" {
+			t.Fatalf("X-Filename = %q, want archive.unknown", r.Header.Get("X-Filename"))
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(body) != string([]byte{0, 1, 2, 3, 4}) {
+			t.Fatalf("body = %v, want uploaded bytes", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"url":"https://example.test/file","id":"file"}`))
+	}))
+	defer server.Close()
+
+	writeUploadConfig(t, server.URL, "secret")
+	previousDocName := docName
+	previousFolderUpload := folderUpload
+	docName = ""
+	folderUpload = false
+	t.Cleanup(func() {
+		docName = previousDocName
+		folderUpload = previousFolderUpload
+	})
+
+	if err := runUpload(nil, []string{filePath}); err != nil {
+		t.Fatalf("runUpload returned error: %v", err)
+	}
+}
+
 func writeUploadConfig(t *testing.T, url string, token string) {
 	t.Helper()
 	home := t.TempDir()

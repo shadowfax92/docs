@@ -6,8 +6,8 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:          "docs",
-	Short:        "Share documents with short URLs",
-	Long:         "Upload PDFs, HTML files, Markdown files, and Markdown folders to get a short, shareable URL that renders in the browser.",
+	Short:        "Share files with short URLs",
+	Long:         "Upload files and Markdown folders to get a short, shareable URL. Renderable documents open in the browser; other files get a download page.",
 	SilenceUsage: true,
 }
 

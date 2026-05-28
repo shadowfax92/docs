@@ -2,16 +2,17 @@
 
 # 📎 docs
 
-**Share documents with short, clean URLs.**
+**Share files with short, clean URLs.**
 
 *One command. File or Markdown folder uploaded, link in your clipboard.*
 
 </div>
 
-Upload a PDF, HTML file, Markdown file, or Markdown folder and get a short URL that renders directly in the browser. No login walls, no download prompts, no ugly Google Drive links.
+Upload any regular file, HTML page, Markdown file, PDF, or Markdown folder and get a short URL. Renderable documents open directly in the browser; everything else gets a clean download page.
 
 - **One command** — `docs upload report.pdf` → short URL copied to clipboard
-- **Renders in browser** — PDFs display inline, HTML served as-is, Markdown rendered with GitHub styling
+- **Renders when it can** — PDFs display inline, HTML serves as-is, Markdown renders with GitHub styling
+- **Downloads when it should** — unknown file types show a download page instead of raw bytes
 - **Folder-friendly Markdown** — point at a docs folder to publish one combined page with a clickable table of contents
 - **Short URLs** — `https://your-domain.com/xK9mRt2p` — clean and shareable
 - **Fast & global** — served from Cloudflare's edge network via R2 + Workers
@@ -65,6 +66,7 @@ token: your-auth-token
 docs upload report.pdf           # upload PDF, get short URL
 docs upload page.html            # upload HTML page
 docs upload notes.md             # upload Markdown (rendered with GitHub CSS)
+docs upload archive.zip          # upload any file with a download page
 docs upload --folder ./guides    # combine Markdown files recursively
 docs upload --folder ./guides --name Docs # set link preview title
 ```
@@ -80,6 +82,7 @@ When uploading a directory with `--folder`, `docs` recursively collects `.md` an
 | `.pdf` | Displayed inline in browser's PDF viewer |
 | `.html`, `.htm` | Served as-is with original formatting |
 | `.md`, `.markdown` | Rendered with GitHub-flavored Markdown (light theme) |
+| Any other regular file | Download page with filename, type, and size |
 | Directory containing `.md` / `.markdown` files, with `--folder` | Combined into one Markdown page with a linked table of contents |
 
 ## How It Works
@@ -105,7 +108,8 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 - CLI sends the file, or generated Markdown folder document, to the Worker with a bearer token
 - Worker generates an 8-character short ID, stores the file in R2
 - Worker returns the short URL, CLI copies it to clipboard
-- Anyone with the URL can view the document — no auth required
+- Anyone with the URL can view or download the file — no auth required
+- `/raw` serves the stored object inline; `/download` serves it as an attachment
 
 ## Commands
 
