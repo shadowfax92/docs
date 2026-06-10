@@ -13,24 +13,26 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/shadowfax/docs/internal/config"
+	"github.com/shadowfax/docs/internal/folderarchive"
 	"github.com/shadowfax/docs/internal/history"
-	"github.com/shadowfax/docs/internal/markdown"
 	"github.com/shadowfax/docs/internal/upload"
 )
+
+const maxFolderUploadBytes int64 = 200 * 1024 * 1024
 
 var docName string
 var folderUpload bool
 
 var uploadCmd = &cobra.Command{
-	Use:   "upload [--folder] <file-or-markdown-folder>",
-	Short: "Upload a file or combine a Markdown folder and get a short URL",
+	Use:   "upload [--folder] <file-or-folder>",
+	Short: "Upload a file or folder and get a short URL",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runUpload,
 }
 
 func init() {
 	uploadCmd.Flags().StringVarP(&docName, "name", "n", "", "document name shown in link previews")
-	uploadCmd.Flags().BoolVar(&folderUpload, "folder", false, "recursively combine a Markdown folder before uploading")
+	uploadCmd.Flags().BoolVar(&folderUpload, "folder", false, "recursively archive a folder before uploading")
 	rootCmd.AddCommand(uploadCmd)
 }
 
@@ -46,7 +48,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	}
 
 	if info.IsDir() && !folderUpload {
-		return fmt.Errorf("%s is a directory; pass --folder to combine markdown files", filePath)
+		return fmt.Errorf("%s is a directory; pass --folder to upload it", filePath)
 	}
 	if !info.IsDir() && folderUpload {
 		return fmt.Errorf("--folder requires a directory")
@@ -83,17 +85,17 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// uploadPath routes files and Markdown directories through the shared upload API.
+// uploadPath routes files and archived directories through the shared upload API.
 func uploadPath(cfg *config.Config, filePath string, info os.FileInfo, docName string) (*upload.Response, error) {
 	if !info.IsDir() {
 		return upload.Upload(cfg, filePath, docName)
 	}
-	combined, err := markdown.CombineDirectory(filePath)
+	archive, err := folderarchive.New(filePath, maxFolderUploadBytes)
 	if err != nil {
 		return nil, err
 	}
-	filename := markdown.CombinedFilename(filePath)
-	return upload.UploadContent(cfg, filename, "text/markdown", strings.NewReader(combined), docName)
+	defer archive.Content.Close()
+	return upload.UploadContent(cfg, archive.Filename, "application/zip", archive.Content, docName)
 }
 
 func recordUploadHistory(filePath string, info os.FileInfo, docName string, resp *upload.Response) error {
@@ -115,7 +117,7 @@ func uploadHistoryName(filePath string, info os.FileInfo, docName string) string
 		return docName
 	}
 	if info.IsDir() {
-		return markdown.CombinedFilename(filePath)
+		return folderarchive.Filename(filePath)
 	}
 	return filepath.Base(filePath)
 }
