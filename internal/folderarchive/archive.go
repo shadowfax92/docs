@@ -102,8 +102,15 @@ func collectFiles(root string, maxUncompressedBytes int64) ([]archiveFile, error
 func writeZip(w io.Writer, files []archiveFile) error {
 	zipWriter := zip.NewWriter(w)
 	for _, file := range files {
+		src, err := openValidatedFile(file)
+		if err != nil {
+			_ = zipWriter.Close()
+			return err
+		}
+
 		header, err := zip.FileInfoHeader(file.info)
 		if err != nil {
+			_ = src.Close()
 			_ = zipWriter.Close()
 			return fmt.Errorf("create zip header for %s: %w", file.relativePath, err)
 		}
@@ -112,10 +119,11 @@ func writeZip(w io.Writer, files []archiveFile) error {
 
 		dst, err := zipWriter.CreateHeader(header)
 		if err != nil {
+			_ = src.Close()
 			_ = zipWriter.Close()
 			return fmt.Errorf("create zip entry for %s: %w", file.relativePath, err)
 		}
-		if err := copyFile(dst, file); err != nil {
+		if err := copyFile(dst, src, file); err != nil {
 			_ = zipWriter.Close()
 			return err
 		}
@@ -123,18 +131,35 @@ func writeZip(w io.Writer, files []archiveFile) error {
 	return zipWriter.Close()
 }
 
-func copyFile(dst io.Writer, file archiveFile) error {
+func openValidatedFile(file archiveFile) (*os.File, error) {
 	src, err := os.Open(file.absolutePath)
 	if err != nil {
-		return fmt.Errorf("open %s: %w", file.relativePath, err)
+		return nil, fmt.Errorf("open %s: %w", file.relativePath, err)
 	}
-	_, copyErr := io.Copy(dst, src)
+	info, err := src.Stat()
+	if err != nil {
+		_ = src.Close()
+		return nil, fmt.Errorf("stat %s: %w", file.relativePath, err)
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(file.info, info) || info.Size() != file.info.Size() {
+		_ = src.Close()
+		return nil, fmt.Errorf("%s changed during archive", file.relativePath)
+	}
+	return src, nil
+}
+
+func copyFile(dst io.Writer, src *os.File, file archiveFile) error {
+	limit := &io.LimitedReader{R: src, N: file.info.Size() + 1}
+	n, copyErr := io.Copy(dst, limit)
 	closeErr := src.Close()
 	if copyErr != nil {
 		return fmt.Errorf("copy %s: %w", file.relativePath, copyErr)
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close %s: %w", file.relativePath, closeErr)
+	}
+	if n != file.info.Size() {
+		return fmt.Errorf("%s changed during archive", file.relativePath)
 	}
 	return nil
 }

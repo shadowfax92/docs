@@ -108,6 +108,26 @@ func TestNewRejectsNonRegularFiles(t *testing.T) {
 	}
 }
 
+func TestWriteZipRejectsFileChangedAfterScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file.txt")
+	writeTestFile(t, path, "small")
+
+	files, err := collectFiles(dir, 1024)
+	if err != nil {
+		t.Fatalf("collectFiles returned error: %v", err)
+	}
+	writeTestFile(t, path, "larger contents")
+
+	err = writeZip(io.Discard, files)
+	if err == nil {
+		t.Fatal("writeZip returned nil error")
+	}
+	if !strings.Contains(err.Error(), "changed during archive") {
+		t.Fatalf("error = %q, want changed-file error", err.Error())
+	}
+}
+
 func readZipEntries(t *testing.T, r io.Reader) map[string]string {
 	t.Helper()
 	data, err := io.ReadAll(r)
