@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,22 +13,21 @@ import (
 	"testing"
 )
 
-func TestRunUploadAcceptsMarkdownDirectory(t *testing.T) {
+func TestRunUploadAcceptsFolderArchive(t *testing.T) {
 	sourceDir := t.TempDir()
 	writeUploadTestFile(t, filepath.Join(sourceDir, "intro.md"), "hello\n")
-	writeUploadTestFile(t, filepath.Join(sourceDir, "nested", "guide.md"), "world\n")
-	writeUploadTestFile(t, filepath.Join(sourceDir, "nested", "skip.txt"), "ignored\n")
+	writeUploadTestFile(t, filepath.Join(sourceDir, "nested", "image.bin"), "\x00\x01\x02")
+	writeUploadTestFile(t, filepath.Join(sourceDir, "nested", "notes.txt"), "plain text\n")
 
-	var uploaded string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Content-Type") != "text/markdown" {
-			t.Fatalf("Content-Type = %q, want text/markdown", r.Header.Get("Content-Type"))
+		if r.Header.Get("Content-Type") != "application/zip" {
+			t.Fatalf("Content-Type = %q, want application/zip", r.Header.Get("Content-Type"))
 		}
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			t.Fatalf("Authorization = %q, want bearer token", r.Header.Get("Authorization"))
 		}
-		if r.Header.Get("X-Filename") != filepath.Base(sourceDir)+".md" {
-			t.Fatalf("X-Filename = %q, want directory markdown filename", r.Header.Get("X-Filename"))
+		if r.Header.Get("X-Filename") != filepath.Base(sourceDir)+".zip" {
+			t.Fatalf("X-Filename = %q, want directory zip filename", r.Header.Get("X-Filename"))
 		}
 		if r.Header.Get("X-Doc-Name") != "Folder Docs" {
 			t.Fatalf("X-Doc-Name = %q, want Folder Docs", r.Header.Get("X-Doc-Name"))
@@ -35,7 +36,11 @@ func TestRunUploadAcceptsMarkdownDirectory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadAll: %v", err)
 		}
-		uploaded = string(body)
+		assertZipEntries(t, body, map[string]string{
+			"intro.md":         "hello\n",
+			"nested/image.bin": "\x00\x01\x02",
+			"nested/notes.txt": "plain text\n",
+		})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"url":"https://example.test/folder","id":"folder"}`))
 	}))
@@ -53,15 +58,6 @@ func TestRunUploadAcceptsMarkdownDirectory(t *testing.T) {
 
 	if err := runUpload(nil, []string{sourceDir}); err != nil {
 		t.Fatalf("runUpload returned error: %v", err)
-	}
-	if !strings.Contains(uploaded, "- [intro.md](#intro-md)") {
-		t.Fatalf("uploaded markdown missing intro TOC link:\n%s", uploaded)
-	}
-	if !strings.Contains(uploaded, "  - [guide.md](#nested-guide-md)") {
-		t.Fatalf("uploaded markdown missing nested guide TOC link:\n%s", uploaded)
-	}
-	if strings.Contains(uploaded, "ignored") {
-		t.Fatalf("uploaded markdown included non-markdown file:\n%s", uploaded)
 	}
 }
 
@@ -81,6 +77,46 @@ func TestRunUploadRequiresFolderFlagForDirectory(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "pass --folder") {
 		t.Fatalf("error = %q, want --folder guidance", err.Error())
+	}
+}
+
+func TestRunUploadRejectsFolderOverSizeLimitBeforeUpload(t *testing.T) {
+	sourceDir := t.TempDir()
+	largeFile := filepath.Join(sourceDir, "large.bin")
+	f, err := os.Create(largeFile)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := f.Truncate(maxFolderUploadBytes + 1); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	writeUploadConfig(t, server.URL, "secret")
+	previousFolderUpload := folderUpload
+	folderUpload = true
+	t.Cleanup(func() {
+		folderUpload = previousFolderUpload
+	})
+
+	err = runUpload(nil, []string{sourceDir})
+	if err == nil {
+		t.Fatal("runUpload returned nil error")
+	}
+	if !strings.Contains(err.Error(), "200 MB") {
+		t.Fatalf("error = %q, want 200 MB guidance", err.Error())
+	}
+	if called {
+		t.Fatal("server received upload for over-limit folder")
 	}
 }
 
@@ -200,5 +236,36 @@ func writeUploadTestFile(t *testing.T, path string, contents string) {
 	}
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+}
+
+func assertZipEntries(t *testing.T, body []byte, want map[string]string) {
+	t.Helper()
+	reader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	got := make(map[string]string)
+	for _, file := range reader.File {
+		rc, err := file.Open()
+		if err != nil {
+			t.Fatalf("Open %q: %v", file.Name, err)
+		}
+		contents, err := io.ReadAll(rc)
+		if closeErr := rc.Close(); closeErr != nil {
+			t.Fatalf("Close %q: %v", file.Name, closeErr)
+		}
+		if err != nil {
+			t.Fatalf("ReadAll %q: %v", file.Name, err)
+		}
+		got[file.Name] = string(contents)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("zip entries = %v, want %v", got, want)
+	}
+	for name, contents := range want {
+		if got[name] != contents {
+			t.Fatalf("zip entry %q = %q, want %q", name, got[name], contents)
+		}
 	}
 }

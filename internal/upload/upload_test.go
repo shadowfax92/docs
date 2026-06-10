@@ -89,3 +89,32 @@ func TestUploadSendsArbitraryFileWithDetectedContentType(t *testing.T) {
 		t.Fatalf("response = %+v, want parsed URL and ID", resp)
 	}
 }
+
+func TestUploadSendsZipWithApplicationZipContentType(t *testing.T) {
+	sourceDir := t.TempDir()
+	filePath := filepath.Join(sourceDir, "folder.zip")
+	if err := os.WriteFile(filePath, []byte("zip bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/zip" {
+			t.Fatalf("Content-Type = %q, want application/zip", got)
+		}
+		if got := r.Header.Get("X-Filename"); got != "folder.zip" {
+			t.Fatalf("X-Filename = %q, want folder.zip", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"url":"https://example.test/folder","id":"folder"}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{URL: server.URL, Token: "secret"}
+	resp, err := Upload(cfg, filePath, "")
+	if err != nil {
+		t.Fatalf("Upload returned error: %v", err)
+	}
+	if resp.URL != "https://example.test/folder" || resp.ID != "folder" {
+		t.Fatalf("response = %+v, want parsed URL and ID", resp)
+	}
+}
