@@ -4,16 +4,16 @@
 
 **Share files with short, clean URLs.**
 
-*One command. File or Markdown folder uploaded, link in your clipboard.*
+*One command. File or folder uploaded, link in your clipboard.*
 
 </div>
 
-Upload any regular file, HTML page, Markdown file, PDF, or Markdown folder and get a short URL. Renderable documents open directly in the browser; everything else gets a clean download page.
+Upload any regular file, HTML page, Markdown file, PDF, or folder and get a short URL. Renderable documents open directly in the browser; everything else gets a clean download page.
 
 - **One command** — `docs upload report.pdf` → short URL copied to clipboard
 - **Renders when it can** — PDFs display inline, HTML serves as-is, Markdown renders with GitHub styling
 - **Downloads when it should** — unknown file types show a download page instead of raw bytes
-- **Folder-friendly Markdown** — point at a docs folder to publish one combined page with a clickable table of contents
+- **Folder uploads** — point at any folder under 200 MiB total and upload one ZIP archive
 - **Short URLs** — `https://your-domain.com/xK9mRt2p` — clean and shareable
 - **Fast & global** — served from Cloudflare's edge network via R2 + Workers
 - **Simple auth** — bearer token for uploads, public read for viewing
@@ -67,7 +67,7 @@ docs upload report.pdf           # upload PDF, get short URL
 docs upload page.html            # upload HTML page
 docs upload notes.md             # upload Markdown (rendered with GitHub CSS)
 docs upload archive.zip          # upload any file with a download page
-docs upload --folder ./guides    # combine Markdown files recursively
+docs upload --folder ./guides    # archive folder files recursively
 docs upload --folder ./guides --name Docs # set link preview title
 docs list                        # show the last 10 uploads
 docs list --days 30              # show uploads from the last 30 days
@@ -75,7 +75,7 @@ docs list --days 30              # show uploads from the last 30 days
 
 The URL is printed and copied to your clipboard automatically.
 
-When uploading a directory with `--folder`, `docs` recursively collects `.md` and `.markdown` files, ignores other files, sorts by relative path, and uploads one generated Markdown document. The generated document starts with a table of contents that mirrors the folder hierarchy and links to each file section.
+When uploading a directory with `--folder`, `docs` recursively archives every regular file into one ZIP upload. Folder uploads preserve relative paths and fail before uploading when regular files total more than 200 MiB.
 
 Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history file stores the upload time, display name, URL, ID, and source path. If history recording fails, the upload still succeeds.
 
@@ -87,7 +87,7 @@ Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history 
 | `.html`, `.htm` | Served as-is with original formatting |
 | `.md`, `.markdown` | Rendered with GitHub-flavored Markdown (light theme) |
 | Any other regular file | Download page with filename, type, and size |
-| Directory containing `.md` / `.markdown` files, with `--folder` | Combined into one Markdown page with a linked table of contents |
+| Directory with `--folder` | ZIP archive download page, limited to 200 MiB of source files |
 
 ## How It Works
 
@@ -95,9 +95,9 @@ Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history 
 docs upload file.pdf
      │
      ▼
-file path ───────────────┐
-markdown folder ─ combine┤
-                         ▼
+file path ──────────────┐
+folder ─ ZIP archive ───┤
+                        ▼
 ┌─────────┐    PUT /upload     ┌──────────────────┐     put()    ┌─────────┐
 │  CLI     │ ──────────────▶   │  Cloudflare       │ ──────────▶ │  R2     │
 │  (Go)    │   Bearer token    │  Worker           │             │  Bucket │
@@ -109,7 +109,7 @@ markdown folder ─ combine┤
 Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 ```
 
-- CLI sends the file, or generated Markdown folder document, to the Worker with a bearer token
+- CLI sends the file, or generated folder ZIP archive, to the Worker with a bearer token
 - Worker generates an 8-character short ID, stores the file in R2
 - Worker returns the short URL, CLI copies it to clipboard
 - Anyone with the URL can view or download the file — no auth required
@@ -120,7 +120,7 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 | Command | Description |
 |---------|-------------|
 | `docs upload <file>` | Upload a file and get a short URL |
-| `docs upload --folder <markdown-folder>` | Combine and upload a Markdown folder |
+| `docs upload --folder <folder>` | Archive and upload a folder |
 | `docs list` | Show the last 10 uploads |
 | `docs list --days <n>` | Show uploads from the last `n` days |
 | `docs config` | Set worker URL and auth token |
