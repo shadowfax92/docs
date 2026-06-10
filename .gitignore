@@ -6,3 +6,4 @@ worker/dist/
 worker/.wrangler/
 .DS_Store
 **/*.env
+.grove/
