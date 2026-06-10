@@ -27,6 +27,7 @@ var extToContentType = map[string]string{
 	".htm":      "text/html",
 	".md":       "text/markdown",
 	".markdown": "text/markdown",
+	".zip":      "application/zip",
 }
 
 func Upload(cfg *config.Config, filePath string, docName string) (*Response, error) {

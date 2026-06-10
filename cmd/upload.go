@@ -13,24 +13,26 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/shadowfax/docs/internal/config"
+	"github.com/shadowfax/docs/internal/folderarchive"
 	"github.com/shadowfax/docs/internal/history"
-	"github.com/shadowfax/docs/internal/markdown"
 	"github.com/shadowfax/docs/internal/upload"
 )
+
+const maxFolderUploadBytes = 200 * 1024 * 1024
 
 var docName string
 var folderUpload bool
 
 var uploadCmd = &cobra.Command{
-	Use:   "upload [--folder] <file-or-markdown-folder>",
-	Short: "Upload a file or combine a Markdown folder and get a short URL",
+	Use:   "upload [--folder] <file-or-folder>",
+	Short: "Upload a file or folder and get a short URL",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runUpload,
 }
 
 func init() {
 	uploadCmd.Flags().StringVarP(&docName, "name", "n", "", "document name shown in link previews")
-	uploadCmd.Flags().BoolVar(&folderUpload, "folder", false, "recursively combine a Markdown folder before uploading")
+	uploadCmd.Flags().BoolVar(&folderUpload, "folder", false, "recursively archive a folder before uploading")
 	rootCmd.AddCommand(uploadCmd)
 }
 
@@ -46,7 +48,7 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	}
 
 	if info.IsDir() && !folderUpload {
-		return fmt.Errorf("%s is a directory; pass --folder to combine markdown files", filePath)
+		return fmt.Errorf("%s is a directory; pass --folder to upload it as a zip archive", filePath)
 	}
 	if !info.IsDir() && folderUpload {
 		return fmt.Errorf("--folder requires a directory")
@@ -83,17 +85,27 @@ func runUpload(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// uploadPath routes files and Markdown directories through the shared upload API.
+// uploadPath routes files and folder archives through the shared upload API.
 func uploadPath(cfg *config.Config, filePath string, info os.FileInfo, docName string) (*upload.Response, error) {
 	if !info.IsDir() {
 		return upload.Upload(cfg, filePath, docName)
 	}
-	combined, err := markdown.CombineDirectory(filePath)
+	return uploadFolder(cfg, filePath, docName)
+}
+
+// uploadFolder creates a temporary archive so a directory still fits the one-object upload API.
+func uploadFolder(cfg *config.Config, filePath string, docName string) (*upload.Response, error) {
+	tempDir, err := os.MkdirTemp("", "docs-folder-*")
 	if err != nil {
+		return nil, fmt.Errorf("create temporary archive directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	archivePath := filepath.Join(tempDir, folderArchiveFilename(filePath))
+	if err := folderarchive.WriteZip(filePath, archivePath, maxFolderUploadBytes); err != nil {
 		return nil, err
 	}
-	filename := markdown.CombinedFilename(filePath)
-	return upload.UploadContent(cfg, filename, "text/markdown", strings.NewReader(combined), docName)
+	return upload.Upload(cfg, archivePath, docName)
 }
 
 func recordUploadHistory(filePath string, info os.FileInfo, docName string, resp *upload.Response) error {
@@ -115,9 +127,17 @@ func uploadHistoryName(filePath string, info os.FileInfo, docName string) string
 		return docName
 	}
 	if info.IsDir() {
-		return markdown.CombinedFilename(filePath)
+		return folderArchiveFilename(filePath)
 	}
 	return filepath.Base(filePath)
+}
+
+func folderArchiveFilename(folderPath string) string {
+	base := filepath.Base(filepath.Clean(folderPath))
+	if base == "." || base == string(filepath.Separator) {
+		base = "folder"
+	}
+	return base + ".zip"
 }
 
 func copyToClipboard(text string) error {
