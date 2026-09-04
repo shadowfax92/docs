@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,8 @@ import (
 )
 
 var httpClient = &http.Client{Timeout: 2 * time.Minute}
+
+const deleteResultHeader = "X-Docs-Delete-Result"
 
 type Response struct {
 	URL string `json:"url"`
@@ -104,4 +107,36 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 		return nil, fmt.Errorf("invalid response: %w", err)
 	}
 	return &result, nil
+}
+
+// Delete removes an upload through the authenticated Worker API. The boolean distinguishes
+// a confirmed deletion from an already-missing upload without treating not-found as a transport failure.
+func Delete(cfg *config.Config, id string) (bool, error) {
+	endpoint := strings.TrimRight(cfg.URL, "/") + "/upload/" + url.PathEscape(id)
+	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create delete request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("delete failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// A result marker distinguishes the deletion endpoint from the generic 404 returned by
+	// Workers deployed before deletion existed. Only marked absence is safe to reconcile locally.
+	switch {
+	case resp.StatusCode == http.StatusNoContent && resp.Header.Get(deleteResultHeader) == "deleted":
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound && resp.Header.Get(deleteResultHeader) == "not-found":
+		return false, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("failed to read delete response: %w", err)
+	}
+	return false, fmt.Errorf("delete failed (HTTP %d): %s", resp.StatusCode, string(body))
 }

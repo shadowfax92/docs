@@ -14,9 +14,10 @@ Upload any regular file, HTML page, Markdown file, PDF, or folder and get a shor
 - **Renders when it can** — PDFs display inline, HTML serves as-is, Markdown renders with GitHub styling
 - **Downloads when it should** — unknown file types show a download page instead of raw bytes
 - **Folder uploads** — point at a folder to publish one downloadable zip archive
+- **Safe deletion** — remove a shared upload and its matching local history with `docs delete <id>`
 - **Short URLs** — `https://your-domain.com/xK9mRt2p` — clean and shareable
 - **Fast & global** — served from Cloudflare's edge network via R2 + Workers
-- **Simple auth** — bearer token for uploads, public read for viewing
+- **Simple auth** — bearer token for uploads and deletion, public read for viewing
 
 ---
 
@@ -71,6 +72,7 @@ docs upload --folder ./guides    # upload folder as a zip archive
 docs upload --folder ./guides --name Docs # set link preview title
 docs list                        # show the last 10 uploads
 docs list --days 30              # show uploads from the last 30 days
+docs delete xK9mRt2p             # delete an upload by its short ID
 ```
 
 The URL is printed and copied to your clipboard automatically.
@@ -78,6 +80,10 @@ The URL is printed and copied to your clipboard automatically.
 When uploading a directory with `--folder`, `docs` recursively packages regular files into a zip archive and uploads that archive. Folder uploads are limited to 200 MB total across all regular files before compression.
 
 Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history file stores the upload time, display name, URL, ID, and source path. If history recording fails, the upload still succeeds.
+
+`docs delete <id>` authenticates to the Worker, resolves the stored filename from the ID, deletes every object belonging to that upload, and removes only exact matching IDs from local history. If the remote upload is already missing, the command says so and still cleans stale matching history. Authentication, network, or storage errors leave local history unchanged. If remote deletion succeeds but the local history update fails, the error explicitly reports that partial outcome.
+
+A successful deletion guarantees that subsequent uncached requests for the ID return `404 Not Found`. Public responses currently use a one-year immutable cache, so HTML or other content already loaded in an open tab—or retained by a browser cache—may remain visible until that local cached copy is discarded.
 
 ## Supported Uploads
 
@@ -107,6 +113,8 @@ folder ─ zip archive ────┤
      └── { url: "https://…/xK9mRt2p" }
 
 Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
+
+docs delete xK9mRt2p   ──▶  DELETE /upload/xK9mRt2p  ──▶  Worker resolves xK9mRt2p/*  ──▶  R2 delete
 ```
 
 - CLI sends the file, or generated folder archive, to the Worker with a bearer token
@@ -114,6 +122,7 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 - Worker returns the short URL, CLI copies it to clipboard
 - Anyone with the URL can view or download the file — no auth required
 - `/raw` serves the stored object inline; `/download` serves it as an attachment
+- Deletion requires the same bearer token as upload and accepts an ID, never a filename or R2 key
 
 ## Commands
 
@@ -123,6 +132,7 @@ Browser GET /xK9mRt2p  ──▶  Worker  ──▶  R2  ──▶  file served
 | `docs upload --folder <folder>` | Zip and upload a folder |
 | `docs list` | Show the last 10 uploads |
 | `docs list --days <n>` | Show uploads from the last `n` days |
+| `docs delete <id>` | Delete a remote upload and reconcile matching local history |
 | `docs config` | Set worker URL and auth token |
 | `docs help` | Show help |
 
