@@ -59,6 +59,7 @@ describe("DELETE /upload/:id", () => {
     const response = await worker.fetch(request(), environment(bucket));
 
     expect(response.status).toBe(204);
+    expect(response.headers.get("X-Docs-Delete-Result")).toBe("deleted");
     expect(bucket.listCalls).toEqual([
       { prefix: `${uploadId}/`, cursor: undefined },
       { prefix: `${uploadId}/`, cursor: "next-page" },
@@ -72,6 +73,7 @@ describe("DELETE /upload/:id", () => {
     const response = await worker.fetch(request(), environment(bucket));
 
     expect(response.status).toBe(404);
+    expect(response.headers.get("X-Docs-Delete-Result")).toBe("not-found");
     expect(bucket.deletedBatches).toEqual([]);
   });
 

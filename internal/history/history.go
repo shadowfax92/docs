@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 type Entry struct {
@@ -54,12 +56,14 @@ func (s *Store) Append(entry Entry) error {
 	if entry.UploadedAt.IsZero() {
 		entry.UploadedAt = time.Now().UTC()
 	}
-	entries, err := s.read()
-	if err != nil {
-		return err
-	}
-	entries = append(entries, entry)
-	return s.write(entries)
+	return s.withExclusiveLock(func() error {
+		entries, err := s.read()
+		if err != nil {
+			return err
+		}
+		entries = append(entries, entry)
+		return s.write(entries)
+	})
 }
 
 // RemoveByID atomically removes every entry for one remote upload while preserving unrelated history.
@@ -69,23 +73,26 @@ func (s *Store) RemoveByID(id string) (int, error) {
 		return 0, nil
 	}
 
-	entries, err := s.read()
-	if err != nil {
-		return 0, err
-	}
-	kept := make([]Entry, 0, len(entries))
 	removed := 0
-	for _, entry := range entries {
-		if entry.ID == id {
-			removed++
-			continue
+	err := s.withExclusiveLock(func() error {
+		entries, err := s.read()
+		if err != nil {
+			return err
 		}
-		kept = append(kept, entry)
-	}
-	if removed == 0 {
-		return 0, nil
-	}
-	if err := s.write(kept); err != nil {
+		kept := make([]Entry, 0, len(entries))
+		for _, entry := range entries {
+			if entry.ID == id {
+				removed++
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		if removed == 0 {
+			return nil
+		}
+		return s.write(kept)
+	})
+	if err != nil {
 		return 0, err
 	}
 	return removed, nil
@@ -133,8 +140,28 @@ func (s *Store) read() ([]Entry, error) {
 	return entries, nil
 }
 
+// withExclusiveLock serializes complete read-modify-write transactions across CLI processes.
+// The lock file remains in place: removing it after unlock could split waiters across different inodes.
+func (s *Store) withExclusiveLock(update func() error) (err error) {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create upload history directory: %w", err)
+	}
+	fileLock := flock.New(s.path+".lock", flock.SetPermissions(0o600))
+	if err := fileLock.Lock(); err != nil {
+		return fmt.Errorf("lock upload history: %w", err)
+	}
+	defer func() {
+		if unlockErr := fileLock.Unlock(); err == nil && unlockErr != nil {
+			err = fmt.Errorf("unlock upload history: %w", unlockErr)
+		}
+	}()
+	return update()
+}
+
 func (s *Store) write(entries []Entry) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create upload history directory: %w", err)
 	}
 	data, err := json.MarshalIndent(entries, "", "  ")
@@ -142,11 +169,24 @@ func (s *Store) write(entries []Entry) error {
 		return fmt.Errorf("encode upload history: %w", err)
 	}
 	data = append(data, '\n')
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary upload history: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure temporary upload history: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write upload history: %w", err)
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close upload history: %w", err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
 		return fmt.Errorf("replace upload history: %w", err)
 	}
 	return nil

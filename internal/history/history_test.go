@@ -1,8 +1,10 @@
 package history
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -178,7 +180,68 @@ func TestStoreRemoveByIDPreservesPrivateAtomicStorage(t *testing.T) {
 	if got := fileInfo.Mode().Perm(); got != 0o600 {
 		t.Fatalf("history file permissions = %o, want 600", got)
 	}
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf("temporary history file remains after replace: %v", err)
+	lockInfo, err := os.Stat(path + ".lock")
+	if err != nil {
+		t.Fatalf("Stat history lock file: %v", err)
+	}
+	if got := lockInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("history lock permissions = %o, want 600", got)
+	}
+	temporaryFiles, err := filepath.Glob(filepath.Join(dir, ".uploads.json.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temporary history files: %v", err)
+	}
+	if len(temporaryFiles) != 0 {
+		t.Fatalf("temporary history files remain after replace: %v", temporaryFiles)
+	}
+}
+
+func TestStoreSerializesConcurrentAppendAndRemoval(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "uploads.json"))
+	if err := store.Append(Entry{Name: "delete.md", ID: "Ab12Cd34"}); err != nil {
+		t.Fatalf("Append deletion target: %v", err)
+	}
+
+	const appendCount = 64
+	start := make(chan struct{})
+	errors := make(chan error, appendCount+1)
+	var wait sync.WaitGroup
+	for index := 0; index < appendCount; index++ {
+		index := index
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errors <- store.Append(Entry{Name: fmt.Sprintf("keep-%d.md", index), ID: fmt.Sprintf("Keep%04d", index)})
+		}()
+	}
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		_, err := store.RemoveByID("Ab12Cd34")
+		errors <- err
+	}()
+
+	close(start)
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("concurrent history update: %v", err)
+		}
+	}
+
+	entries, err := store.List(Filter{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != appendCount {
+		t.Fatalf("history length = %d, want %d", len(entries), appendCount)
+	}
+	for _, entry := range entries {
+		if entry.ID == "Ab12Cd34" {
+			t.Fatal("concurrent append resurrected deleted history entry")
+		}
 	}
 }

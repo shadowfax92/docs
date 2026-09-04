@@ -4,6 +4,7 @@ interface Env {
 }
 
 const r2DeleteBatchSize = 1000;
+const deleteResultHeader = "X-Docs-Delete-Result";
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -357,7 +358,10 @@ async function handleDelete(request: Request, id: string, env: Env): Promise<Res
     } while (cursor);
 
     if (keys.length === 0) {
-      return new Response("Not found", { status: 404 });
+      return new Response("Not found", {
+        status: 404,
+        headers: { [deleteResultHeader]: "not-found" },
+      });
     }
 
     for (let offset = 0; offset < keys.length; offset += r2DeleteBatchSize) {
@@ -367,7 +371,10 @@ async function handleDelete(request: Request, id: string, env: Env): Promise<Res
     return new Response("Storage error", { status: 500 });
   }
 
-  return new Response(null, { status: 204 });
+  return new Response(null, {
+    status: 204,
+    headers: { [deleteResultHeader]: "deleted" },
+  });
 }
 
 async function handleGet(id: string, raw: boolean, download: boolean, origin: string, env: Env): Promise<Response> {

@@ -17,6 +17,8 @@ import (
 
 var httpClient = &http.Client{Timeout: 2 * time.Minute}
 
+const deleteResultHeader = "X-Docs-Delete-Result"
+
 type Response struct {
 	URL string `json:"url"`
 	ID  string `json:"id"`
@@ -123,17 +125,18 @@ func Delete(cfg *config.Config, id string) (bool, error) {
 	}
 	defer resp.Body.Close()
 
+	// A result marker distinguishes the deletion endpoint from the generic 404 returned by
+	// Workers deployed before deletion existed. Only marked absence is safe to reconcile locally.
+	switch {
+	case resp.StatusCode == http.StatusNoContent && resp.Header.Get(deleteResultHeader) == "deleted":
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound && resp.Header.Get(deleteResultHeader) == "not-found":
+		return false, nil
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, fmt.Errorf("failed to read delete response: %w", err)
 	}
-
-	switch resp.StatusCode {
-	case http.StatusNoContent:
-		return true, nil
-	case http.StatusNotFound:
-		return false, nil
-	default:
-		return false, fmt.Errorf("delete failed (HTTP %d): %s", resp.StatusCode, string(body))
-	}
+	return false, fmt.Errorf("delete failed (HTTP %d): %s", resp.StatusCode, string(body))
 }

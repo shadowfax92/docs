@@ -14,8 +14,13 @@ import (
 var deleteCmd = &cobra.Command{
 	Use:   "delete <id>",
 	Short: "Delete an upload by ID",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runDelete,
+	Long: `Delete a remote upload by ID, then remove its exact matches from local history.
+
+If the upload is already absent, stale local history is still removed. Remote
+errors leave local history unchanged; local failures after remote success are
+reported explicitly. Already-open tabs or cached copies may remain visible.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runDelete,
 }
 
 func init() {

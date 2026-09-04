@@ -130,6 +130,7 @@ func TestDeleteSendsAuthenticatedRequestAndReportsDeletion(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
 			t.Fatalf("Authorization = %q, want bearer token", got)
 		}
+		w.Header().Set("X-Docs-Delete-Result", "deleted")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -145,6 +146,7 @@ func TestDeleteSendsAuthenticatedRequestAndReportsDeletion(t *testing.T) {
 
 func TestDeleteReportsMissingUpload(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Docs-Delete-Result", "not-found")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("Not found"))
 	}))
@@ -153,6 +155,42 @@ func TestDeleteReportsMissingUpload(t *testing.T) {
 	deleted, err := Delete(&config.Config{URL: server.URL, Token: "secret"}, "Ab12Cd34")
 	if err != nil {
 		t.Fatalf("Delete returned error: %v", err)
+	}
+	if deleted {
+		t.Fatal("Delete reported deletion, want missing upload")
+	}
+}
+
+func TestDeleteRejectsUnmarkedNotFoundFromOlderWorker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("Not found"))
+	}))
+	defer server.Close()
+
+	deleted, err := Delete(&config.Config{URL: server.URL, Token: "secret"}, "Ab12Cd34")
+	if err == nil {
+		t.Fatal("Delete accepted unmarked 404 from an unsupported endpoint")
+	}
+	if deleted {
+		t.Fatal("Delete reported deletion for unmarked 404")
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("error = %q, want unsupported-endpoint status", err.Error())
+	}
+}
+
+func TestDeleteMapsMarkedNotFoundBeforeReadingBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Docs-Delete-Result", "not-found")
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	deleted, err := Delete(&config.Config{URL: server.URL, Token: "secret"}, "Ab12Cd34")
+	if err != nil {
+		t.Fatalf("Delete returned error after marked not-found headers: %v", err)
 	}
 	if deleted {
 		t.Fatal("Delete reported deletion, want missing upload")

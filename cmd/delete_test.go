@@ -40,10 +40,14 @@ func TestDeleteCommandIsDiscoverableAndRequiresOneID(t *testing.T) {
 	if !strings.Contains(out.String(), "delete") {
 		t.Fatalf("root help does not list delete command:\n%s", out.String())
 	}
+	if !strings.Contains(deleteCmd.Long, "local history") || !strings.Contains(deleteCmd.Long, "cached") {
+		t.Fatalf("delete help omits reconciliation or cache behavior: %q", deleteCmd.Long)
+	}
 }
 
 func TestRunDeleteRemovesRemoteUploadAndOnlyMatchingHistory(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Docs-Delete-Result", "deleted")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -68,6 +72,7 @@ func TestRunDeleteRemovesRemoteUploadAndOnlyMatchingHistory(t *testing.T) {
 
 func TestRunDeleteReconcilesHistoryWhenRemoteUploadIsMissing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Docs-Delete-Result", "not-found")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("Not found"))
 	}))
@@ -117,8 +122,28 @@ func TestRunDeleteLeavesHistoryWhenRemoteDeletionFails(t *testing.T) {
 	assertDeleteHistoryIDs(t, store, []string{deleteTestID})
 }
 
+func TestRunDeleteLeavesHistoryWhenWorkerDoesNotSupportDeletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("Not found"))
+	}))
+	defer server.Close()
+
+	home := writeUploadConfigWithHome(t, server.URL, "secret")
+	store := appendDeleteHistory(t, home, history.Entry{Name: "keep.md", ID: deleteTestID})
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+
+	err := runDelete(cmd, []string{deleteTestID})
+	if err == nil {
+		t.Fatal("runDelete accepted an unmarked 404 from an older Worker")
+	}
+	assertDeleteHistoryIDs(t, store, []string{deleteTestID})
+}
+
 func TestRunDeleteReportsRemoteSuccessWhenHistoryCleanupFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Docs-Delete-Result", "deleted")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
