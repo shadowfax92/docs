@@ -118,3 +118,82 @@ func TestUploadSendsZipWithApplicationZipContentType(t *testing.T) {
 		t.Fatalf("response = %+v, want parsed URL and ID", resp)
 	}
 }
+
+func TestDeleteSendsAuthenticatedRequestAndReportsDeletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s, want DELETE", r.Method)
+		}
+		if got := r.URL.EscapedPath(); got != "/upload/Ab12%2FCd34" {
+			t.Fatalf("escaped path = %q, want escaped upload ID", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	deleted, err := Delete(&config.Config{URL: server.URL + "/", Token: "secret"}, "Ab12/Cd34")
+	if err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if !deleted {
+		t.Fatal("Delete reported missing upload, want deleted")
+	}
+}
+
+func TestDeleteReportsMissingUpload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("Not found"))
+	}))
+	defer server.Close()
+
+	deleted, err := Delete(&config.Config{URL: server.URL, Token: "secret"}, "Ab12Cd34")
+	if err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if deleted {
+		t.Fatal("Delete reported deletion, want missing upload")
+	}
+}
+
+func TestDeleteReturnsSafeHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("Storage error"))
+	}))
+	defer server.Close()
+
+	const token = "never-print-this-token"
+	deleted, err := Delete(&config.Config{URL: server.URL, Token: token}, "Ab12Cd34")
+	if err == nil {
+		t.Fatal("Delete returned nil error")
+	}
+	if deleted {
+		t.Fatal("Delete reported deletion after HTTP error")
+	}
+	if !strings.Contains(err.Error(), "delete failed (HTTP 500): Storage error") {
+		t.Fatalf("error = %q, want status and response", err.Error())
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("error exposed auth token: %q", err.Error())
+	}
+}
+
+func TestDeleteReturnsNetworkError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	server.Close()
+
+	deleted, err := Delete(&config.Config{URL: server.URL, Token: "secret"}, "Ab12Cd34")
+	if err == nil {
+		t.Fatal("Delete returned nil error")
+	}
+	if deleted {
+		t.Fatal("Delete reported deletion after network error")
+	}
+	if !strings.Contains(err.Error(), "delete failed") {
+		t.Fatalf("error = %q, want deletion context", err.Error())
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,4 +105,35 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 		return nil, fmt.Errorf("invalid response: %w", err)
 	}
 	return &result, nil
+}
+
+// Delete removes an upload through the authenticated Worker API. The boolean distinguishes
+// a confirmed deletion from an already-missing upload without treating not-found as a transport failure.
+func Delete(cfg *config.Config, id string) (bool, error) {
+	endpoint := strings.TrimRight(cfg.URL, "/") + "/upload/" + url.PathEscape(id)
+	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create delete request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("delete failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("failed to read delete response: %w", err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("delete failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
 }
