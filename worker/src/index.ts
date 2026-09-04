@@ -3,6 +3,8 @@ interface Env {
   AUTH_TOKEN: string;
 }
 
+const r2DeleteBatchSize = 1000;
+
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const bytes = new Uint8Array(10);
@@ -53,6 +55,10 @@ function isHtml(filename: string): boolean {
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^\w.\-]/g, "_");
+}
+
+function isUploadId(id: string): boolean {
+  return /^[A-Za-z0-9]{8}$/.test(id);
 }
 
 function escapeHtml(s: string): string {
@@ -263,6 +269,14 @@ export default {
       return handleUpload(request, env);
     }
 
+    if (request.method === "DELETE" && path.startsWith("upload/")) {
+      const id = path.slice("upload/".length);
+      if (!isUploadId(id)) {
+        return new Response("Not found", { status: 404 });
+      }
+      return handleDelete(request, id, env);
+    }
+
     if (request.method === "GET" && !path) {
       return new Response("docs — document sharing", { status: 200 });
     }
@@ -283,10 +297,15 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handleUpload(request: Request, env: Env): Promise<Response> {
+// Upload and deletion share one authentication boundary so their bearer-token behavior cannot drift.
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   const auth = request.headers.get("Authorization");
   const expected = `Bearer ${env.AUTH_TOKEN}`;
-  if (!auth || !(await timingSafeEqual(auth, expected))) {
+  return !!auth && timingSafeEqual(auth, expected);
+}
+
+async function handleUpload(request: Request, env: Env): Promise<Response> {
+  if (!(await isAuthorized(request, env))) {
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -315,6 +334,40 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     url: `${baseUrl}/${id}`,
     id,
   });
+}
+
+/** Resolves storage keys from the upload ID before deleting, keeping R2 key ownership server-side. */
+async function handleDelete(request: Request, id: string, env: Env): Promise<Response> {
+  if (!(await isAuthorized(request, env))) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  try {
+    // Resolve a stable key set before mutation. Deleting while advancing an R2 cursor could skip
+    // keys if the listing shifts underneath pagination.
+    do {
+      const listed = await env.DOCS_BUCKET.list({ prefix: `${id}/`, cursor });
+      keys.push(...listed.objects.map((object) => object.key));
+      if (listed.truncated && !listed.cursor) {
+        throw new Error("truncated R2 listing did not return a cursor");
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+
+    if (keys.length === 0) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    for (let offset = 0; offset < keys.length; offset += r2DeleteBatchSize) {
+      await env.DOCS_BUCKET.delete(keys.slice(offset, offset + r2DeleteBatchSize));
+    }
+  } catch {
+    return new Response("Storage error", { status: 500 });
+  }
+
+  return new Response(null, { status: 204 });
 }
 
 async function handleGet(id: string, raw: boolean, download: boolean, origin: string, env: Env): Promise<Response> {
