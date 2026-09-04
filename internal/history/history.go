@@ -62,6 +62,35 @@ func (s *Store) Append(entry Entry) error {
 	return s.write(entries)
 }
 
+// RemoveByID atomically removes every entry for one remote upload while preserving unrelated history.
+// An empty ID is never a deletion key because legacy entries may not have stored IDs at all.
+func (s *Store) RemoveByID(id string) (int, error) {
+	if id == "" {
+		return 0, nil
+	}
+
+	entries, err := s.read()
+	if err != nil {
+		return 0, err
+	}
+	kept := make([]Entry, 0, len(entries))
+	removed := 0
+	for _, entry := range entries {
+		if entry.ID == id {
+			removed++
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	if err := s.write(kept); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
 // List returns upload history newest-first with optional age and count filters.
 func (s *Store) List(filter Filter) ([]Entry, error) {
 	entries, err := s.read()
