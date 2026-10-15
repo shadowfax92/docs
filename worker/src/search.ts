@@ -110,7 +110,12 @@ export function createSearchIndex(): SearchIndex {
       const before = cutoff(filter.uploadedBefore);
       const after = cutoff(filter.uploadedAfter);
       const pattern = compile(query);
-      const scanBranches = query.mode === "regex" ? literalAlternatives(query.text) : 1;
+      const alternatives = query.mode === "regex" ? literalAlternatives(query.text) : [query.text];
+      const scanBranches = alternatives?.length ?? null;
+      // RE2 compilation above remains authoritative even when execution can use string search.
+      // Only proven ASCII branches have the tiny fold alphabet audited against pinned RE2JS.
+      const nativeTerms = alternatives?.every((term) => term.length && !/[^\x00-\x7f]/.test(term))
+        ? alternatives.map((term) => query.ignoreCase ? foldASCII(term) : term) : null;
       const instructions = pattern?.programSize() ?? 0;
       const hits: SearchHit[] = [];
       let work = 0;
@@ -125,16 +130,15 @@ export function createSearchIndex(): SearchIndex {
           let matchCount = 0;
           let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: record.title.slice(0, SNIPPET_LENGTH), ranges: [] };
           for (const field of [record.filename, record.title, record.body]) {
-            // Literal searches and flat alternatives of nonempty literals have bounded lookahead:
-            // charge one field scan per branch, independent of each term's length. Multiplying by
-            // program size rejected ordinary grep terms on admitted libraries. RE2 still owns
-            // matching, Unicode simple folding and UTF-16 offsets. Shared-prefix constant costs
-            // remain subject to the 256-byte pattern, find-count and wall-clock guards; this is
-            // a scan budget, not an instruction count. All other regexes retain suffix accounting.
+            // Each literal branch scans a field monotonically. Folding adds one bounded pass,
+            // not a program-size multiplier; no field copy survives this iteration/query. The
+            // other regexes can rescan suffixes, so keep their conservative instruction charging.
             if (scanBranches !== null) work += field.length * scanBranches;
             if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
             if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
-            const matcher = pattern.matcher(field);
+            const matcher = nativeTerms
+              ? literalMatcher(query.ignoreCase ? foldASCII(field) : field, nativeTerms)
+              : pattern.matcher(field);
             let window: SnippetWindow | undefined;
             let searchedThrough = 0;
             while (true) {
@@ -190,28 +194,78 @@ function queryBudget(): never {
   throw new SearchError("search_budget_exceeded", "The query exceeds its matching work/time budget. Narrow the filters or simplify the pattern.");
 }
 
-/** Recognize only flat alternatives of nonempty literals for scan accounting, never execution.
- * Any regex operator, empty arm or non-punctuation escape keeps conservative RE2 suffix charging.
- * A permissive guess here would let patterns such as a.*b|a bypass the repeated-rescan guard.
+/** Parse only flat, nonempty literal branches, preserving source order for RE2 branch priority.
+ * Operators, empty arms and non-punctuation escapes keep RE2 execution and suffix charging.
+ * Unicode literal branches qualify for scan accounting but still execute with RE2.
  */
-function literalAlternatives(source: string): number | null {
-  let branches = 1;
-  let nonempty = false;
+function literalAlternatives(source: string): string[] | null {
+  const branches: string[] = [];
+  let branch = "";
   for (let index = 0; index < source.length; index++) {
     const character = source[index];
     if (character === "|") {
-      if (!nonempty) return null;
-      branches++;
-      nonempty = false;
+      if (!branch) return null;
+      branches.push(branch);
+      branch = "";
       continue;
     }
     if (character === "\\") {
       const escaped = source[++index];
       if (!escaped || !"\\.^$*+?()[]{}|".includes(escaped)) return null;
-    } else if (".^$*+?()[]{}".includes(character)) return null;
-    nonempty = true;
+      branch += escaped;
+    } else {
+      if (".^$*+?()[]{}".includes(character)) return null;
+      branch += character;
+    }
   }
-  return nonempty ? branches : null;
+  return branch ? [...branches, branch] : null;
+}
+
+/** Fixed trusted normalization for ASCII-pattern RE2 simple-fold orbits in RE2JS 2.8.6.
+ * Its CASE_ORBIT and reciprocal scalar conversions admit only Kelvin sign and long s beyond
+ * ASCII. Each replacement is exactly one UTF16 unit; all other text (including surrogates,
+ * dotted/dotless I and combining marks) stays byte-for-byte positioned for original snippets.
+ * Never use whole-string Unicode lowercase here: it changes lengths and creates false matches.
+ */
+function foldASCII(text: string): string {
+  return text.replace(/[A-Z\u017f\u212a]/g, (character) => {
+    const code = character.charCodeAt(0);
+    return code === 0x017f ? "s" : code === 0x212a ? "k" : String.fromCharCode(code + 32);
+  });
+}
+
+/** Query-local cursor for nonempty ASCII branches. Cached next positions make each branch's
+ * scan monotone: absent/rare alternatives never rescan their suffix for every dense match.
+ * Earliest start wins; ties keep source branch order, then consume the selected branch only.
+ * This is the same nonoverlap/leftmost-first contract as RE2, without untrusted native regex.
+ */
+function literalMatcher(field: string, terms: string[]) {
+  const next: (number | undefined)[] = new Array(terms.length);
+  let start = 0;
+  let end = 0;
+  return {
+    find(): boolean {
+      let chosen = -1;
+      let earliest = field.length;
+      for (let branch = 0; branch < terms.length; branch++) {
+        let position = next[branch];
+        if (position === undefined || (position >= 0 && position < end)) {
+          position = field.indexOf(terms[branch], end);
+          next[branch] = position;
+        }
+        if (position >= 0 && position < earliest) {
+          chosen = branch;
+          earliest = position;
+        }
+      }
+      if (chosen < 0) return false;
+      start = earliest;
+      end = start + terms[chosen].length;
+      return true;
+    },
+    start: () => start,
+    end: () => end,
+  };
 }
 
 function compile(query: SearchQuery): RE2JS | null {
@@ -222,7 +276,7 @@ function compile(query: SearchQuery): RE2JS | null {
   if (query.mode === "regex") checkExpansion(query.text);
   let pattern: RE2JS;
   try {
-    // All untrusted patterns, including literal case folding, use RE2JS. Never native backtracking.
+    // RE2 validates every user pattern before execution selection. Never native backtracking.
     pattern = RE2JS.compile(query.mode === "regex" ? query.text : RE2JS.quote(query.text), query.ignoreCase ? RE2JS.CASE_INSENSITIVE : 0);
   } catch (error) {
     throw new SearchError("invalid_pattern", `Invalid or unsupported RE2 pattern: ${error instanceof Error ? error.message.slice(0, 256) : "compilation failed"}`);

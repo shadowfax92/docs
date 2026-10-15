@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { RE2JS } from "re2js";
 import { build } from "esbuild";
 // @ts-expect-error Node-only test adapter; the production Worker/browser targets omit Node types.
 import { Worker } from "node:worker_threads";
@@ -125,6 +126,111 @@ describe("createSearchIndex", () => {
     // an unbounded exemption merely because each individual arm contains literal characters.
     expect(() => index.query({ text: Array.from({ length: 14 }, (_, n) => `absent${n}`).join("|"), mode: "regex", ignoreCase: false }, all))
       .toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+  });
+
+  it("matches every ASCII literal against RE2 with simple-fold exceptions and original offsets", () => {
+    const index = createSearchIndex();
+    const body = Array.from({ length: 128 }, (_, code) => String.fromCharCode(code)).join("")
+      + " Kſ İı ßẞ ss Σσς 𐐀𐐨 😀 é e\u0301 \ud800 \udfff";
+    const fixture = document("ASCII001", body, { filename: "", title: "" });
+    index.add(fixture.summary, fixture.text);
+    for (let code = 0; code < 128; code++) {
+      for (const ignoreCase of [false, true]) {
+        const text = String.fromCharCode(code);
+        const oracle = RE2JS.compile(RE2JS.quote(text), ignoreCase ? RE2JS.CASE_INSENSITIVE : 0);
+        const matcher = oracle.matcher(body);
+        const ranges = [];
+        while (matcher.find()) ranges.push([matcher.start(), matcher.end()]);
+        const actual = index.query(literal(text, ignoreCase), all);
+        expect(actual).toEqual(index.query({ text: `(?:${RE2JS.quote(text)})`, mode: "regex", ignoreCase }, all));
+        expect(actual[0].matchCount).toBe(ranges.length);
+        expect(actual[0].ranges.map(([start, end]) => actual[0].snippet.slice(start, end)))
+          .toEqual(ranges.map(([start, end]) => body.slice(start, end)));
+        oracle.reset();
+      }
+    }
+  });
+
+  it("exhaustively checks every Unicode scalar for pinned RE2 ASCII-fold orbit membership", () => {
+    // Use RE2 itself as oracle, not a copy of the fast path's normalization table.
+    // Chunking keeps strings small while visiting every scalar, including astral planes.
+    const oracle = RE2JS.compile("[\\x00-\\x7f]", RE2JS.CASE_INSENSITIVE);
+    const matched: number[] = [];
+    try {
+      for (let base = 0; base <= 0x10ffff; base += 4096) {
+        const scalars = [];
+        for (let cp = base; cp < Math.min(base + 4096, 0x110000); cp++) {
+          if (cp < 0xd800 || cp > 0xdfff) scalars.push(cp);
+        }
+        const body = String.fromCodePoint(...scalars);
+        const matcher = oracle.matcher(body);
+        while (matcher.find()) matched.push(body.codePointAt(matcher.start())!);
+        const index = createSearchIndex();
+        const fixture = document("Scalars1", body, { title: "", filename: "" });
+        index.add(fixture.summary, fixture.text);
+        // All three ASCII orbits with subtle Unicode counterexamples cross the public seam.
+        expect(index.query({ text: "k|s|i", mode: "regex", ignoreCase: true }, all))
+          .toEqual(index.query({ text: "(?:k|s|i)", mode: "regex", ignoreCase: true }, all));
+      }
+      expect(matched).toEqual([...Array.from({ length: 128 }, (_, cp) => cp), 0x017f, 0x212a]);
+    } finally { oracle.reset(); }
+  });
+
+  it.each(["a|ab", "ab|a", "aba|ba", "ba|aba", "aa|a", "a|aa", "absent|a|late", "late|a|absent", "k|s|i", "K|kK", "a\\|b|a\\.b", "\\[x\\]|\\\\|\\$", "a\nb|a\tb"])(
+    "preserves RE2 leftmost-first alternatives, prefixes, overlaps and escapes (%s)", (text) => {
+      const index = createSearchIndex();
+      const fixture = document("Branches", "ababa aaa late a|b a.b [x] \\ $ a\nb a\tb 😀 KkKſsS İıIi", { title: "", filename: "" });
+      index.add(fixture.summary, fixture.text);
+      for (const ignoreCase of [false, true]) {
+        expect(index.query({ text, mode: "regex", ignoreCase }, all))
+          .toEqual(index.query({ text: `(?:${text})`, mode: "regex", ignoreCase }, all));
+      }
+    },
+  );
+
+  it("preserves field-length, normalization and snippet boundaries without retaining folded records", () => {
+    const index = createSearchIndex();
+    for (const length of [0, 1, 63, 64, 239, 240, 241, 4095, 4096, 524270]) {
+      // Includes the maximum UTF8 body size once emoji, Kelvin and long-s are appended.
+      const fixture = document("Lengths1", "X".repeat(length) + "😀KſIİı KSI", { title: "", filename: "" });
+      index.add(fixture.summary, fixture.text);
+      for (const text of ["ksi", "xk", "K|S|I"]) {
+        const query: SearchQuery = { text, mode: text.includes("|") ? "regex" : "literal", ignoreCase: true };
+        expect(index.query(query, all)).toEqual(index.query({ text: `(?:${text})`, mode: "regex", ignoreCase: true }, all));
+      }
+      expect(index.query(literal("ksi", false), all)).toEqual([]);
+    }
+    index.clear();
+    expect(index.query(literal("ksi"), all)).toEqual([]);
+  });
+
+  it("bounds dense matches even with absent branches and refuses the million-find cap", () => {
+    const index = createSearchIndex();
+    const fixture = document("Dense001", "a".repeat(100000), { title: "", filename: "" });
+    index.add(fixture.summary, fixture.text);
+    expect(index.query({ text: "absent|a|rare", mode: "regex", ignoreCase: true }, all)[0].matchCount).toBe(100000);
+    const large = document("Dense002", "a".repeat(512 * 1024), { title: "", filename: "" });
+    index.add(large.summary, large.text);
+    index.add({ ...large.summary, id: "Dense003" }, { ...large.text, id: "Dense003" });
+    // Freeze only time so this proves the find cap independently of device speed.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    try {
+      expect(() => index.query({ text: "absent|a|rare", mode: "regex", ignoreCase: true }, all))
+        .toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each([0, 1, 2, 3])("checks the unchanged deadline before and after native literal execution (%s)", (checksBeforeExpiry) => {
+    const index = createSearchIndex();
+    const fixture = document("Timeout1", "ASCII Kſ text", { title: "", filename: "" });
+    index.add(fixture.summary, fixture.text);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(1501);
+    // First read establishes the deadline; subsequent reads cover field admission, the
+    // pre-find guard and the post-find guard so no execution strategy can skip the cap.
+    for (let read = 0; read <= checksBeforeExpiry; read++) clock.mockReturnValueOnce(0);
+    try {
+      expect(() => index.query(literal("ascii"), all)).toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+    } finally { clock.mockRestore(); }
   });
 
   it("treats empty queries as filtered listing and never counts zero-width matches", () => {
