@@ -125,7 +125,13 @@ export function createSearchIndex(): SearchIndex {
           let matchCount = 0;
           let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: record.title.slice(0, SNIPPET_LENGTH), ranges: [] };
           for (const field of [record.filename, record.title, record.body]) {
-            if (!regex) work += field.length * instructions;
+            // A quoted literal's nonoverlapping finds consume one field, rather than restarting
+            // a regex search over each remaining suffix. Charge that text once, independent of
+            // literal length; multiplying by program size rejected ordinary terms on admitted
+            // libraries. RE2 still owns Unicode simple folding and UTF-16 offsets. Its constant
+            // costs (including shared literal prefixes) remain bounded by the pattern-size,
+            // find-count and wall-clock guards; this is a scan budget, not an instruction count.
+            if (!regex) work += field.length;
             if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
             if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
             const matcher = pattern.matcher(field);

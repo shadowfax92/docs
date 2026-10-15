@@ -67,6 +67,55 @@ describe("createSearchIndex", () => {
     expect(hit.snippet.length).toBeLessThanOrEqual(243);
   });
 
+  it("preserves RE2 simple-fold classes, literal punctuation and original UTF-16 offsets", () => {
+    const index = createSearchIndex();
+    const fixture = document("Folding1", "K k K ſ s S Σ σ ς ß ẞ ss İ ı I i 𐐀 𐐨 😀 é e\u0301 [a-z]+.*?$^|(){}\\E");
+    index.add(fixture.summary, fixture.text);
+    const cases: [string, string[]][] = [
+      ["k", ["K", "k", "K"]], ["σ", ["Σ", "σ", "ς"]],
+      ["ß", ["ß", "ẞ"]], ["ss", ["ss"]],
+      ["İ", ["İ"]], ["ı", ["ı"]], ["i", ["I", "i"]],
+      ["𐐀", ["𐐀", "𐐨"]], ["é", ["é"]],
+      ["[a-z]+.*?$^|(){}\\E", ["[a-z]+.*?$^|(){}\\E"]],
+    ];
+    for (const [query, expected] of cases) {
+      const hit = index.query(literal(query), all)[0];
+      expect(hit.matchCount).toBe(expected.length);
+      expect(hit.ranges.map(([start, end]) => hit.snippet.slice(start, end))).toEqual(expected);
+    }
+    expect(index.query(literal("ſ"), all)[0].matchCount).toBe(5);
+    const astral = index.query(literal("𐐀", false), all)[0];
+    expect(astral.matchCount).toBe(1);
+    expect(astral.ranges).toEqual([[33, 35]]);
+  });
+
+  it("searches long body and filename literals over a fully admitted 485-document, 10 MiB corpus", () => {
+    const index = createSearchIndex();
+    const needle = "OwnedBodyNeedleec059c3e";
+    const filename = "owned-ec059c3e-pdf-acceptance";
+    const filler = "Ordinary document prose with numbers 0123456789 and punctuation. ";
+    const bodyLength = Math.ceil(10 * 1024 * 1024 / 467);
+    const padding = filler.repeat(Math.ceil(bodyLength / filler.length));
+    for (let number = 0; number < 485; number++) {
+      const prefix = number === 0 ? `${needle} ${needle} ${needle.toLowerCase()} ` : number === 1 ? `${needle} ` : "";
+      const fixture = document(String(number).padStart(8, "0"), number < 467 ? (prefix + padding).slice(0, bodyLength) : "", {
+        filename: number === 484 ? `${filename}.pdf` : `document-${number}.txt`,
+      });
+      if (number >= 467) fixture.text.coverage = "metadata-only";
+      else if (number < 20) fixture.text.coverage = "truncated";
+      index.add(fixture.summary, fixture.text);
+    }
+    expect(index.query(literal(""), all)).toHaveLength(485);
+    for (const ignoreCase of [false, true]) {
+      expect(index.query(literal(needle, ignoreCase), all).map(({ id, matchCount }) => [id, matchCount]))
+        .toEqual([["00000000", ignoreCase ? 3 : 2], ["00000001", 1]]);
+      expect(index.query(literal(filename, ignoreCase), all).map(({ id, matchCount }) => [id, matchCount]))
+        .toEqual([["00000484", 1]]);
+      expect(index.query(literal("ec059c3e", ignoreCase), all).map(({ id, matchCount }) => [id, matchCount]))
+        .toEqual([["00000000", 3], ["00000001", 1], ["00000484", 1]]);
+    }
+  });
+
   it("treats empty queries as filtered listing and never counts zero-width matches", () => {
     const index = createSearchIndex();
     const fixture = document("Empty001", "😀aaa");
