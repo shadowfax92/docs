@@ -164,11 +164,20 @@ p.on('response', async (r) => {
   try { catalogBodies.push({ url: r.url(), body: await r.text() }); } catch { /* redirects / aborted */ }
 });
 
-// Concurrency is sampled at the network layer: one entry per in-flight /raw navigation.
-const rawInflight = new Set();
-let maxRawInflight = 0;
-p.on('request', (r) => { if (/\/[A-Za-z0-9]{8}\/raw$/.test(r.url()) && r.resourceType() === 'document') { rawInflight.add(r); maxRawInflight = Math.max(maxRawInflight, rawInflight.size); } });
-for (const done of ['requestfinished', 'requestfailed']) p.on(done, (r) => rawInflight.delete(r));
+// Network-level concurrency of /raw navigations, from the network stack's own timestamps:
+// [request start, response end] for finished requests, [start, failure event] for cancelled ones.
+// Counting Playwright request/finished events instead over-counts: frames are separate renderer
+// processes, so a finished event can arrive after the frame's load has already freed its slot.
+const isRaw = (r) => /\/[A-Za-z0-9]{8}\/raw$/.test(r.url()) && r.resourceType() === 'document';
+const rawIntervals = [];
+p.on('requestfinished', (r) => { if (isRaw(r)) { const t = r.timing(); rawIntervals.push([t.startTime, t.startTime + t.responseEnd]); } });
+p.on('requestfailed', (r) => { if (isRaw(r)) rawIntervals.push([r.timing().startTime, Date.now()]); });
+const maxConcurrent = (intervals) => {
+  const edges = intervals.flatMap(([a, b]) => [[a, 1], [b, -1]]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  let open = 0, peak = 0;
+  for (const [, delta] of edges) peak = Math.max(peak, open += delta);
+  return peak;
+};
 const rawRequests = () => requests.filter((r) => /\/[A-Za-z0-9]{8}\/raw$/.test(r.url) && r.type === 'document');
 
 const previewState = () => p.evaluate(() => {
@@ -409,6 +418,7 @@ try {
   const peaks = await p.evaluate(() => ({ maxPending: window.__proof.maxPending, maxLive: window.__proof.maxLive }));
   assert(total > MAX_LIVE, `fixture exceeds the live cap (${total} previews)`);
   assert(peaks.maxLive <= MAX_LIVE && peaks.maxPending <= MAX_PENDING, JSON.stringify(peaks));
+  const maxRawInflight = maxConcurrent(rawIntervals);
   assert(maxRawInflight <= MAX_PENDING, `max concurrent /raw ${maxRawInflight}`);
   Object.assign(metrics, { totalPreviews: total, ...peaks, maxRawInflight, rawRequestsTotal: rawRequests().length, liveAtBottom: bottom.live });
   check('bounded: across all previews the page never exceeded 36 live frames or 6 pending loads, evicted offscreen frames and re-attached them on return', metrics);
