@@ -1,6 +1,7 @@
 import type { TextRecord } from "./contracts";
 import type { ResolvedDocument } from "./documents";
 import { decodeHTML } from "entities";
+import { docxText, DOCX_SOURCE_LIMIT } from "./document-text";
 
 const SOURCE_LIMIT = 2 * 1024 * 1024;
 const TEXT_LIMIT = 512 * 1024;
@@ -18,12 +19,13 @@ export async function extractText(doc: ResolvedDocument): Promise<TextRecord> {
     text: "", sourceBytes: doc.summary.sizeBytes, indexedBytes: 0, extractorVersion: 1,
   };
   const { kind, mime, filename } = doc.summary;
-  // Neither a compressed-byte cap nor a PDF page count bounds a parser's internal inflation.
-  // Keep these seams honest until expansion/page/CPU limits are enforceable, not just a bundle smoke.
+  // PDF decompression still lacks enforceable internal expansion/page limits. Native viewing is
+  // independent of extraction; metadata remains searchable without claiming OCR or body coverage.
   if (kind === "pdf" || /\.pdf$/i.test(filename)) {
     return { ...record, reason: "PDF text extraction is not enabled: bounded stream expansion and page parsing are not yet verified. No OCR is performed." };
   }
-  if (kind === "office" || /\.(?:docx?|xlsx?|pptx?|odt)$/i.test(filename)) {
+  const docx = /\.docx$/i.test(filename) || /^application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document(?:;|$)/i.test(mime);
+  if (!docx && (kind === "office" || /\.(?:docx?|xlsx?|pptx?|odt)$/i.test(filename))) {
     return { ...record, reason: "Office text extraction is not enabled: actual ZIP expansion and XML parser limits are not yet verified." };
   }
   // Legacy uploads often label source files application/octet-stream. Recognize their names
@@ -31,14 +33,17 @@ export async function extractText(doc: ResolvedDocument): Promise<TextRecord> {
   const sourceFile = /\.(?:txt|md|markdown|mdx|html?|jsonl?|ndjson|csv|tsv|xml|ya?ml|toml|ini|conf|cfg|properties|log|sh|bash|zsh|fish|py|rb|go|rs|c|h|cpp|hpp|cs|fsx?|java|[cm]?js|jsx|[cm]?ts|tsx|css|scss|less|sql|graphql|vue|svelte|lua|vim|el|clj|exs?|erl|hrl|hs|ml|mli|php|pl|pm|r|jl|swift|kts?|scala|dart|tex|rst)$/i.test(filename)
     || /^(?:makefile|dockerfile|gemfile|rakefile|\.(?:gitignore|gitattributes|editorconfig|env))$/i.test(filename);
   const textMime = /^(?:text\/|application\/(?:json|[\w.+-]+\+json|xml|[\w.+-]+\+xml|javascript|x-javascript|typescript|sql|yaml|x-yaml)(?:;|$))/i.test(mime);
-  if (!["html", "markdown", "text", "data"].includes(kind) && !sourceFile && !textMime) {
+  if (!docx && !["html", "markdown", "text", "data"].includes(kind) && !sourceFile && !textMime) {
     return { ...record, reason: "This format is searched by name and title only; content extraction is unsupported." };
   }
   const charset = /charset\s*=\s*["']?([^\s;"']+)/i.exec(mime)?.[1]?.toLowerCase();
-  if (charset && !["utf-8", "utf8", "us-ascii", "ascii"].includes(charset)) {
+  if (!docx && charset && !["utf-8", "utf8", "us-ascii", "ascii"].includes(charset)) {
     return { ...record, reason: "Only UTF-8 source text is supported; the declared encoding is unsupported." };
   }
   try {
+    if (docx && (doc.objects[0]?.sizeBytes ?? doc.summary.sizeBytes) > DOCX_SOURCE_LIMIT) {
+      return { ...record, coverage: "error", reason: "DOCX exceeds the 2 MiB compressed source limit." };
+    }
     const body = await doc.openBody({ maxBytes: SOURCE_LIMIT + 1 });
     if (!body) return { ...record, coverage: "error", reason: "The document was removed before its text could be read." };
     const input = await readPrefix(body.body, SOURCE_LIMIT + 1);
@@ -48,19 +53,20 @@ export async function extractText(doc: ResolvedDocument): Promise<TextRecord> {
     try {
       // A source cutoff may bisect a UTF-8 code point: streaming decode drops only that unfinished
       // suffix. Invalid bytes anywhere before it still fail, rather than silently replacing text.
-      source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(input.bytes.subarray(0, SOURCE_LIMIT), { stream: sourceTruncated });
+      source = docx ? docxText(input.bytes) : new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(input.bytes.subarray(0, SOURCE_LIMIT), { stream: sourceTruncated });
     } catch {
-      return { ...record, coverage: "error", reason: "The source is not valid UTF-8 text." };
+      return { ...record, coverage: "error", reason: docx ? "DOCX could not be parsed within the bounded ZIP/XML limits." : "The source is not valid UTF-8 text." };
     }
     if (/[\u0000-\u0008\u000b\u000e-\u001f]/u.test(source)) {
       return { ...record, reason: "The source contains binary control bytes; only its name and title are searchable." };
     }
     const html = kind === "html" || /^text\/html(?:;|$)/i.test(mime) || /\.html?$/i.test(filename);
-    const text = html ? await htmlText(source) : source;
+    const text = !docx && html ? await htmlText(source) : source;
     const output = new Uint8Array(TEXT_LIMIT);
     // encodeInto never splits a Unicode scalar value; indexedBytes measures actual UTF-8 output.
     const { read, written } = encoder.encodeInto(text, output);
     const reasons: string[] = [];
+    if (docx) reasons.push("Only DOCX main-document text was extracted; headers, images, embedded objects and Word layout are not included.");
     if (sourceTruncated) reasons.push("Only the first 2 MiB of source bytes were read.");
     if (read < text.length) reasons.push("Extracted text was limited to 512 KiB UTF-8.");
     if (doc.summary.objectCount > 1) reasons.push("Only the primary object of this multi-object document was extracted.");

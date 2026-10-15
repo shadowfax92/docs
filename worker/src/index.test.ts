@@ -382,7 +382,7 @@ describe("legacy public document routes", () => {
   });
 });
 
-describe("Documents interface and unavailable modules", () => {
+describe("Documents and trusted asset interfaces", () => {
   it("derives aggregate metadata and versions from storage, ignoring a legacy client timestamp", async () => {
     const bucket = await fixture("a.html", "<h1>A</h1>", "text/html");
     await bucket.put(`${uploadId}/b.html`, "B", { customMetadata: { uploadedAt: "1900-01-01T00:00:00Z" } });

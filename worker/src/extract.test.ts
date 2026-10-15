@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
+import { strToU8, zipSync } from "fflate";
 import type { TextRecord } from "./contracts";
 
 // Only storage is substituted: the production extractor and native HTMLRewriter run in workerd.
@@ -125,8 +126,47 @@ describe("extractText in native workerd", () => {
     expect(encoding.record.reason).toContain("encoding");
   });
 
-  it("leaves binary formats unopened and identifies the exact PDF/DOCX extraction seam", async () => {
-    for (const [name, kind, source] of [["bad.pdf", "pdf", "%PDF corrupt"], ["bad.docx", "office", "PK corrupt"], ["data.zip", "archive", "PK"], ["photo.png", "image", "PNG"]]) {
+  it("searches compressed DOCX main text through the bounded parser with honest coverage", async () => {
+    const xml = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>BodyOnlySentinel &amp; 😀</w:t></w:r></w:p></w:body></w:document>';
+    const bytes = zipSync({ "word/document.xml": strToU8(xml), "word/media/ignored.bin": new Uint8Array(2 * 1024 * 1024) });
+    const result = await extract(bytes, "name=report.docx&kind=office&mime=application/octet-stream");
+    expect(result.opened).toBe(true);
+    expect(result.record).toMatchObject({ coverage: "truncated", text: "BodyOnlySentinel & 😀", sourceBytes: bytes.length });
+    expect(result.record.reason).toContain("main-document");
+    expect(result.record.indexedBytes).toBe(new TextEncoder().encode(result.record.text).length);
+  });
+
+  it("keeps malformed, CRC-corrupt, forged-expansion and deep XML DOCX visible with error coverage", async () => {
+    const xml = (body: string) => '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' + body + '</w:body></w:document>';
+    const packed = (body: string) => zipSync({ "word/document.xml": strToU8(body) });
+    const corrupt = zipSync({ "word/document.xml": strToU8(xml('<w:p><w:t>safe</w:t></w:p>')) }, { level: 0 });
+    corrupt[50] ^= 1;
+    const bomb = packed(xml('<w:p><w:t>' + "x".repeat(2 * 1024 * 1024) + '</w:t></w:p>'));
+    const view = new DataView(bomb.buffer, bomb.byteOffset, bomb.byteLength);
+    view.setUint32(22, 100, true);
+    for (let i = 0; i + 46 <= bomb.length; i++) if (view.getUint32(i, true) === 0x02014b50) view.setUint32(i + 24, 100, true);
+    for (const bytes of [strToU8("not zip"), corrupt, bomb, packed(xml('<w:p>'.repeat(65) + '</w:p>'.repeat(65))), packed('<!DOCTYPE x [<!ENTITY x SYSTEM "https://evil.example">]>' + xml('<w:t>&x;</w:t>'))]) {
+      const { record } = await extract(bytes, "name=bad.docx&kind=office");
+      expect(record).toMatchObject({ coverage: "error", text: "", indexedBytes: 0, id: "Ab12Cd34" });
+      expect(record.reason).toContain("ZIP/XML limits");
+    }
+  });
+
+  it("bounds DOCX source and UTF-8 output, retaining primary-only coverage", async () => {
+    const large = new Uint8Array(2 * 1024 * 1024 + 1);
+    const rejected = await extract(large, "name=large.docx&kind=office");
+    expect(rejected.opened).toBe(false);
+    expect(rejected.record).toMatchObject({ coverage: "error", indexedBytes: 0 });
+    const xml = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:t>' + "😀".repeat(150000) + '</w:t></w:p></w:body></w:document>';
+    const { record } = await extract(zipSync({ "word/document.xml": strToU8(xml) }), "name=large.docx&kind=office&objects=2");
+    expect(record).toMatchObject({ coverage: "truncated", indexedBytes: 512 * 1024 });
+    expect(record.text).toBe("😀".repeat(131072));
+    expect(record.reason).toContain("512 KiB");
+    expect(record.reason).toContain("primary object");
+  });
+
+  it("leaves unsupported binary formats unopened and identifies the PDF extraction limit", async () => {
+    for (const [name, kind, source] of [["bad.pdf", "pdf", "%PDF corrupt"], ["data.zip", "archive", "PK"], ["photo.png", "image", "PNG"]]) {
       const result = await extract(source, `name=${name}&kind=${kind}&mime=application/octet-stream`);
       expect(result.opened).toBe(false);
       expect(result.record).toMatchObject({ coverage: "metadata-only", text: "", indexedBytes: 0 });

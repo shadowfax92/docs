@@ -17,6 +17,8 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",
     "esbuild": "0.28.2",
+    "miniflare": "3.20250718.3",
+    "playwright": "1.58.2",
     "typescript": "^5.7.0",
     "vitest": "^4.1.6",
     "wrangler": "^3.99.0"
