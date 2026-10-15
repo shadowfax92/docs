@@ -356,4 +356,3 @@ const image=document.querySelector('[data-image]');if(image)image.addEventListen
 const media=document.querySelector('audio,video,[data-image]'),error=document.querySelector('[data-media-error]');if(media&&error){const fail=()=>{error.hidden=false};media.addEventListener('error',fail);if(media.error||(media.tagName==='IMG'&&media.complete&&media.naturalWidth===0))fail()}
 for(const node of document.querySelectorAll('[data-uploaded]')){const date=new Date(node.dateTime);if(!Number.isNaN(date.getTime())){const days=Math.floor((Date.now()-date.getTime())/86400000);node.textContent=date.toLocaleString()+(days>=0?' · '+(days===0?'today':days+'d ago'):'');node.title=date.toISOString()}}
 })();`;
-
