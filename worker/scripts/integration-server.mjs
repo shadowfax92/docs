@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 /** Disposable two-origin acceptance environment. All product code runs unchanged in workerd;
  * only the external Cloudflare account is replaced with one shared native local R2 bucket.
@@ -91,7 +92,7 @@ export async function seed(mf) {
   execFileSync('ffmpeg', ['-loglevel','error','-y','-f','lavfi','-i','color=c=blue:s=160x90:d=1','-c:v','libvpx-vp9',resolve(state,'video.webm')]);
   await put('WaveAud1', 'tone.wav', await readFile(resolve(state,'tone.wav')), 'WAV fixture', 'audio/wav');
   await put('WebmVid1', 'video.webm', await readFile(resolve(state,'video.webm')), 'WebM fixture', 'video/webm');
-  await put('BadMedia', 'bad.mp4', 'unsupported codec payload', 'Unsupported MP4', 'video/mp4');
+  await put('BadMedia', 'bad.mp4', 'unsupported codec payload', 'Invalid MP4', 'video/mp4');
   await writeFile(resolve(state,'fixtures.json'), JSON.stringify(fixtures,null,2));
   return fixtures;
 }
@@ -120,7 +121,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try { await mf.ready; await seed(mf); } finally { await mf.dispose(); }
   await prepareAdapter();
   mf=runtime(); await mf.ready;
-  const info={pid:process.pid,publicOrigin,catalogOrigin,state,startedAt:new Date().toISOString(),stop:`kill -TERM ${process.pid}`};
+  const bundleSha256=createHash('sha256').update(await readFile(resolve(root,'.wrangler/build/index.js'))).digest('hex');
+  const sourceCommit=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
+  const info={pid:process.pid,publicOrigin,catalogOrigin,state,sourceCommit,bundleSha256,startedAt:new Date().toISOString(),stop:`kill -TERM ${process.pid}`};
   await writeFile(resolve(state,'server.json'),JSON.stringify(info,null,2));
   console.log(JSON.stringify(info));
   // Out-of-band replacement is deliberately confined to one disposable legacy fixture, so an

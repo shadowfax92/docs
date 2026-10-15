@@ -11,6 +11,7 @@ import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, state 
  */
 await mkdir(resolve(state,'screenshots'),{recursive:true});
 const checks=[];
+let complete=false;
 const check=(name,details={})=>{checks.push({name,...details});console.log(`PASS ${name}`);};
 const browser=await chromium.launch({headless:true,channel:'chromium',...(process.env.DOCS_CHROMIUM?{executablePath:process.env.DOCS_CHROMIUM}:{})});
 const context=await browser.newContext({viewport:{width:1440,height:1000},permissions:['clipboard-read','clipboard-write']});
@@ -52,7 +53,7 @@ try {
   await page.locator('video').evaluate(e=>e.play());await page.waitForFunction(()=>document.querySelector('video').currentTime>0);
   await shot(page,'public-video');
   await page.goto(pub+'/BadMedia');await page.locator('[data-media-error]').waitFor({state:'visible'});
-  check('browser decodes PNG, plays PCM WAV and VP9 WebM; unsupported MP4 displays codec fallback');
+  check('browser decodes PNG, plays PCM WAV and VP9 WebM; invalid MP4 displays media error fallback');
   await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');
   await page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
   // Chromium's PDF guest paints asynchronously after its extension frame navigates.
@@ -78,8 +79,9 @@ try {
   await hostile.close();await trusted.close();
   if (!process.argv.includes('--public-only')) await catalogProof(context,shot,check);
   assert.deepEqual(errors,[]);
+  complete=true;
 } finally {
-  await writeFile(resolve(state,'browser-results.json'),JSON.stringify({checks,errors,browser:browser.version(),limitations:'Headless local Chromium; other devices/codecs, OCR and deployed Cloudflare CPU/tier remain unverified.'},null,2));
+  await writeFile(resolve(state,'browser-results.json'),JSON.stringify({complete,scope:process.argv.includes('--public-only')?'public-only':'full',checks,errors,browser:browser.version(),limitations:'Headless local Chromium; other devices/codecs, OCR and deployed Cloudflare CPU/tier remain unverified.'},null,2));
   await browser.close();
 }
 

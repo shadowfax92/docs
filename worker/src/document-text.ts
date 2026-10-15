@@ -81,8 +81,8 @@ function crc32(bytes: Uint8Array): number {
 }
 
 /** Conservative WordprocessingML text reader: no DOM, entity expansion, relationship resolution
- * or HTML conversion. Only w:t and paragraph/table separators are emitted, then HTML-escaped by
- * linesBody. Unsupported/malformed XML fails closed to the original download, never partial markup.
+ * or HTML conversion. Only w:t and paragraph/table separators are emitted as plain text; each
+ * caller owns its presentation/coverage. Unsupported XML rejects the whole extraction, never partial markup.
  */
 function wordText(xml: string): string {
   const invalid = () => new DocumentTextFailure("This DOCX has invalid or unsupported document XML. Download the original.");

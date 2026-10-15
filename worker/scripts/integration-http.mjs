@@ -8,6 +8,7 @@ import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, bearer
  * Credentials here are disposable fixture values. No .env, Cloudflare account or live URL is read.
  */
 const checks=[];
+let complete=false;
 const check=(name,details={})=>{checks.push({name,...details});console.log(`PASS ${name}`);};
 const privateHeaders=r=>{
   assert.equal(r.headers.get('cache-control'),'no-store');
@@ -31,7 +32,7 @@ try {
   for(const value of ['Secure','HttpOnly','SameSite=Strict','Path=/']) assert(r.headers.get('set-cookie').includes(value));
   assert.equal((await request('/all-docs/session')).status,200);
   check('wrong/right password, signed secure host-only session and reload bootstrap');
-  for(const headers of [{Origin:pub},{'X-Docs-Catalog':''},{Origin:cat,'Sec-Fetch-Site':'cross-site'}]){r=await request('/all-docs/api/documents',{headers});assert.equal(r.status,403);privateHeaders(r);}
+  for(const headers of [{Origin:pub},{'X-Docs-Catalog':''},{Origin:cat,'Sec-Fetch-Site':'cross-site'},{Origin:cat,'Sec-Fetch-Site':'same-site'}]){r=await request('/all-docs/api/documents',{headers});assert.equal(r.status,403);privateHeaders(r);}
   r=await request('/all-docs/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});assert.equal(r.status,403);
   r=await fetch(cat+'/all-docs/api/documents',{method:'OPTIONS',headers:{Origin:pub,'Access-Control-Request-Headers':'x-docs-catalog'}});assert.equal(r.status,404);privateHeaders(r);
   check('cross-origin/custom-header/Fetch-Metadata/preflight and missing-CSRF refusal');
@@ -86,6 +87,7 @@ try {
   r=await request('/all-docs/session',{method:'DELETE',headers:{'X-CSRF-Token':csrf}});assert.equal(r.status,204);assert.match(r.headers.get('set-cookie'),/Max-Age=0/);
   cookie='';assert.equal((await request('/all-docs/session')).status,401);
   check('logout clears cookie and anonymous bootstrap fails');
+  complete=true;
 } finally {
-  await writeFile(resolve(state,'http-results.json'),JSON.stringify({checks,limitations:'Local workerd/R2 only; no deployed-tier CPU, device, production or OCR proof.'},null,2));
+  await writeFile(resolve(state,'http-results.json'),JSON.stringify({complete,checks,limitations:'Local workerd/R2 only; no deployed-tier CPU, device, production or OCR proof.'},null,2));
 }
