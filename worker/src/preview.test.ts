@@ -376,9 +376,12 @@ it("opens empty objects without an invalid R2 byte range before page/conditional
 it("formats JSON without changing numeric tokens, negative zero, or duplicate keys", async () => {
   const input = '{"n":9007199254740993,"big":1e400,"small":1e-4000,"zero":-0,"same":1,"same":2}';
   const html = await (await renderDocument(document("precise.json", input).doc, "page", request())).text();
-  for (const expected of ['9007199254740993', '1e400', '1e-4000', ': -0', '&#34;same&#34;: 1', '&#34;same&#34;: 2']) expect(html).toContain(expected);
-  expect(html).not.toContain('9007199254740992');
-  expect(html).not.toContain(': null');
+  // The injected runtime has its own defaults; fidelity applies to document content.
+  const content = /<main\b[^>]*>([\s\S]*?)<\/main>/i.exec(html)?.[1];
+  expect(content).toBeDefined();
+  for (const expected of ['9007199254740993', '1e400', '1e-4000', ': -0', '&#34;same&#34;: 1', '&#34;same&#34;: 2']) expect(content).toContain(expected);
+  expect(content).not.toContain('9007199254740992');
+  expect(content).not.toContain(': null');
 });
 
 it("preserves validated HTML charsets and exact originals", async () => {

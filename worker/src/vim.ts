@@ -20,7 +20,7 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
   if (!response.body || response.status !== 200 ||
       !/^text\/html(?:\s*;|$)/i.test(headers.get("Content-Type") || "") ||
       /charset\s*=\s*["']?(?!utf-8\b|utf8\b)[\w-]+/i.test(headers.get("Content-Type") || "") ||
-      headers.has("Content-Security-Policy") || headers.has("Content-Range") ||
+      !permitsInlineLayer(headers.get("Content-Security-Policy")) || headers.has("Content-Range") ||
       /attachment/i.test(headers.get("Content-Disposition") || "") ||
       /\bno-transform\b/i.test(headers.get("Cache-Control") || "") ||
       (headers.has("Content-Encoding") && headers.get("Content-Encoding") !== "identity")) return response;
@@ -83,6 +83,30 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
   return new Response(new ReadableStream<Uint8Array>({
     start(controller) { controller.enqueue(bytes); controller.enqueue(suffix); controller.close(); },
   }), { status: response.status, statusText: response.statusText, headers: updated });
+}
+
+/** Recognize CSP permission, never grant it. Generated previews explicitly allow
+ * inline scripts/styles; source policies may instead require a nonce/hash. CSP3
+ * intersects comma-separated policies, takes the first duplicate directive, and
+ * lets *-src-elem override *-src/default-src. Unknown restrictive mechanisms are
+ * declined rather than minting nonces or changing the authored policy.
+ * Reference: https://www.w3.org/TR/CSP/#allow-all-inline
+ */
+function permitsInlineLayer(csp: string | null): boolean {
+  if (csp === null) return true;
+  return csp.split(",").every(policy => {
+    const directives = new Map<string, string[]>();
+    for (const directive of policy.split(";")) {
+      const [name, ...values] = directive.trim().toLowerCase().split(/\s+/);
+      if (name && !directives.has(name)) directives.set(name, values);
+    }
+    if (directives.has("sandbox") || directives.has("require-trusted-types-for")) return false;
+    return ["script", "style"].every(kind => {
+      const values = directives.get(`${kind}-src-elem`) ?? directives.get(`${kind}-src`) ?? directives.get("default-src");
+      return values === undefined || (values.includes("'unsafe-inline'") &&
+        !values.some(value => /^'(?:nonce-|sha(?:256|384|512)-|strict-dynamic'|none')/.test(value)));
+    });
+  });
 }
 
 /** Conservative lexical inspection, not HTML sanitization. Source is never

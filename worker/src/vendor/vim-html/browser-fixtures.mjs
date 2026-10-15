@@ -22,7 +22,9 @@ const server = createServer(async (req, res) => {
   try {
     const path = new URL(req.url, "http://localhost").pathname;
     const source = path === "/baked" ? baked : path === "/fragment" ? "<h1>Fragment</h1><p>Alpha</p><p>Needle</p>" : plain;
-    let response = new Response(source, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    const headers = { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" };
+    if (path === "/csp") headers["Content-Security-Policy"] = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'";
+    let response = new Response(source, { headers });
     if (path !== "/raw") {
       response = await enhanceHtml(response, { id: "Ab12Cd34", title: "Authored fixture", publicUrl: `http://127.0.0.1:${server.address().port}${path}` });
       if (path === "/repeat") response = await enhanceHtml(response, { id: "Other123", title: "Must not replace", publicUrl: "https://wrong.example/Other123" });

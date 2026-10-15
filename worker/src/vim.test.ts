@@ -50,6 +50,10 @@ describe("public HTML vim enhancement", () => {
 
   it.each<Record<string, string>>([
     { "Content-Security-Policy": "default-src 'self'" },
+    { "Content-Security-Policy": "script-src 'unsafe-inline' 'nonce-fixed'; style-src 'unsafe-inline'" },
+    { "Content-Security-Policy": "script-src 'unsafe-inline'; style-src 'unsafe-inline', default-src 'none'" },
+    { "Content-Security-Policy": "script-src 'unsafe-inline'; script-src-elem 'none'; style-src 'unsafe-inline'" },
+    { "Content-Security-Policy": "script-src 'unsafe-inline'; style-src 'unsafe-inline'; sandbox" },
     { "Content-Type": "text/plain" }, { "Content-Type": "text/html; charset=windows-1252" },
     { "Content-Encoding": "gzip" }, { "Cache-Control": "public, no-transform" },
     { "Content-Range": "bytes 0-9/20" }, { "Content-Disposition": "attachment" },
@@ -57,6 +61,13 @@ describe("public HTML vim enhancement", () => {
     const response = htmlResponse("<h1>Original</h1>", headers);
     expect(await enhanceHtml(response, identity)).toBe(response);
     expect(response.bodyUsed).toBe(false);
+  });
+
+  it("enhances generated previews whose unchanged CSP permits the offline inline layer", async () => {
+    const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' https: http: data:; media-src 'self'; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'";
+    const response = await enhanceHtml(htmlResponse("<main><p>Generated text</p></main>", { "Content-Security-Policy": policy }), identity);
+    expect((await response.text()).includes('data-vh="runtime"')).toBe(true);
+    expect(response.headers.get("Content-Security-Policy")).toBe(policy);
   });
 
   it("retains byte fidelity for invalid UTF-8 and BOM/CRLF source", async () => {
