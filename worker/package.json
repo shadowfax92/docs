@@ -3,16 +3,27 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "build": "wrangler deploy --dry-run --outdir dist",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "test": "node scripts/build.mjs && vitest run",
+    "typecheck": "node scripts/build.mjs && tsc --noEmit && tsc -p tsconfig.browser.json --noEmit",
+    "bundle": "node scripts/build.mjs",
+    "build": "wrangler deploy --dry-run --no-bundle --outdir dist/public && wrangler deploy --config wrangler.catalog.toml --dry-run --no-bundle --outdir dist/catalog",
+    "dev": "wrangler dev --no-bundle",
+    "dev:catalog": "wrangler dev --no-bundle --config wrangler.catalog.toml",
+    "deploy": "wrangler deploy --no-bundle",
+    "deploy:catalog": "wrangler deploy --no-bundle --config wrangler.catalog.toml"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",
+    "esbuild": "0.28.2",
     "typescript": "^5.7.0",
     "vitest": "^4.1.6",
     "wrangler": "^3.99.0"
+  },
+  "dependencies": {
+    "fflate": "0.8.3",
+    "mammoth": "1.13.0",
+    "markdown-it": "15.0.2",
+    "re2js": "2.8.6",
+    "unpdf": "1.8.1"
   }
 }
