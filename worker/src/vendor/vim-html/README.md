@@ -12,13 +12,15 @@ Regenerate the checked-in TypeScript strings with:
 The normal Worker bundler imports `generated.ts`; no manifest/build-script changes
 or network access are needed. `generate.py` applies three small hosting changes:
 
-- Keyboard dispatch honors `defaultPrevented`, native clickable controls, and an
+- Keyboard dispatch honors `defaultPrevented`, native clickable controls (including
+  Space/Enter on the hosting buttons), authored modals, ARIA text widgets, and an
   adapter-owned `VH.disabled` flag. All motions/search/selection/comments/export,
   modes, storage, folding and help are the authentic skill implementation.
 - The gutter margin and status `body::after` rules are omitted to retain authored
   layout and pseudo-content. Gutters may clip on pages without left whitespace.
 - `host.js`/`host.css` add small help/off buttons inside the existing UI layer.
-  Off lasts for the page load and leaves stored comments intact. A global guard
+  Off clears pending key sequences and remembers `docs-vim=off` on this public
+  origin (session-only if storage fails), leaving stored comments intact. A global guard
   prevents this bundle from booting over an already-live `window.__VH`.
 
 Upstream's `make_script_safe` and `make_style_safe` protect HTML end tags and make

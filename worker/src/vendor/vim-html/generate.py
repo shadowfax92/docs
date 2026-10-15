@@ -24,9 +24,22 @@ js = js.replace(needle, needle + """
   // Honor an earlier capture listener that already claimed a keyboard event.
   if (VH.disabled || e.defaultPrevented) return;
   var control = targetOf(e);
+  // Native button activation must work inside the runtime's own help/off UI.
+  if (control && control.closest && control.closest('button, summary, a[href]') &&
+      (e.key === ' ' || e.key === 'Enter')) return;
+  // An authored modal owns all its keys, including when its focused widget is
+  // implemented by page JavaScript rather than a native input.
+  if (!isOurs(control) && Array.prototype.some.call(
+      document.querySelectorAll('dialog[open], [aria-modal="true"]'),
+      function (el) { return !isOurs(el); })) return;
   if (!isOurs(control) && control && control.closest &&
       control.closest('button, a[href], input, select, summary, audio, video') &&
       !isEditable(control)) return;
+""")
+editable = "  if (el.isContentEditable) return true;"
+assert js.count(editable) == 1
+js = js.replace(editable, editable + """
+  if (el.closest && el.closest('[role="textbox"], [role="combobox"], [role="searchbox"]')) return true;
 """)
 # A defensive guard also covers authors dynamically loading a runtime before us.
 js = "if (!window.__VH) {\n" + js + "\n" + build.make_script_safe((ROOT / "host.js").read_text()) + "\n}"

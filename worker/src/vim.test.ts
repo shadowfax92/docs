@@ -41,6 +41,9 @@ describe("public HTML vim enhancement", () => {
     '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'"><p>Protected</p>',
     '<script>unterminated', '<style>unterminated', '<!-- incomplete',
     '<template><p>Inert</p>', '<svg><text>Foreign</text>', '<plaintext>All text', '<p title="incomplete',
+    '<h1>One</h1><script><!--<script></script>',
+    '<template><p>Hidden</p></svg>', '<svg><p>Hidden</p></template>',
+    '<meta charset="windows-1252"><p>Legacy encoding</p>',
   ])("declines CSP and unfinished parser contexts instead of breaking authored content", async (body) => {
     expect(await (await enhanceHtml(htmlResponse(body), identity)).text()).toBe(body);
   });

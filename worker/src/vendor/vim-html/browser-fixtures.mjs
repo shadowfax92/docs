@@ -17,7 +17,7 @@ const plain = `<!doctype html><html><head><meta charset="utf-8"><title>Authored 
 <script>window.authored={boots:1,keys:[],submitted:0,clicks:0};window.addEventListener('keydown',e=>window.authored.keys.push(e.key));document.querySelector('form').addEventListener('submit',e=>{e.preventDefault();window.authored.submitted++;document.querySelector('#result').textContent=document.querySelector('#notes').value});document.querySelector('#native').onclick=()=>window.authored.clicks++;</script></body></html>`;
 // stdin/stdout uses the vendored, unchanged build.py --theme none path. Baking
 // source/storage identity here tests that the hosting module never replaces it.
-const baked = execFileSync("python3", ["-c", "import sys;sys.path.insert(0,sys.argv[1]);import build;print(build.build(sys.stdin.read(),theme='none',source='/synthetic/authored.html',key='baked-fixture')[0])", fileURLToPath(new URL("upstream/scripts", import.meta.url))], { input: plain, encoding: "utf8" });
+const baked = execFileSync("python3", ["-B", "-c", "import sys;sys.path.insert(0,sys.argv[1]);import build;print(build.build(sys.stdin.read(),theme='none',source='/synthetic/authored.html',key='baked-fixture')[0])", fileURLToPath(new URL("upstream/scripts", import.meta.url))], { input: plain, encoding: "utf8" });
 const server = createServer(async (req, res) => {
   try {
     const path = new URL(req.url, "http://localhost").pathname;

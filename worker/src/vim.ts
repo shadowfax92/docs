@@ -93,12 +93,12 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
 function canEnhance(html: string): boolean {
   if (/vim-html:(?:head|body):(?:begin|end)|\bdata-vh\s*=|\b(?:window\.)?(?:VIM_HTML|__VH)\b/i.test(html)) return false;
   let at = 0;
-  let inertDepth = 0;
+  const inertTags: string[] = [];
   const token = /<!--|<!\[CDATA\[|<\/?[a-z][\w:-]*(?=[\s/>])|<!|<\?/ig;
   for (;;) {
     token.lastIndex = at;
     const match = token.exec(html);
-    if (!match) return inertDepth === 0 && html.lastIndexOf("<") <= html.lastIndexOf(">");
+    if (!match) return inertTags.length === 0 && html.lastIndexOf("<") <= html.lastIndexOf(">");
     const start = match.index;
     if (match[0] === "<!--") {
       const end = html.indexOf("-->", token.lastIndex);
@@ -124,8 +124,11 @@ function canEnhance(html: string): boolean {
     if (tag === "<meta" && /charset\s*=/i.test(html.slice(start, end + 1)) &&
         !/charset\s*=\s*["']?utf-?8\b/i.test(html.slice(start, end + 1))) return false;
     if (/^<\/?(?:template|svg|math|select)$/.test(tag)) {
-      inertDepth += tag.startsWith("</") ? -1 : 1;
-      if (inertDepth < 0) return false;
+      // Different inert contexts cannot balance one another. An unmatched
+      // </svg>, for example, does not close an outstanding HTML <template>.
+      if (tag.startsWith("</")) {
+        if (inertTags.pop() !== tag.slice(2)) return false;
+      } else inertTags.push(tag.slice(1));
     }
     at = end + 1;
     if (/^<(?:script|style|title|textarea|xmp|iframe|noembed|noframes|noscript)$/.test(tag)) {
@@ -133,6 +136,10 @@ function canEnhance(html: string): boolean {
       close.lastIndex = at;
       const closing = close.exec(html);
       if (!closing) return false;
+      // In script's legacy double-escaped state an apparent </script> may only
+      // leave that state, rather than close the element. Decline nested script
+      // text instead of attempting the browser's full script tokenizer here.
+      if (tag === "<script" && /<script(?=[\s/>])/i.test(html.slice(at, closing.index))) return false;
       at = close.lastIndex;
     }
   }
