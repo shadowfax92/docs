@@ -147,8 +147,13 @@ describe("role isolation", () => {
     expect(bucket.listCalls).toEqual([]);
   });
 
-  it("fails closed on every catalog path without invoking public storage", async () => {
-    for (const path of ["/", "/all-docs", "/all-docs/api/documents", `/${uploadId}`, `/${uploadId}/raw`, "/upload"]) {
+  it("serves trusted catalog assets and rejects unauthenticated JSON and unknown paths without public storage", async () => {
+    for (const [path, status] of [
+      ["/all-docs", 200], ["/all-docs/assets/app.js", 200],
+      ["/all-docs/api/documents", 401], ["/all-docs/session", 401],
+      ["/", 404], [`/${uploadId}`, 404], [`/${uploadId}/raw`, 404],
+      [`/${uploadId}/download`, 404], ["/upload", 404],
+    ] as const) {
       const bucket = new FakeBucket({});
       const response = await worker.fetch(new Request(`https://library.example${path}`), {
         DOCS_BUCKET: bucket as unknown as R2Bucket,
@@ -156,16 +161,24 @@ describe("role isolation", () => {
         PUBLIC_DOCS_ORIGIN: "https://docs.example",
         CATALOG_ORIGIN: "https://library.example",
         ALL_DOCS_PASSWORD: "fixture-password",
-        CATALOG_SESSION_KEY: "fixture-signing-key",
+        CATALOG_SESSION_KEY: "fixture-signing-key-at-least-32-bytes",
       });
-
-      expect(response.status).toBe(503);
+      expect(response.status).toBe(status);
       expect(response.headers.get("Cache-Control")).toBe("no-store");
       expect(response.headers.get("X-Robots-Tag")).toContain("noindex");
       expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
       expect(response.headers.get("Set-Cookie")).toBeNull();
       expect(bucket.listCalls).toEqual([]);
     }
+    const bucket = new FakeBucket({});
+    const response = await worker.fetch(new Request("https://library.example/all-docs"), {
+      DOCS_BUCKET: bucket as unknown as R2Bucket, APP_ROLE: "catalog",
+      PUBLIC_DOCS_ORIGIN: "https://docs.example", CATALOG_ORIGIN: "https://library.example",
+      ALL_DOCS_PASSWORD: "", CATALOG_SESSION_KEY: "",
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(bucket.listCalls).toEqual([]);
   });
 
   it("never resolves arbitrary or private prefixes as public documents", async () => {
