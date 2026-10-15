@@ -30,7 +30,7 @@ injected content ASCII. The hosting module separately escapes config JSON.
 UTF-8 HTML up to 4 MiB gets a suffix after the untouched original bytes, including
 fragments and omitted head/body tags. Baked markers/config/runtime anywhere in the
 source are conservatively left untouched, retaining comment/source identity.
-Restrictive header CSP, any meta CSP, no-transform, non-UTF-8, compressed, partial, attachment, malformed
+Restrictive/non-ASCII header CSP, any meta CSP, no-transform, non-UTF-8, compressed, partial, attachment, malformed
 unclosed raw-text/inert contexts, and larger pages are served unchanged. No CSP
 is relaxed. Generated previews' existing inline-permissive header CSP is retained
 and recognized, including directive fallbacks, nonce/hash restrictions and the

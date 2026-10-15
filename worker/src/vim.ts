@@ -94,10 +94,14 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
  */
 function permitsInlineLayer(csp: string | null): boolean {
   if (csp === null) return true;
+  // CSP tokenization uses ASCII whitespace, unlike JavaScript's \s/trim. A
+  // Unicode space must not turn an invalid directive into a permissive first
+  // duplicate and hide the browser's effective restrictive directive.
+  if (/[^\t\x20-\x7e]/.test(csp)) return false;
   return csp.split(",").every(policy => {
     const directives = new Map<string, string[]>();
     for (const directive of policy.split(";")) {
-      const [name, ...values] = directive.trim().toLowerCase().split(/\s+/);
+      const [name, ...values] = directive.trim().toLowerCase().split(/[ \t]+/);
       if (name && !directives.has(name)) directives.set(name, values);
     }
     if (directives.has("sandbox") || directives.has("require-trusted-types-for")) return false;

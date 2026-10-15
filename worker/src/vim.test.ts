@@ -54,6 +54,7 @@ describe("public HTML vim enhancement", () => {
     { "Content-Security-Policy": "script-src 'unsafe-inline'; style-src 'unsafe-inline', default-src 'none'" },
     { "Content-Security-Policy": "script-src 'unsafe-inline'; script-src-elem 'none'; style-src 'unsafe-inline'" },
     { "Content-Security-Policy": "script-src 'unsafe-inline'; style-src 'unsafe-inline'; sandbox" },
+    { "Content-Security-Policy": "script-src\u00a0'unsafe-inline'; script-src 'none'; style-src 'unsafe-inline'" },
     { "Content-Type": "text/plain" }, { "Content-Type": "text/html; charset=windows-1252" },
     { "Content-Encoding": "gzip" }, { "Cache-Control": "public, no-transform" },
     { "Content-Range": "bytes 0-9/20" }, { "Content-Disposition": "attachment" },
