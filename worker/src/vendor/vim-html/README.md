@@ -31,8 +31,21 @@ or network access are needed. `generate.py` applies three small hosting changes:
   which-key under `d` and `Space ?` list both. Page fields, the comment editor,
   the command line, the sidebar (its own `D`) and Vim off never dispatch `dC`.
   Off clears pending key sequences and remembers `docs-vim=off` on this public
-  origin (session-only if storage fails), leaving stored comments intact. A global guard
-  prevents this bundle from booting over an already-live `window.__VH`.
+  origin (session-only if storage fails), leaving stored comments intact. A mouse
+  click on either dock button hands focus back to the page (keyboard activation
+  keeps it), so a Space right after "Vim on" starts `Space u b` instead of
+  re-pressing the button. A global guard prevents this bundle from booting over an
+  already-live `window.__VH`.
+- On Preview's generated viewer only (`enhanceHtml(..., { generatedViewer: true })`
+  adds `docsViewer: true` to the injected config), light/dark belongs to the
+  viewer: its toolbar toggle, `docs-theme` storage and `<html data-theme>`.
+  `host.js` replaces the skill's `VH.scheme` seam so `Space u b` and `:theme`
+  press that toggle, mirrors `data-theme` into `data-vh-scheme` for the runtime
+  chrome, and `host.css` hides the skill's corner `#vh-theme` (which covered the
+  toolbar toggle) and phone status-line toggle. The global `vim-html:prefs`
+  scheme is never written there; it stays the authored/baked pages' choice.
+  Authored uploads are never recognized from markup (they commonly reuse
+  `data-theme`/`data-theme-toggle`) and keep the skill's own toggle and scheme.
 
 Upstream's `make_script_safe` and `make_style_safe` protect HTML end tags and make
 injected content ASCII. The hosting module separately escapes config JSON.
@@ -41,7 +54,7 @@ HTML line endings/outer whitespace) and embeds adapter-owned `baked-hook.js`.
 The fingerprint recognizes common skill-built uploads without shipping another
 copy of the original runtime or relying on a guessed interface version.
 
-`enhanceHtml(Response, DocumentIdentity)` owns bounded inspection and injection:
+`enhanceHtml(Response, DocumentIdentity, HostedPage?)` owns bounded inspection and injection:
 UTF-8 HTML up to 4 MiB gets a suffix after the untouched original bytes, including
 fragments and omitted head/body tags. A standard baked body block with exactly
 one synchronous inline config/runtime and the recognized script fingerprint gets
@@ -81,10 +94,11 @@ enhancement. The harness imports the same production module through esbuild;
 it serves no owner data, opens no browser and modifies no installed tools.
 
 For automated headless proofs over the real Preview and generated-preview path,
-run from the Worker directory (both serve fixtures through `proof-server.mjs`):
+run from the Worker directory (all serve fixtures through `proof-server.mjs`):
 
     node src/vendor/vim-html/quiet-browser-proof.mjs <output-dir>
     node src/vendor/vim-html/clear-browser-proof.mjs <output-dir>
+    node src/vendor/vim-html/theme-browser-proof.mjs <output-dir>
 
 It owns its loopback server and isolated Chromium, closes both, and writes JSON
 and screenshots. It checks initial render samples, both number toggle states,
@@ -103,3 +117,15 @@ storage; one-step `u`, `Ctrl-r`, a history-free empty clear, `dc`, `gy`, reload
 persistence, another document's comments, preferences, numbers, and that page
 fields, the editor, the command line and Vim off type `dC` as text. Twice-enhanced
 pages keep one binding; raw/download stay exact.
+
+The theme proof clicks, taps and types against generated Markdown, text, JSON,
+CSV, image, audio and unsupported viewers with Vim on and off, at desktop and
+phone widths. It measures computed document, toolbar, text and status-line
+colors, hit-tests every visible theme control (exactly one, uncovered), and
+checks icon/label/tooltip, `Space u b`, `:theme`, Tab/Enter/Space on the
+toggle without Vim capture, `j` after a click, off/on transitions, conflicting
+`docs-theme` vs `vim-html:prefs` choices, reload without a light frame,
+standalone (uninjected) and twice-enhanced viewers, authored/baked negatives
+that keep their own `data-theme-toggle` and the skill's semantics, and exact
+raw/download bytes. Against the pre-fix tree it fails first on the owner's
+symptom: two visible theme controls, the skill's covering the viewer's.

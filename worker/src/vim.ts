@@ -4,6 +4,13 @@ import { bakedHookScript, bakedRuntimeSha256, runtimeScript, runtimeStyle } from
 /** Stable public identity; baked vim-html source/storage identity always takes precedence. */
 export interface DocumentIdentity { id: UploadId; title: string; publicUrl: string }
 
+/** What produced the page. Only Preview's own generated viewer sets `generatedViewer`: its
+ * toolbar toggle then owns light/dark and the injected runtime defers to it (host.js). The
+ * flag is exact by construction; authored uploads often reuse data-theme/data-theme-toggle
+ * names, so they are never recognized from markup and keep the skill's own theme behavior.
+ */
+export interface HostedPage { generatedViewer?: boolean }
+
 // Bounded inspection is necessary before any injection: a baked runtime or CSP
 // can appear at the very end. Never tee a large R2 body (an unread tee buffers it).
 const MAX_HTML_BYTES = 4 * 1024 * 1024;
@@ -15,9 +22,10 @@ const encoder = new TextEncoder();
  * cancellation reaches the source, and read errors propagate without truncation.
  * Recognized baked pages get only a startup hook (numbers off, dC for :clear);
  * their own runtime/config/comment storage stay authoritative. Raw/download
- * callers bypass this module. No CSP is weakened.
+ * callers bypass this module. No CSP is weakened. A generated viewer's flag only
+ * reaches a newly injected runtime: baked and declined pages ignore it.
  */
-export async function enhanceHtml(response: Response, identity: DocumentIdentity): Promise<Response> {
+export async function enhanceHtml(response: Response, identity: DocumentIdentity, page: HostedPage = {}): Promise<Response> {
   const headers = response.headers;
   if (!response.body || response.status !== 200 ||
       !/^text\/html(?:\s*;|$)/i.test(headers.get("Content-Type") || "") ||
@@ -88,6 +96,7 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
       storageKey: `docs:${identity.publicUrl}`,
       docTitle: identity.title,
       theme: "none", scheme: "light", debug: false,
+      ...(page.generatedViewer ? { docsViewer: true } : {}),
     }).replace(/</g, "\\u003c")
       .replace(/[\u007f-\uffff]/g, ch => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
     suffix = encoder.encode(`\n<!-- vim-html:head:begin -->\n<style data-vh="theme">${runtimeStyle}</style>\n<!-- vim-html:head:end -->\n<!-- vim-html:body:begin -->\n<script data-vh="config">window.VIM_HTML=Object.assign(${config},window.VIM_HTML||{});</script>\n<script data-vh="runtime">${runtimeScript}</script>\n<!-- vim-html:body:end -->`);
