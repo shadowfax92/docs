@@ -291,6 +291,8 @@ describe("createSearchIndex", () => {
     expect(index.query(literal("secret"), all)).toEqual([]);
     expect(index.query(literal("metadata"), all)).toHaveLength(1);
     const updated = document("Replace1", "new text", { version: "new-version" });
+    // Only discovery announces a new version; a body response cannot replace that identity.
+    index.add(updated.summary);
     index.add(updated.summary, updated.text);
     expect(index.query(literal("metadata"), all)).toEqual([]);
     expect(index.query(literal("new text"), all)[0].version).toBe("new-version");
@@ -299,22 +301,56 @@ describe("createSearchIndex", () => {
     expect(index.query(literal(""), all)).toEqual([]);
   });
 
-  it("makes failed memory admission explicit until clear and releases replacement/clear budgets", () => {
+  it("rejects body overflow without losing names, and releases replacement/clear budgets", () => {
     const index = createSearchIndex();
     let rejected = false;
     for (let number = 0; number < 40; number++) {
       const fixture = document(String(number).padStart(8, "0"), "x".repeat(512 * 1024));
+      index.add(fixture.summary);
       try { index.add(fixture.summary, fixture.text); }
       catch (error) { expect(error).toMatchObject({ code: "search_budget_exceeded" }); rejected = true; break; }
     }
     expect(rejected).toBe(true);
-    expect(() => index.query(literal(""), all)).toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+    // A rejected body no longer poisons queries: its independently admitted name remains honest.
+    expect(index.query(literal("note"), all).length).toBeGreaterThan(32);
     index.clear();
     const fixture = document("Replace1", "x".repeat(512 * 1024));
     for (let number = 0; number < 40; number++) index.add(fixture.summary, fixture.text);
     expect(index.query(literal(""), all)).toHaveLength(1);
     index.clear();
     expect(index.query(literal("x"), all)).toEqual([]);
+  });
+
+  it("upgrades metadata once, preserves bodies on replay and refuses stale body versions", () => {
+    const index = createSearchIndex();
+    const old = document("Meta0001", "needle needle", { title: "needle", filename: "needle.txt" });
+    index.add(old.summary);
+    expect(index.query(literal("needle"), all).map((hit) => hit.matchCount)).toEqual([2]);
+    index.add(old.summary, old.text);
+    index.add(old.summary);
+    expect(index.query(literal("needle"), all).map((hit) => hit.matchCount)).toEqual([4]);
+    const next = document("Meta0001", "fresh body", { title: "fresh title", version: "v2" });
+    index.add(next.summary);
+    expect(index.query(literal("needle"), all)).toEqual([]);
+    expect(() => index.add(old.summary, old.text)).toThrow(expect.objectContaining({ code: "invalid_search_request" }));
+    index.add(next.summary, next.text);
+    expect(index.query(literal("fresh"), all).map((hit) => [hit.version, hit.matchCount])).toEqual([["v2", 2]]);
+  });
+
+  it("bounds metadata independently and fails closed until clear if names cannot be admitted", () => {
+    const index = createSearchIndex();
+    let rejected = false;
+    for (let number = 0; number < 400; number++) {
+      const fixture = document(String(number).padStart(8, "0"), "", { title: "n".repeat(16384) });
+      try { index.add(fixture.summary); }
+      catch (error) { expect(error).toMatchObject({ code: "search_budget_exceeded" }); rejected = true; break; }
+    }
+    expect(rejected).toBe(true);
+    expect(() => index.query(literal("note"), all)).toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+    index.clear();
+    const fixture = document("Meta0001", "");
+    index.add(fixture.summary);
+    expect(index.query(literal("note"), all)).toHaveLength(1);
   });
 });
 
@@ -341,5 +377,15 @@ it("uses the bundled worker protocol for generations, errors, FIFO additions and
     expect(await send({ version: 1, generation: 10, operation: "clear" })).toMatchObject({ generation: 10, status: "ready" });
     expect(await send({ version: 1, generation: 11, operation: "query", query: literal(""), filter: all })).toMatchObject({ generation: 11, status: "results", hits: [] });
     expect(await send({ version: 1, generation: 12, operation: "unknown" })).toMatchObject({ generation: 12, status: "error", code: "invalid_search_request" });
+    expect(await send({ version: 1, generation: 13, operation: "metadata", summary: fixture.summary })).toMatchObject({ status: "ready" });
+    expect(await send({ version: 1, generation: 14, operation: "query", query: literal("note"), filter: all })).toMatchObject({ status: "results", hits: [{ id: "Worker01" }] });
+    expect(await send({ version: 1, generation: 15, operation: "query", query: literal("private"), filter: all })).toMatchObject({ status: "results", hits: [] });
+    expect(await send({ version: 1, generation: 16, operation: "add", ...fixture })).toMatchObject({ status: "ready" });
+    expect(await send({ version: 1, generation: 17, operation: "metadata", summary: { ...fixture.summary, version: "v2", title: "Replacement name" } })).toMatchObject({ status: "ready" });
+    expect(await send({ version: 1, generation: 18, operation: "add", ...fixture })).toMatchObject({ status: "error", code: "invalid_search_request" });
+    expect(await send({ version: 1, generation: 19, operation: "query", query: literal("private"), filter: all })).toMatchObject({ status: "results", hits: [] });
+    expect(await send({ version: 1, generation: 20, operation: "add", summary: fixture.summary })).toMatchObject({ status: "error", code: "invalid_search_request" });
+
+
   } finally { await worker.terminate(); }
 });

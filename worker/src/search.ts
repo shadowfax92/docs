@@ -11,18 +11,22 @@ export interface SearchHit {
 }
 
 /** Private, in-process browser index: no storage, credentials or persistence. Retention is bounded
- * to 32 MiB estimated UTF-16 strings/record overhead and 10,000 documents; failed budget admission
- * invalidates queries until clear. Matching filters first, then ranks exact counts/date/ID.
+ * to 8 MiB metadata/record overhead plus 32 MiB body strings and 10,000 documents.
+ * Metadata overflow invalidates queries until clear; rejected bodies leave admitted names searchable.
+ * Matching filters first, then ranks exact counts/date/ID.
  * Patterns, compiled programs and aggregate matching work have separate explicit error budgets.
  */
 export interface SearchIndex {
-  add(summary: DocumentSummary, text: TextRecord): void;
+  /** Metadata announces the current version; optional text upgrades it. A repeated metadata add
+   * preserves that version's body, while a new version discards it. Stale body upgrades are refused. */
+  add(summary: DocumentSummary, text?: TextRecord): void;
   query(query: SearchQuery, filter: DocumentFilter): SearchHit[];
   clear(): void;
 }
 
 /** Generation correlates async replies; UI ignores obsolete replies and terminates work on logout. */
 export type SearchWorkerRequest = { version: 1; generation: number } & (
+  | { operation: "metadata"; summary: DocumentSummary }
   | { operation: "add"; summary: DocumentSummary; text: TextRecord }
   | { operation: "query"; query: SearchQuery; filter: DocumentFilter }
   | { operation: "clear" }
@@ -33,7 +37,7 @@ export type SearchWorkerResponse = { version: 1; generation: number } & (
   | { status: "error"; code: string; message: string }
 );
 
-/** Safe, caller-visible failures. No partial corpus/ranking is returned after a budget failure. */
+/** Safe, caller-visible failures. Metadata/query limits fail closed; body limits reject upgrades. */
 export class SearchError extends Error {
   constructor(readonly code: "invalid_search_request" | "invalid_pattern" | "search_budget_exceeded", message: string) {
     super(message);
@@ -42,6 +46,7 @@ export class SearchError extends Error {
 }
 
 const INDEX_BYTES = 32 * 1024 * 1024;
+const METADATA_BYTES = 8 * 1024 * 1024;
 const MAX_RECORDS = 10000;
 const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATTERN_BYTES = 256;
@@ -62,43 +67,52 @@ interface IndexedDocument {
   body: string;
   kind: string;
   uploadedAt: number;
-  bytes: number;
+  metadataBytes: number;
 }
 
 export function createSearchIndex(): SearchIndex {
   const records = new Map<UploadId, IndexedDocument>();
-  let bytes = 0;
+  let metadataBytes = 0;
+  let bodyBytes = 0;
   let incomplete = false;
   return {
     add(summary, text) {
-      if (!summary || !text || typeof summary.id !== "string" || !/^[A-Za-z0-9]{8}$/.test(summary.id)
+      if (!summary || typeof summary.id !== "string" || !/^[A-Za-z0-9]{8}$/.test(summary.id)
         || typeof summary.version !== "string" || !summary.version.length || summary.version.length > 128
-        || summary.id !== text.id || summary.version !== text.documentVersion
-        || text.version !== 1 || text.extractorVersion !== 1
-        || typeof summary.title !== "string" || typeof summary.filename !== "string"
-        || typeof text.text !== "string" || !kinds.has(summary.kind)
-        || !["full", "truncated", "metadata-only", "error"].includes(text.coverage)
+        || typeof summary.title !== "string" || typeof summary.filename !== "string" || !kinds.has(summary.kind)
         || typeof summary.uploadedAt !== "string" || !Number.isFinite(Date.parse(summary.uploadedAt))) {
-        throw new SearchError("invalid_search_request", "Search records must have matching document IDs/versions and valid metadata.");
+        throw new SearchError("invalid_search_request", "Search records must have valid document IDs/versions and metadata.");
       }
-      const body = text.coverage === "full" || text.coverage === "truncated" ? text.text : "";
-      if (summary.title.length > 16384 || summary.filename.length > 4096 || body.length > MAX_TEXT_BYTES
-        || encoder.encode(body).length > MAX_TEXT_BYTES) {
-        incomplete = true;
-        throw new SearchError("search_budget_exceeded", "A document exceeds the text/metadata search budget. Clear and reload the index.");
-      }
-      const retained = 512 + 2 * (summary.id.length + summary.version.length + summary.title.length + summary.filename.length + body.length);
       const previous = records.get(summary.id);
-      const nextBytes = bytes - (previous?.bytes ?? 0) + retained;
-      if (nextBytes > INDEX_BYTES || (!previous && records.size === MAX_RECORDS)) {
+      if (text !== undefined && (!text || summary.id !== text.id || summary.version !== text.documentVersion
+        || (previous && previous.version !== summary.version)
+        || text.version !== 1 || text.extractorVersion !== 1 || typeof text.text !== "string"
+        || !["full", "truncated", "metadata-only", "error"].includes(text.coverage))) {
+        throw new SearchError("invalid_search_request", "Body upgrades must match the current document ID/version.");
+      }
+      // Discovery owns replacement identity; a late body cannot roll metadata back. Metadata
+      // replays for the current version are idempotent and must not erase an already indexed body.
+      if (!text && previous?.version === summary.version) return;
+      const retained = 512 + 2 * (summary.id.length + summary.version.length + summary.title.length + summary.filename.length);
+      const nextMetadataBytes = metadataBytes - (previous?.metadataBytes ?? 0) + retained;
+      if (summary.title.length > 16384 || summary.filename.length > 4096
+        || nextMetadataBytes > METADATA_BYTES || (!previous && records.size === MAX_RECORDS)) {
         incomplete = true;
-        throw new SearchError("search_budget_exceeded", "The library exceeds the 32 MiB / 10,000 document search budget. Clear and reload a smaller corpus.");
+        throw new SearchError("search_budget_exceeded", "The library exceeds the 8 MiB / 10,000 document metadata search budget. Clear and reload a smaller corpus.");
+      }
+      const body = text && (text.coverage === "full" || text.coverage === "truncated") ? text.text : "";
+      const nextBodyBytes = bodyBytes - 2 * (previous?.body.length ?? 0) + 2 * body.length;
+      // Metadata has an independent allowance: slow/rejected text must never consume the space
+      // reserved for later discovered names. Body rejection leaves the existing record intact.
+      if (body.length > MAX_TEXT_BYTES || encoder.encode(body).length > MAX_TEXT_BYTES || nextBodyBytes > INDEX_BYTES) {
+        throw new SearchError("search_budget_exceeded", "The document exceeds the 512 KiB text / 32 MiB retained body search budget.");
       }
       records.set(summary.id, {
         id: summary.id, version: summary.version, title: summary.title, filename: summary.filename,
-        body, kind: summary.kind, uploadedAt: Date.parse(summary.uploadedAt), bytes: retained,
+        body, kind: summary.kind, uploadedAt: Date.parse(summary.uploadedAt), metadataBytes: retained,
       });
-      bytes = nextBytes;
+      metadataBytes = nextMetadataBytes;
+      bodyBytes = nextBodyBytes;
     },
     query(query, filter) {
       if (incomplete) throw new SearchError("search_budget_exceeded", "Search is incomplete after an index budget failure. Clear and reload the index.");
@@ -179,7 +193,7 @@ export function createSearchIndex(): SearchIndex {
         pattern?.reset();
       }
     },
-    clear() { records.clear(); bytes = 0; incomplete = false; },
+    clear() { records.clear(); metadataBytes = 0; bodyBytes = 0; incomplete = false; },
   };
 }
 
