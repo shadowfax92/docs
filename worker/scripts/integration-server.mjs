@@ -10,7 +10,9 @@ import { execFileSync } from 'node:child_process';
  * Never bind to non-loopback interfaces or load production .env/credentials here.
  */
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const state = resolve(root, '.wrangler/integration', process.env.DOCS_LOCAL_RUN || 'current');
+const run = process.env.DOCS_LOCAL_RUN || 'current';
+if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(run)) throw new Error('DOCS_LOCAL_RUN must be a simple local run name');
+export const state = resolve(root, '.wrangler/integration', run);
 export const publicOrigin = 'http://127.0.0.1:18787';
 export const catalogOrigin = 'http://localhost:18788';
 export const password = 'disposable-local-library-password';
@@ -65,7 +67,7 @@ export async function seed(mf) {
   for (let i=0;i+46<=bomb.length;i++) if(view.getUint32(i,true)===0x02014b50) view.setUint32(i+24,100,true);
   await put('DocxBomb', 'bomb.docx', bomb);
   await put('PdfText1', 'text.pdf', pdf('Native PDF readable text fixture'), 'Text PDF', 'application/pdf');
-  await put('PngImg01', 'pixel.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64'));
+  await put('PngImg01', 'pixel.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64'), 'PNG fixture', 'image/png');
   await put('JsonDat1', 'data.json', '{"precise":9007199254740993,"big":1e400,"z":-0}');
   await put('CsvData1', 'data.csv', 'name,note,amount\n"A, B","first\nsecond",42\n');
   await put('TsvData1', 'data.tsv', 'name\tamount\nalpha\t42\n');
@@ -80,14 +82,16 @@ export async function seed(mf) {
   await bucket.put('Group001/b.txt', 'secondary body');
   for (let i=0;i<205;i++) await put(`Scan${String(i).padStart(4,'0')}`, 'page.txt', `page fixture ${i}`, `Pagination fixture ${i}`);
   for (let i=0;i<103;i++) await put(`Del${String(i).padStart(5,'0')}`, 'delete.txt', `disposable ${i}`, 'Delete cohort');
+  await put('AgeOld01', 'old.txt', 'Boundary older fixture', 'Age boundary older', 'text/plain');
+  await put('AgeNew01', 'new.txt', 'Boundary newer fixture', 'Age boundary newer', 'text/plain');
   await put('FailDel1', 'failed.txt', 'Native SQLite failure fixture', 'Failure cohort');
   await put('StaleDel', 'stale.txt', 'Original version', 'Stale cohort');
   // Real media is generated locally; no conversion service or outbound fetch is used.
   execFileSync('ffmpeg', ['-loglevel','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1',resolve(state,'tone.wav')]);
   execFileSync('ffmpeg', ['-loglevel','error','-y','-f','lavfi','-i','color=c=blue:s=160x90:d=1','-c:v','libvpx-vp9',resolve(state,'video.webm')]);
-  await put('WaveAud1', 'tone.wav', await readFile(resolve(state,'tone.wav')));
-  await put('WebmVid1', 'video.webm', await readFile(resolve(state,'video.webm')));
-  await put('BadMedia', 'bad.mp4', 'unsupported codec payload');
+  await put('WaveAud1', 'tone.wav', await readFile(resolve(state,'tone.wav')), 'WAV fixture', 'audio/wav');
+  await put('WebmVid1', 'video.webm', await readFile(resolve(state,'video.webm')), 'WebM fixture', 'video/webm');
+  await put('BadMedia', 'bad.mp4', 'unsupported codec payload', 'Unsupported MP4', 'video/mp4');
   await writeFile(resolve(state,'fixtures.json'), JSON.stringify(fixtures,null,2));
   return fixtures;
 }
@@ -103,6 +107,8 @@ for path in sys.argv[1:]:
  c=sqlite3.connect(path)
  if not c.execute("SELECT name FROM sqlite_master WHERE name='_mf_objects'").fetchone(): continue
  c.execute("UPDATE _mf_objects SET uploaded=? WHERE key LIKE 'Scan00%/page.txt'", (int(time.time()*1000)-120*86400000,))
+ c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeOld01/old.txt'", (int(time.time()*1000)-90*86400000-60000,))
+ c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeNew01/new.txt'", (int(time.time()*1000)-90*86400000+60000,))
  c.execute("CREATE TRIGGER IF NOT EXISTS fail_fixture BEFORE DELETE ON _mf_objects WHEN OLD.key='FailDel1/failed.txt' BEGIN SELECT RAISE(ABORT,'disposable native R2 failure'); END")
  c.commit()
 `, ...files]);

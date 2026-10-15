@@ -152,7 +152,13 @@ docs list --days 30              # show uploads from the last 30 days
 docs delete xK9mRt2p             # delete an upload by its short ID
 ```
 
-The URL is printed and copied to your clipboard automatically.
+The URL is printed and copied to your clipboard automatically. Regular file uploads
+stream with an explicit remaining Content-Length, including zero-byte files.
+Standard in-memory readers retain net/http length inference. Unknown-length streams
+are not buffered: the native local R2 harness rejects them with HTTP 500. The
+mediator verified that the original Go client works against the pre-rollout
+production Worker; local emulation failure alone is not a production regression.
+The mediator owns before/after live compatibility proof and any global CLI install.
 
 When uploading a directory with `--folder`, `docs` recursively packages regular files into a zip archive and uploads that archive. Folder uploads are limited to 200 MB total across all regular files before compression.
 

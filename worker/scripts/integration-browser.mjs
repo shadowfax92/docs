@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { publicOrigin as pub, catalogOrigin as cat, password, state } from './integration-server.mjs';
+import { readFile } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
+import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, state } from './integration-server.mjs';
 
 /** Physical browser interactions against actual built Worker roles/native R2. Headless Chromium
  * has an isolated profile; no owner browser/window/clipboard/storage is attached or activated.
@@ -12,6 +14,7 @@ const checks=[];
 const check=(name,details={})=>{checks.push({name,...details});console.log(`PASS ${name}`);};
 const browser=await chromium.launch({headless:true,channel:'chromium',...(process.env.DOCS_CHROMIUM?{executablePath:process.env.DOCS_CHROMIUM}:{})});
 const context=await browser.newContext({viewport:{width:1440,height:1000},permissions:['clipboard-read','clipboard-write']});
+context.setDefaultTimeout(15000);
 const errors=[];
 const page=await context.newPage();page.on('pageerror',e=>errors.push(String(e)));
 const shot=async(p,name)=>p.screenshot({path:resolve(state,'screenshots',name+'.png'),fullPage:false});
@@ -50,7 +53,10 @@ try {
   await shot(page,'public-video');
   await page.goto(pub+'/BadMedia');await page.locator('[data-media-error]').waitFor({state:'visible'});
   check('browser decodes PNG, plays PCM WAV and VP9 WebM; unsupported MP4 displays codec fallback');
-  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');await shot(page,'public-pdf');
+  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');
+  await page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
+  // Chromium's PDF guest paints asynchronously after its extension frame navigates.
+  await page.waitForTimeout(1200);await shot(page,'public-pdf');
   await page.goto(pub+'/DocxOk01');assert((await page.locator('main').innerText()).includes('DocxBodySentinel & 😀'));await shot(page,'public-docx-light');
   await page.getByRole('button',{name:'Switch to dark theme'}).click();await shot(page,'public-docx-dark');
   const mobile=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,deviceScaleFactor:1});const mp=await mobile.newPage();
@@ -77,4 +83,110 @@ try {
   await browser.close();
 }
 
-async function catalogProof() { throw new Error('Catalog acceptance requires the merged UI contract'); }
+async function catalogProof(context,shot,check) {
+  await context.clearCookies();
+  const p=await context.newPage();
+  const violations=[],errors=[],batches=[],lists=[];
+  await p.addInitScript(()=>{window.cspViolations=[];document.addEventListener('securitypolicyviolation',e=>window.cspViolations.push(e.violatedDirective));});
+  p.on('pageerror',e=>errors.push(String(e)));
+  p.on('request',r=>{if(r.url().endsWith('/all-docs/api/delete')&&r.method()==='POST')batches.push(JSON.parse(r.postData()));if(r.url().includes('/all-docs/api/documents')&&!r.url().includes('/text?'))lists.push(r.url());});
+  await p.goto(cat+'/all-docs');
+  await p.getByLabel('Password',{exact:true}).fill('wrong-password');await p.getByRole('button',{name:'Unlock',exact:true}).click();
+  await p.waitForFunction(()=>document.querySelector('#login-error').textContent.includes('Wrong password'));
+  await p.getByLabel('Password',{exact:true}).fill(password);await p.getByRole('button',{name:'Unlock',exact:true}).click();
+  await p.locator('#library-title').waitFor({state:'visible'});
+  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  assert(lists.length>=2);assert.equal(await p.locator('[data-vh-ui]').count(),0);
+  await p.reload();await p.locator('#library-title').waitFor({state:'visible'});
+  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await shot(p,'catalog-light-desktop');
+  await p.getByRole('button',{name:'Switch to dark theme'}).click();await shot(p,'catalog-dark-desktop');
+  await p.reload();assert.equal(await p.locator('html').getAttribute('data-theme'),'dark');
+  await p.getByRole('button',{name:'Switch to light theme'}).click();
+  check('actual UI JSON wrong/right login, persisted reload session, global native pagination and light/dark desktop screenshots');
+  const search=p.getByRole('searchbox',{name:'Search names and content'});
+  const ids=()=>p.locator('article[data-id]').evaluateAll(es=>es.map(e=>e.dataset.id));
+  const query=async(value,count)=>{
+    await search.fill(value);
+    await p.waitForFunction(({value,count})=>document.querySelector('#search').value===value&&document.querySelectorAll('article[data-id]').length===count&&!document.querySelector('#search-error').textContent&&(!value||document.querySelector('.coverage').textContent.startsWith('Complete')), {value,count},{timeout:30000});
+  };
+  await query('BodySentinel',4); // high/low, DOCX and legacy all use real extraction
+  assert.equal((await ids())[0],'TextHi01');
+  assert.deepEqual(new Set(await ids()),new Set(['TextHi01','TextLo01','DocxOk01','Legacy01']));
+  await query('literal.a+b',1);assert.deepEqual(await ids(),['TextHi01']);
+  await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('BodySentinel',4);
+  assert.equal((await ids())[0],'TextHi01');
+  await query('CaseNeedle',2);await p.getByRole('button',{name:'Match case',exact:true}).click();await query('CaseNeedle',1);
+  await search.fill('[');await p.waitForFunction(()=>document.querySelector('#search-error').textContent.length>0);
+  assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
+  await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await p.getByRole('button',{name:'Match case',exact:true}).click();
+  await query('DocxBodySentinel',1);assert((await p.locator('.coverage').innerText()).includes('searched partially'));
+  await shot(p,'catalog-docx-body-search');
+  await query('Text PDF',1);assert((await p.locator('article[data-id="PdfText1"]').innerText()).includes('name match only'));
+  await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes('content unreadable'));
+  check('real search Worker literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
+  await search.fill('');await p.locator('#age').selectOption('gt90');
+  await p.waitForFunction(()=>document.querySelector('.cutoff')&&!document.querySelector('.cutoff').hidden);
+  const cutoff=(await p.locator('.cutoff span').innerText()).split(' · cutoff fixed')[0];
+  await p.waitForFunction(()=>document.querySelector('#results-label').textContent.startsWith('101 of '));
+  await p.getByRole('button',{name:'Select all 101 matching',exact:true}).click();
+  await p.getByRole('button',{name:'Review deletion',exact:true}).click();
+  assert((await p.locator('dialog[open]').innerText()).includes(cutoff));
+  assert.equal(await p.locator('dialog[open] .review-list li').count(),101);
+  assert(await p.locator('dialog[open]').getByText('AgeOld01',{exact:true}).count());
+  assert.equal(await p.locator('dialog[open]').getByText('AgeNew01',{exact:true}).count(),0);
+  await shot(p,'catalog-frozen-age-review');
+  await p.getByRole('button',{name:'Cancel',exact:true}).click();await p.getByRole('button',{name:'Clear',exact:true}).click();await p.locator('#age').selectOption('any');
+  check('native Uploaded age filter, frozen 90-day cutoff and exact global 101-ID review without deletion');
+  await query('Delete cohort',48);
+  await p.getByRole('button',{name:'Select page (48)',exact:true}).click();assert.equal(await p.locator('.selection-bar .count').innerText(),'48');
+  await p.getByRole('button',{name:'Clear',exact:true}).click();await p.getByRole('button',{name:'Select all 103 matching',exact:true}).click();
+  await p.getByRole('button',{name:'Review deletion',exact:true}).click();
+  assert.equal(await p.locator('dialog[open] .review-list li').count(),103);
+  const confirm=p.getByRole('button',{name:'Delete 103 documents',exact:true});assert(await confirm.isDisabled());
+  await p.locator('#confirm-count').fill('102');assert(await confirm.isDisabled());
+  await p.locator('#confirm-count').fill('103');await shot(p,'catalog-exact-count-delete');await confirm.click();
+  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents');
+  assert.deepEqual(batches.slice(-2).map(b=>b.items.length),[100,3]);
+  const deleted=batches.slice(-2).flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
+  for(const b of batches.slice(-2)){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
+  await p.getByRole('button',{name:'Done',exact:true}).click();
+  check('page selection vs all 103 matching, wrong-count refusal and real 100+3 bounded native deletion');
+  await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('Failure cohort|Stale cohort',2);
+  await p.getByRole('button',{name:'Select all 2 matching',exact:true}).click();await p.getByRole('button',{name:'Review deletion',exact:true}).click();
+  const beforeStale=await(await fetch(pub+'/StaleDel/raw')).text();
+  const info=JSON.parse(await readFile(resolve(state,'server.json'),'utf8'));process.kill(info.pid,'SIGUSR1');
+  for(let i=0;i<30;i++){if((await(await fetch(pub+'/StaleDel/raw')).text())!==beforeStale)break;await new Promise(r=>setTimeout(r,50));if(i===29)throw new Error('stale fixture not changed');}
+  await p.locator('#confirm-count').fill('2');await p.getByRole('button',{name:'Delete 2 documents',exact:true}).click();
+  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='0 of 2 documents deleted');
+  const partial=await p.locator('dialog[open]').innerText();assert.match(partial,/changed/i);assert.match(partial,/failed|Storage could not delete/i);await shot(p,'catalog-partial-delete');
+  await p.getByRole('button',{name:'Done',exact:true}).click();assert.equal(await p.locator('.selection-bar .count').innerText(),'2');await p.getByRole('button',{name:'Clear',exact:true}).click();
+  check('real changed-after-review and native R2 failure outcomes preserve both selected documents');
+  await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('LegacyBodySentinel',1);
+  await p.locator('article[data-id="Legacy01"] [data-action="delete"]').click();
+  await p.getByRole('button',{name:'Delete Legacy01',exact:true}).click();await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 1 document');await p.getByRole('button',{name:'Done',exact:true}).click();
+  assert.equal((await fetch(pub+'/Legacy01/raw')).status,404);
+  check('single-card exact-ID review deletes only its native fixture');
+  await search.fill('');await p.getByRole('button',{name:'Refresh',exact:true}).click();
+  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await p.setViewportSize({width:900,height:900});await shot(p,'catalog-tablet');
+  await p.setViewportSize({width:375,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile');
+  await p.setViewportSize({width:320,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile-320');
+  await p.setViewportSize({width:1440,height:1000});
+  await p.getByRole('button',{name:'Lock',exact:true}).click();await p.locator('#password').waitFor({state:'visible'});assert.equal(await p.locator('#password').inputValue(),'');
+  assert.equal(await p.evaluate(async()=> (await fetch('/all-docs/session',{headers:{'X-Docs-Catalog':'1'}})).status),401);
+  await p.locator('#password').fill(password);await p.getByRole('button',{name:'Unlock',exact:true}).click();await p.locator('#library-title').waitFor({state:'visible'});
+  const now=Math.floor(Date.now()/1000);
+  const key=createHmac('sha256',sessionKey).update(JSON.stringify(['docs-catalog-key-v1',cat,password])).digest();
+  const sign=state=>{const payload=Buffer.from(JSON.stringify(state)).toString('base64url');return payload+'.'+createHmac('sha256',key).update('session-v1\n'+payload).digest('base64url');};
+  const active={v:1,sid:'A'.repeat(43),csrf:'B'.repeat(43),iat:now,exp:now+43200};
+  const setCookie=value=>context.addCookies([{name:'__Host-docs_catalog',value,domain:'localhost',path:'/',secure:true,httpOnly:true,sameSite:'Strict'}]);
+  await setCookie(sign(active));
+  assert.equal(await p.evaluate(async()=> (await fetch('/all-docs/session',{headers:{'X-Docs-Catalog':'1'}})).status),200);
+  await setCookie(sign({...active,iat:now-43201,exp:now-1}));
+  assert.equal(await p.evaluate(async()=> (await fetch('/all-docs/session',{headers:{'X-Docs-Catalog':'1'}})).status),401);
+  await p.reload();await p.locator('#password').waitFor({state:'visible'});assert.equal(await p.locator('#password').inputValue(),'');
+  violations.push(...await p.evaluate(()=>window.cspViolations));assert.deepEqual(violations,[]);assert.deepEqual(errors,[]);
+  check('visual tablet/mobile reflow, real logout and correctly signed expired-session UI reset; zero page/CSP errors',{batches:batches.map(b=>b.items.length),listRequests:lists.length});
+  await p.close();
+}

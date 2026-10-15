@@ -334,6 +334,19 @@ func TestNativeR2Uploads(t *testing.T) {
 		}
 		verifyNativeUpload(t, cfg, result, "memory")
 	}
+	legacyFile, err := os.Open(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyFile.Close()
+	// This wrapper recreates the old Go transport: net/http sees an unknown-length
+	// reader. Native R2 rejects it; preserve streaming and report the compatibility
+	// limit instead of buffering an arbitrary legacy body.
+	_, err = UploadContent(cfg, "legacy.txt", "text/plain", struct{ io.Reader }{legacyFile}, "Native old-client fixture")
+	if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("unknown-length old-client error=%v, want native R2 HTTP 500", err)
+	}
+
 }
 
 func verifyNativeUpload(t *testing.T, cfg *config.Config, result *Response, want string) {

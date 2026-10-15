@@ -37,10 +37,12 @@ try {
   check('cross-origin/custom-header/Fetch-Metadata/preflight and missing-CSRF refusal');
   // Sign a correctly authenticated but expired local fixture token; this tests expiry rather than
   // merely changing an unsigned payload. No production signer/key is involved.
-  const now=Math.floor(Date.now()/1000),old={v:1,sid:'A'.repeat(32),csrf:'B'.repeat(32),iat:now-43201,exp:now-1};
+  const now=Math.floor(Date.now()/1000);
   const key=createHmac('sha256',sessionKey).update(JSON.stringify(['docs-catalog-key-v1',cat,password])).digest();
-  const payload=Buffer.from(JSON.stringify(old)).toString('base64url');
-  const expired=payload+'.'+createHmac('sha256',key).update('session-v1\n'+payload).digest('base64url');
+  const sign=state=>{const payload=Buffer.from(JSON.stringify(state)).toString('base64url');return payload+'.'+createHmac('sha256',key).update('session-v1\n'+payload).digest('base64url');};
+  const active={v:1,sid:'A'.repeat(43),csrf:'B'.repeat(43),iat:now,exp:now+43200};
+  assert.equal((await request('/all-docs/session',{headers:{Cookie:'__Host-docs_catalog='+sign(active)}})).status,200);
+  const expired=sign({...active,iat:now-43201,exp:now-1});
   assert.equal((await request('/all-docs/session',{headers:{Cookie:'__Host-docs_catalog='+expired}})).status,401);
   check('correctly signed expired session is refused');
   const {items,pages}=await scan();assert(pages>1);assert.equal(new Set(items.map(i=>i.id)).size,items.length);assert(items.length>300);

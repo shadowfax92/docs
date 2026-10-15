@@ -1,5 +1,5 @@
 import MarkdownIt from "markdown-it";
-import { docxText, DOCX_SOURCE_LIMIT, DocumentTextFailure as PreviewFailure } from "./document-text";
+import { docxText, DOCX_SOURCE_LIMIT, DocumentTextFailure } from "./document-text";
 import type { DocumentSummary } from "./contracts";
 import type { ResolvedDocument } from "./documents";
 import { enhanceHtml } from "./vim";
@@ -11,6 +11,8 @@ const MAX_COLUMNS = 64;
 const markdown: { render(source: string): string } = new MarkdownIt({ html: false, linkify: false });
 
 type Format = "html" | "markdown" | "text" | "json" | "csv" | "tsv" | "pdf" | "image" | "audio" | "video" | "docx" | "unsupported";
+
+class PreviewFailure extends Error {}
 
 /** Public rendering owns original-byte delivery and bounded format previews behind one interface.
  * Documents validates identity/version. Each opened stream is transferred, consumed, or canceled;
@@ -69,8 +71,8 @@ export async function renderDocument(
       else if (format === "json") body = linesBody(prettyJson(text), false);
       else body = linesBody(text, prefix);
     } catch (error) {
-      if (request.signal.aborted || !(error instanceof PreviewFailure)) throw error;
-      body = fallback(doc.summary, error instanceof PreviewFailure ? error.message : "This file could not be previewed. Download the original.");
+      if (request.signal.aborted || !(error instanceof PreviewFailure || error instanceof DocumentTextFailure)) throw error;
+      body = fallback(doc.summary, error.message);
     }
   }
   // These static scripts/styles are self-hosted inside the page; document strings only enter

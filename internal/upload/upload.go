@@ -82,7 +82,7 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 	}
 	// net/http infers lengths for its standard in-memory readers, but not *os.File.
 	// Native R2 requires a known-length stream. Use only regular-file metadata and
-	// the current offset, preserving streaming and the caller's ownership of the file.
+	// the current offset without reading ahead or buffering the file.
 	if file, ok := content.(*os.File); ok {
 		info, err := file.Stat()
 		if err != nil {
