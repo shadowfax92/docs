@@ -1,0 +1,23 @@
+{
+  "source": "/Users/shadowfax/.local/state/rtr/homes/codex/nik_100/skills/vim-html",
+  "snapshotDate": "2026-10-14",
+  "sha256": {
+    "scripts/build.py": "4670b06b7c22fcfb3ea836c31dca6fa1787bc01452202d479309d53850141a79",
+    "runtime/chrome.css": "3e4cdc68567e23d8e472d32c769e43baa3cbfa4b122a2447c9db91bd5e0a30a4",
+    "runtime/chrome.js": "0c25614a40a8eeec1579fbe89d362ef9dbd9bf66ba0251bf442f71d1505fba4c",
+    "runtime/comments.css": "0c3900e687b9340e218deca133d385ff06c9e6fc6d97f7f2e3055ed4771a8342",
+    "runtime/comments.js": "e233a9ff538fc044d12702bbc90b4f75b9d5b036c9cba50b0aee90a805b69245",
+    "runtime/core.css": "2d6d08d77806a366c6f01e741003a4370df27dd3dd280461b1fea7e4dd19ab98",
+    "runtime/core.js": "8a2ace2faddd8a4f9810bfc092c6cceb332418de8beabdde19babfa65705cb86",
+    "runtime/lines.css": "1c33448fbc1afe77081b508b933b369d08b4c17a5df988d05e182b4fac026aa0",
+    "runtime/lines.js": "dfbfad76d14e8d6c467e62e915ea1d3e878764239ecd5c2bc6db71b7b5949d85",
+    "runtime/motions.css": "c04d44426175b33ee9c1a372e5407b06776167c50cf3a78e2e4264ef8dfae834",
+    "runtime/motions.js": "98fdfd9f05775a119ae549a3735d6bef2a75ef709133097f2eda2de6f19232ac",
+    "runtime/panel.css": "773288ace77a456f71951b83588fb0b59f416ba378d0920ba15dace5e2768134",
+    "runtime/panel.js": "6c8db743fb3932b17f2a2c064873a45b9f6eaf35bd04581ca20d3a2c9d1b602e",
+    "runtime/search.css": "905147dc51e169ad6454a47cea37a30556505d2714fe712e0140ff919e9cbd8e",
+    "runtime/search.js": "364884138f1c8462b004ad91bf2e2e08e0ca6c99e57c508e208ca06da8628184",
+    "runtime/select.css": "bbda3af8d7f7c81e135dff02576e926218c3b124d4872f18b632bb1ef432a2e1",
+    "runtime/select.js": "bb6dc6abbee1486d4ecde436c14487685714d20afdde0f75f1ac0c97001a1e5d"
+  }
+}

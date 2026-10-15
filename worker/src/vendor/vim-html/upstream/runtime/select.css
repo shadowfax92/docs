@@ -1,0 +1,44 @@
+/* select.css -- visual modes (piece E). Tokens only.
+   Character visual is the browser's own selection, recoloured with --vh-visual;
+   fields (the page's and ours) keep native colours so they look as they always
+   do. The rule must not depend on the mode: html[data-vh-mode=...] ::selection
+   made every element's style depend on that attribute, and each mode change
+   (:, Esc, i) restyled the whole document, ~40 ms on 2,000 lines. Visual line
+   paints whole line elements. */
+
+::selection { background-color: var(--vh-visual); }
+:is(input, textarea, select)::selection,
+[contenteditable] ::selection { background-color: Highlight; }
+
+.vh-vline,
+.vh-vline.vh-cursor { background: var(--vh-visual) !important; border-radius: 2px; }
+
+/* The one-click comment button at the end of a mouse selection. */
+.vh-sel-btn {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 8px;
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  box-shadow: var(--vh-shadow);
+  font: 600 12px/1.3 var(--vh-font-body, system-ui, sans-serif);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.vh-sel-btn:hover { background: var(--vh-accent-soft); }
+.vh-sel-btn:focus-visible { outline: 2px solid var(--vh-accent); outline-offset: 1px; }
+.vh-sel-btn-icon { color: var(--vh-accent-ink); font-weight: 800; }
+.vh-sel-btn kbd {
+  padding: 0 4px;
+  border: 1px solid var(--vh-line);
+  border-radius: 3px;
+  background: var(--vh-sunk);
+  color: var(--vh-muted);
+  font: 10px/1.5 var(--vh-font-mono, ui-monospace, monospace);
+}
+
+@media print { .vh-vline { background: none !important; } }

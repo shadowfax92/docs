@@ -1,0 +1,79 @@
+/* core.css -- the base every runtime module's UI sits on (piece A). Tokens only.
+   All runtime UI lives inside #vh-ui (VH.ui.layer): a zero-size box at its
+   containing block's origin, so absolute children can be placed over the
+   document and fixed children over the viewport, all above the page. */
+
+#vh-ui {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  z-index: 2147483000;
+  font: 13px/1.45 var(--vh-font-body, system-ui, sans-serif);
+  color: var(--vh-ink);
+  text-align: left;
+  letter-spacing: normal;
+  text-transform: none;
+  -webkit-font-smoothing: antialiased;
+}
+[data-vh-ui] *, [data-vh-ui] *::before, [data-vh-ui] *::after { box-sizing: border-box; }
+
+/* VH.toast */
+.vh-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 40px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: var(--vh-radius);
+  background: var(--vh-ink);
+  color: var(--vh-bg);
+  box-shadow: var(--vh-shadow);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.15s, transform 0.15s;
+  pointer-events: none;
+}
+.vh-toast.vh-show { opacity: 1; transform: none; }
+.vh-toast.vh-toast-error { background: var(--vh-bad); color: var(--vh-bg); }
+
+/* VH.clip: the off-screen execCommand sink and the last-resort copy dialog */
+.vh-clip-sink { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.vh-clipdlg {
+  position: fixed;
+  left: 50%;
+  top: 12vh;
+  transform: translateX(-50%);
+  width: min(640px, calc(100vw - 32px));
+  padding: 12px;
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  background: var(--vh-surface);
+  box-shadow: var(--vh-shadow);
+}
+.vh-clipdlg-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; color: var(--vh-ink); }
+.vh-clipdlg-head span { flex: 1; }
+.vh-clipdlg-close {
+  padding: 3px 10px;
+  border: 1px solid var(--vh-edge);
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: var(--vh-bg);
+  color: var(--vh-ink);
+  font: inherit;
+  cursor: pointer;
+}
+.vh-clipdlg-text {
+  display: block;
+  width: 100%;
+  height: min(50vh, 360px);
+  padding: 8px;
+  border: 1px solid var(--vh-line);
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: var(--vh-bg);
+  color: var(--vh-ink);
+  font: 12px/1.5 var(--vh-font-mono, ui-monospace, monospace);
+  resize: none;
+}
+
+@media print { [data-vh-ui] { display: none !important; } }

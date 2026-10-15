@@ -1,0 +1,97 @@
+/* comments.css -- comment highlights, the editor and the K popover (piece E).
+   Highlights go through the CSS Custom Highlight API (see comments.js), so the
+   document's DOM is never wrapped or split. Tokens only. */
+
+::highlight(vh-comment) { background-color: var(--vh-comment); }
+::highlight(vh-comment-cur) {
+  background-color: var(--vh-comment);
+  text-decoration: underline 2px var(--vh-comment-mark);
+  text-underline-offset: 3px;
+}
+::highlight(vh-comment-draft) { background-color: var(--vh-visual); }
+
+/* editor: absolute in VH.ui.layer, under the last commented line */
+.vh-editor {
+  position: absolute;
+  padding: 10px 12px 9px;
+  background: var(--vh-surface);
+  border: 1px solid var(--vh-edge);
+  border-left: 3px solid var(--vh-comment-mark);
+  border-radius: var(--vh-radius);
+  box-shadow: var(--vh-shadow);
+}
+.vh-editor-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font: 11px/1.4 var(--vh-font-mono, ui-monospace, monospace);
+  color: var(--vh-muted);
+}
+.vh-editor-ref { color: var(--vh-accent-ink); font-weight: 700; white-space: nowrap; }
+.vh-editor-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vh-editor-state {
+  margin-left: auto;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--vh-sunk);
+  color: var(--vh-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+.vh-editor-quote {
+  margin: 6px 0 8px;
+  padding-left: 9px;
+  border-left: 2px solid var(--vh-line);
+  color: var(--vh-muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 4.4em;
+  overflow: hidden;
+}
+.vh-editor-note {
+  display: block;
+  width: 100%;
+  min-height: 2.6em;
+  resize: none;
+  padding: 6px 8px;
+  border: 1px solid var(--vh-line);
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: var(--vh-bg);
+  color: var(--vh-ink);
+  font: 14px/1.45 var(--vh-font-body, system-ui, sans-serif);
+}
+.vh-editor-note::placeholder { color: var(--vh-faint); }
+.vh-editor-note:focus { outline: 2px solid var(--vh-accent); outline-offset: -1px; }
+.vh-editor-hint { margin-top: 6px; font-size: 11px; color: var(--vh-faint); white-space: pre-wrap; }
+
+.vh-editor kbd, .vh-pop kbd {
+  padding: 0 4px;
+  border: 1px solid var(--vh-line);
+  border-radius: 3px;
+  background: var(--vh-sunk);
+  color: var(--vh-muted);
+  font: 10px/1.5 var(--vh-font-mono, ui-monospace, monospace);
+}
+
+/* K: the note(s) on the cursor line. VH.ui.layer is zero-width, so shrink-to-fit
+   would collapse the box to one word: size it to its content instead. */
+.vh-pop {
+  position: absolute;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 8px 10px;
+  background: var(--vh-surface);
+  border: 1px solid var(--vh-edge);
+  border-left: 3px solid var(--vh-comment-mark);
+  border-radius: var(--vh-radius);
+  box-shadow: var(--vh-shadow);
+}
+.vh-pop-item + .vh-pop-item { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--vh-line); }
+.vh-pop-ref { font: 700 11px/1.4 var(--vh-font-mono, ui-monospace, monospace); color: var(--vh-accent-ink); }
+.vh-pop-note { margin-top: 2px; color: var(--vh-ink); font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.vh-pop-hint { margin-top: 8px; font-size: 11px; color: var(--vh-faint); white-space: pre-wrap; }

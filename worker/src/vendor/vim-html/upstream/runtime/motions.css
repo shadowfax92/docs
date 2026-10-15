@@ -1,0 +1,47 @@
+/* motions.css -- the cursorline overlay and the message area (:marks, <leader>md).
+   Tokens only. Both live in VH.ui.layer; see motions.js for why the cursorline
+   is an overlay and not a background on the line element. */
+
+.vh-cursorline {
+  position: absolute;
+  display: none;
+  box-sizing: content-box;
+  /* Reach a little past the text on both sides, like a band, without moving it. */
+  margin-left: -0.45rem;
+  padding: 0 0.45rem;
+  border-radius: min(var(--vh-radius, 4px), 5px);
+  background: var(--vh-cursorline);
+  pointer-events: none;
+}
+.vh-cursorline.vh-on { display: block; }
+
+/* .vh-cursor only marks the cursor line's element for other modules. The
+   wave-1 lines.css painted it with background: var(--vh-cursorline), which
+   doubles the overlay and tints an li's nested list; emptying the token on that
+   element alone switches such a rule off and does nothing once it is gone. */
+.vh-cursor { --vh-cursorline: transparent; }
+
+.vh-msg {
+  position: fixed;
+  left: 0;
+  bottom: 28px;
+  max-width: min(640px, 100vw);
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 6px 0;
+  border: 1px solid var(--vh-line);
+  border-left: 0;
+  border-bottom: 0;
+  border-top-right-radius: var(--vh-radius);
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  box-shadow: var(--vh-shadow);
+  font: 12px/1.6 var(--vh-font-mono, ui-monospace, monospace);
+}
+.vh-msg-title { padding: 0 12px 2px; color: var(--vh-muted); white-space: pre; }
+.vh-msg-row { display: flex; gap: 12px; padding: 0 12px; white-space: nowrap; }
+.vh-msg-pick { cursor: pointer; }
+.vh-msg-pick:hover { background: var(--vh-accent-soft); }
+.vh-msg-key { width: 2ch; text-align: center; color: var(--vh-mark, var(--vh-accent)); font-weight: 700; }
+.vh-msg-line { min-width: 4ch; text-align: right; color: var(--vh-muted); font-variant-numeric: tabular-nums; }
+.vh-msg-text { overflow: hidden; text-overflow: ellipsis; }

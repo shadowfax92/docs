@@ -1,0 +1,338 @@
+/* chrome.css -- status line, theme toggle, which-key, help overlay, first-load
+   hint (piece F). Tokens only; the vh-* locals below are derived from them.
+
+   Stacking inside #vh-ui (one stacking context above the page):
+     2 status line   (piece D's command line sits above it, over the same area)
+     3 theme toggle  4 hint   5 comments sidebar   6 help   7 which-key
+     8 core's toast and 9 copy dialog, raised so the sidebar never hides them. */
+
+#vh-ui > .vh-toast { z-index: 8; }
+#vh-ui > .vh-clipdlg { z-index: 9; }
+
+/* --theme none has no doc.css: leave the last line clear of the status line. */
+html.vh-status-room body::after { content: ""; display: block; height: 36px; }
+
+/* ---- shared: key chips (also used by panel.js) and icons ---- */
+
+.vh-kbd {
+  display: inline-block;
+  min-width: 1.7em;
+  margin: 0 1px;
+  padding: 0 5px;
+  border: 1px solid var(--vh-line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--vh-bg);
+  color: var(--vh-ink);
+  font: 600 11px/17px var(--vh-font-mono, ui-monospace, monospace);
+  text-align: center;
+  white-space: nowrap;
+}
+.vh-i { display: inline-flex; flex: none; }
+.vh-i svg { display: block; }
+
+[data-vh-ui] button { -webkit-tap-highlight-color: transparent; }
+[data-vh-ui] button:focus-visible { outline: 2px solid var(--vh-accent); outline-offset: 1px; }
+
+/* ---- status line (lualine) ----
+   a: mode   b: comments   c: title > section   x: memory, search, copy
+   y: progress   z: position. a and z take the mode's colour; the powerline
+   arrows are clipped triangles that carry their section's background. */
+
+.vh-status {
+  --vhst-a: var(--vh-accent);
+  --vhst-a-ink: var(--vh-on-accent);
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 28px;
+  display: flex;
+  align-items: stretch;
+  background: var(--vh-sunk);
+  color: var(--vh-muted);
+  font: 12px/28px var(--vh-font-mono, ui-monospace, monospace);
+  white-space: nowrap;
+  z-index: 2;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.vh-status[data-mode="insert"] { --vhst-a: var(--vh-ok); --vhst-a-ink: var(--vh-bg); }
+.vh-status[data-mode="visual"],
+.vh-status[data-mode="vline"] { --vhst-a: var(--vh-warn); --vhst-a-ink: var(--vh-bg); }
+.vh-status[data-mode="command"] { --vhst-a: var(--vh-ink); --vhst-a-ink: var(--vh-bg); }
+
+.vh-st-a, .vh-st-b, .vh-st-y, .vh-st-z { position: relative; display: flex; align-items: center; flex: none; }
+.vh-st-a, .vh-st-z { background: var(--vhst-a); color: var(--vhst-a-ink); font-weight: 700; }
+.vh-st-b, .vh-st-y { background: var(--vh-line); color: var(--vh-ink); }
+
+.vh-st-a { padding: 0 10px 0 11px; letter-spacing: 0.05em; }
+.vh-st-b { padding: 0 6px 0 16px; }
+.vh-st-y { padding: 0 14px 0 8px; }
+.vh-st-z { padding: 0 11px 0 8px; }
+
+.vh-st-a::after, .vh-st-b::after, .vh-st-y::before, .vh-st-z::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 9px;
+  height: 100%;
+  background: inherit;
+  z-index: 1;
+}
+.vh-st-a::after, .vh-st-b::after { right: -9px; clip-path: polygon(0 0, 100% 50%, 0 100%); }
+.vh-st-y::before, .vh-st-z::before { left: -9px; clip-path: polygon(100% 0, 0 50%, 100% 100%); }
+
+.vh-st-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.vh-st-count:hover .vh-st-label { text-decoration: underline; text-underline-offset: 3px; }
+.vh-st-count.vh-zero { color: var(--vh-muted); }
+
+.vh-st-c {
+  flex: 1;
+  min-width: 0;
+  padding: 0 10px 0 19px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vh-st-title { color: var(--vh-ink); }
+.vh-st-crumb { color: var(--vh-faint); }
+
+.vh-st-x { display: flex; align-items: center; flex: none; gap: 12px; padding: 0 19px 0 8px; }
+.vh-st-mem { display: inline-flex; align-items: center; gap: 5px; color: var(--vh-bad); font-weight: 700; cursor: help; }
+.vh-st-search { color: var(--vh-ink); font-weight: 600; }
+.vh-st-mem[hidden], .vh-st-search[hidden] { display: none; }
+
+.vh-st-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  padding: 0 9px;
+  border: 1px solid var(--vh-accent);
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: var(--vh-accent-soft);
+  color: var(--vh-accent-ink);
+  font: 600 11.5px/1 var(--vh-font-body, system-ui, sans-serif);
+  cursor: pointer;
+}
+.vh-st-copy:hover { background: var(--vh-accent); border-color: var(--vh-accent); color: var(--vh-on-accent); }
+.vh-st-copy.vh-zero { border-color: var(--vh-line); background: transparent; color: var(--vh-muted); }
+.vh-st-copy svg { width: 13px; height: 13px; }
+
+@media (max-width: 40rem) {
+  .vh-st-crumb, .vh-st-word, .vh-st-y { display: none; }
+  .vh-st-copy-l { display: none; }
+  .vh-st-copy { padding: 0 7px; }
+  .vh-st-x { gap: 8px; padding-right: 16px; }
+}
+
+/* ---- theme toggle ---- */
+
+.vh-theme {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--vh-line);
+  border-radius: 999px;
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  cursor: pointer;
+  z-index: 3;
+}
+.vh-theme:hover { border-color: var(--vh-edge); background: var(--vh-sunk); }
+/* The outline (search.css) is a right column whose header ends in its close
+   button; the toggle steps to the column's left edge instead of sitting on it.
+   The comments sidebar and help stack above the toggle and simply cover it. */
+html.vh-outline-open .vh-theme { right: calc(var(--vh-ol-w, 280px) + 12px); }
+.vh-theme svg { width: 16px; height: 16px; }
+.vh-theme .vh-i-sun, .vh-st-theme .vh-i-sun { display: none; }
+:root[data-vh-scheme="dark"] .vh-theme .vh-i-sun,
+:root[data-vh-scheme="dark"] .vh-st-theme .vh-i-sun { display: inline-flex; }
+:root[data-vh-scheme="dark"] .vh-theme .vh-i-moon,
+:root[data-vh-scheme="dark"] .vh-st-theme .vh-i-moon { display: none; }
+
+/* At doc.css's phone breakpoint the text runs to 1rem from the edge, where a
+   fixed corner button would sit on it; the status line carries the toggle. */
+.vh-st-theme {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--vh-ink);
+  cursor: pointer;
+}
+@media (max-width: 40rem) {
+  .vh-theme { display: none; }
+  .vh-st-theme { display: inline-flex; }
+}
+
+/* ---- which-key (LazyVim's helix preset: bottom right, one column) ---- */
+
+.vh-wk {
+  position: fixed;
+  right: 12px;
+  bottom: 38px;
+  min-width: 220px;
+  max-width: min(520px, calc(100vw - 24px));
+  max-height: min(60vh, calc(100vh - 60px));
+  overflow: hidden;
+  padding: 8px 4px 8px 0;
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  box-shadow: var(--vh-shadow);
+  font: 12.5px/1.6 var(--vh-font-mono, ui-monospace, monospace);
+  z-index: 7;
+}
+.vh-wk[hidden] { display: none; }
+.vh-wk-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 0 6px 12px;
+  color: var(--vh-muted);
+}
+.vh-wk-count { color: var(--vh-accent-ink); font-weight: 700; margin-right: 2px; }
+.vh-wk-list { display: grid; grid-auto-flow: row; }
+.vh-wk-list.vh-wk-wide { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 8px; }
+.vh-wk-row { display: flex; align-items: baseline; gap: 8px; padding: 0 12px; white-space: nowrap; }
+.vh-wk-key { min-width: 1.4em; text-align: right; color: var(--vh-accent-ink); font-weight: 700; }
+.vh-wk-sep { color: var(--vh-faint); }
+.vh-wk-desc { overflow: hidden; text-overflow: ellipsis; }
+.vh-wk-group .vh-wk-desc { color: var(--vh-accent-ink); }
+
+/* ---- help overlay ---- */
+
+.vh-help {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 28px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5vh 16px 16px;
+  background: rgba(0, 0, 0, 0.18);
+  z-index: 6;
+}
+:root[data-vh-scheme="dark"] .vh-help { background: rgba(0, 0, 0, 0.45); }
+.vh-help-box {
+  display: flex;
+  flex-direction: column;
+  width: min(1040px, 100%);
+  max-height: 100%;
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  box-shadow: var(--vh-shadow);
+}
+.vh-help-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 12px 12px 20px;
+  border-bottom: 1px solid var(--vh-line);
+}
+.vh-help-title { font-weight: 700; font-size: 15px; }
+.vh-help-sub { color: var(--vh-muted); font-size: 12px; }
+.vh-help-close {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: none;
+  color: var(--vh-muted);
+  cursor: pointer;
+}
+.vh-help-close:hover { border-color: var(--vh-line); background: var(--vh-sunk); color: var(--vh-ink); }
+.vh-help-close svg { width: 16px; height: 16px; }
+.vh-help-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 20px 20px;
+  columns: 300px 3;
+  column-gap: 32px;
+  outline: none;
+}
+.vh-help-sec { break-inside: avoid; margin: 0 0 18px; }
+.vh-help-h {
+  margin: 0 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--vh-line);
+  color: var(--vh-accent-ink);
+  font: 700 11px/1.4 var(--vh-font-mono, ui-monospace, monospace);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.vh-help-row { display: flex; align-items: baseline; gap: 10px; padding: 2px 0; font-size: 12.5px; }
+.vh-help-k { flex: none; width: 8.2em; display: flex; flex-wrap: wrap; gap: 3px; }
+.vh-help-d { flex: 1; min-width: 0; color: var(--vh-ink); }
+.vh-keys { display: inline-flex; gap: 2px; }
+.vh-keys .vh-kbd { margin: 0; }
+.vh-help-in {
+  margin: 8px 0 3px;
+  color: var(--vh-faint);
+  font-size: 11.5px;
+  font-style: italic;
+}
+.vh-cmd { color: var(--vh-accent-ink); font: 600 12px/18px var(--vh-font-mono, ui-monospace, monospace); }
+
+@media (max-width: 40rem) {
+  .vh-help { padding: 8px; }
+  .vh-help-sub { display: none; }
+  .vh-help-body { padding: 12px 14px 16px; }
+}
+
+/* ---- first-load hint ---- */
+
+.vh-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 40px;
+  max-width: calc(100vw - 32px);
+  padding: 7px 14px;
+  border: 1px solid var(--vh-edge);
+  border-radius: 999px;
+  background: var(--vh-surface);
+  color: var(--vh-muted);
+  box-shadow: var(--vh-shadow);
+  font: 12.5px/18px var(--vh-font-body, system-ui, sans-serif);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translate(-50%, 6px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+  z-index: 4;
+}
+.vh-hint.vh-show { opacity: 1; transform: translate(-50%, 0); }
+.vh-hint b { color: var(--vh-accent-ink); font: 700 11.5px var(--vh-font-mono, ui-monospace, monospace); letter-spacing: 0.05em; }

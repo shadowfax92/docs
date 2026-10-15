@@ -1,0 +1,189 @@
+/* panel.css -- the comments sidebar (piece F). Tokens only.
+   A fixed right column that stops above the 28px status line, so the status
+   line (and piece D's command line over it) stays visible, like a nvim sidebar
+   above a global statusline. Elements are divs and spans, never the tags
+   doc.css styles (p excepted, reset below). */
+
+.vh-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 28px;
+  width: min(400px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--vh-surface);
+  color: var(--vh-ink);
+  border-left: 1px solid var(--vh-edge);
+  font: 13px/1.45 var(--vh-font-body, system-ui, sans-serif);
+  z-index: 5;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.vh-panel[hidden], .vh-panel [hidden] { display: none !important; }
+
+.vh-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 10px 10px 16px;
+  border-bottom: 1px solid var(--vh-line);
+}
+.vh-panel-title { font-weight: 700; font-size: 14px; }
+.vh-panel-n {
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--vh-sunk);
+  color: var(--vh-muted);
+  font: 600 11px/18px var(--vh-font-mono, ui-monospace, monospace);
+}
+.vh-panel-sel { color: var(--vh-accent-ink); font-size: 12px; font-weight: 600; }
+.vh-panel-close { margin-left: auto; }
+
+/* ---- buttons ---- */
+
+.vh-pbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--vh-line);
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: var(--vh-bg);
+  color: var(--vh-ink);
+  font: 500 12px/1 var(--vh-font-body, system-ui, sans-serif);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.vh-pbtn:hover:not(:disabled) { border-color: var(--vh-edge); background: var(--vh-sunk); }
+.vh-pbtn:disabled { opacity: 0.45; cursor: default; }
+.vh-pbtn.vh-danger { color: var(--vh-bad); }
+.vh-pbtn.vh-danger:hover:not(:disabled) { background: var(--vh-bad-soft); border-color: var(--vh-bad); }
+.vh-pbtn .vh-i, .vh-pbtn svg { display: block; flex: none; }
+.vh-panel-close, .vh-pi-acts .vh-pbtn { width: 26px; padding: 0; justify-content: center; }
+.vh-panel-close { border-color: transparent; background: transparent; color: var(--vh-muted); }
+
+.vh-panel-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--vh-line);
+}
+.vh-act-undo { margin-left: auto; }
+
+/* ---- rows ---- */
+
+.vh-panel-list {
+  position: relative;  /* rows' offsetTop is measured from here */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  outline: none;
+}
+
+.vh-pi {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 10px 10px 10px 13px;
+  border-left: 3px solid transparent;
+  border-bottom: 1px solid var(--vh-line);
+  cursor: pointer;
+}
+.vh-pi:hover { background: var(--vh-cursorline); }
+.vh-pi.vh-on { background: var(--vh-accent-soft); }
+.vh-pi.vh-cur { border-left-color: var(--vh-accent); background: var(--vh-sunk); }
+.vh-pi.vh-cur.vh-on { background: var(--vh-accent-soft); }
+
+.vh-pi-check {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--vh-faint);
+  border-radius: 4px;
+  background: var(--vh-bg);
+  color: transparent;
+}
+.vh-pi-check svg { width: 12px; height: 12px; stroke-width: 3; }
+.vh-pi:hover .vh-pi-check { border-color: var(--vh-muted); }
+.vh-pi.vh-on .vh-pi-check { background: var(--vh-accent); border-color: var(--vh-accent); color: var(--vh-on-accent); }
+
+.vh-pi-meta { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.vh-pi-ref {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--vh-accent-ink);
+  font: 600 11.5px/1.4 var(--vh-font-mono, ui-monospace, monospace);
+  cursor: pointer;
+}
+.vh-pi-ref:hover { text-decoration: underline; }
+.vh-pi-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vh-faint);
+  font-size: 11.5px;
+}
+.vh-pi-quote {
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--vh-comment-mark);
+  color: var(--vh-muted);
+  font-size: 12px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.vh-pi-note {
+  margin-top: 5px;
+  color: var(--vh-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.vh-detached .vh-pi-ref { color: var(--vh-warn); }
+.vh-detached .vh-pi-quote { text-decoration: line-through; text-decoration-color: var(--vh-faint); }
+
+.vh-pi-acts { display: flex; flex-direction: column; gap: 4px; opacity: 0; }
+.vh-pi:hover .vh-pi-acts, .vh-pi.vh-cur .vh-pi-acts { opacity: 1; }
+.vh-pi-acts .vh-pbtn { height: 24px; width: 24px; background: transparent; border-color: transparent; color: var(--vh-muted); }
+.vh-pi-acts .vh-pbtn:hover { border-color: var(--vh-line); background: var(--vh-bg); color: var(--vh-ink); }
+.vh-pi-acts .vh-pbtn.vh-danger:hover { color: var(--vh-bad); background: var(--vh-bad-soft); }
+@media (hover: none) { .vh-pi-acts { opacity: 1; } }
+
+/* ---- empty state and key hints ---- */
+
+.vh-panel-empty { flex: 1; padding: 28px 20px; color: var(--vh-muted); line-height: 1.7; }
+.vh-panel-empty p { margin: 0 0 10px; }
+.vh-panel-empty .vh-panel-empty-head { color: var(--vh-ink); font-weight: 600; font-size: 14px; }
+.vh-panel-empty-q { margin-top: 18px !important; color: var(--vh-faint); }
+
+.vh-panel-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 8px 12px 9px;
+  border-top: 1px solid var(--vh-line);
+  background: var(--vh-sunk);
+  color: var(--vh-faint);
+  font-size: 11px;
+}
+.vh-panel-hint { white-space: nowrap; }
+
+/* The comment being previewed, in the document. */
+.vh-peek {
+  outline: 2px solid var(--vh-comment-mark);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+@media print { .vh-peek { outline: none; } }
