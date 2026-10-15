@@ -29,7 +29,7 @@ export async function renderDocument(
   const primary = doc.objects[0];
   const identity = { id: doc.summary.id, title: doc.summary.title, publicUrl: doc.summary.publicUrl };
   const headers = publicHeaders();
-  headers.set("Content-Type", format === "html" ? "text/html" : "text/html; charset=utf-8");
+  headers.set("Content-Type", format === "html" ? originalMime(doc.summary.filename, doc.summary.mime) : "text/html; charset=utf-8");
 
   if (format === "html") {
     const obj = await doc.openBody();
@@ -43,7 +43,9 @@ export async function renderDocument(
   const textual = ["text", "markdown", "json", "csv", "tsv", "docx"].includes(format);
   const limit = format === "docx" ? DOCX_BYTES : TEXT_BYTES;
   const tooLarge = textual && format !== "text" && primary.sizeBytes > limit;
-  const obj = await doc.openBody({ maxBytes: textual && !tooLarge ? limit : 1 });
+  // R2 rejects ranges of zero-byte objects. A normal version-checked open is already bounded
+  // for an empty representation and still proves existence before conditional/bodyless replies.
+  const obj = await doc.openBody(primary.sizeBytes === 0 ? undefined : { maxBytes: textual && !tooLarge ? limit : 1 });
   if (!obj) return missingResponse();
   let body: string;
   if (request.method === "HEAD") {
@@ -61,7 +63,10 @@ export async function renderDocument(
       const prefix = format === "text" && primary.sizeBytes > TEXT_BYTES;
       const bytes = await readBounded(obj.body, limit, request.signal);
       const text = format === "docx" ? docxText(bytes) : decodeText(bytes, prefix);
-      if (format === "docx") body = `<p class="notice">Main document text only. Word layout, images, headers and embedded objects are not reproduced.</p>${linesBody(text.slice(0, TEXT_BYTES), text.length > TEXT_BYTES)}`;
+      if (format === "docx") {
+        const encoded = new TextEncoder().encode(text), truncated = encoded.length > TEXT_BYTES;
+        body = `<p class="notice">Main document text only. Word layout, images, headers and embedded objects are not reproduced.</p>${text ? linesBody(decodeText(encoded.subarray(0, TEXT_BYTES), truncated), truncated) : '<p class="notice">No readable main-document text was found.</p>'}`;
+      }
       else if (format === "markdown") body = `<article class="prose">${markdown.render(text)}</article>`;
       else if (format === "csv" || format === "tsv") body = tableBody(text, format === "csv" ? "," : "\t");
       else if (format === "json") body = linesBody(prettyJson(text), false);
@@ -130,10 +135,18 @@ const TEXT_EXTENSIONS = new Set("txt text log out err xml yaml yml toml ini cfg 
 function fileExt(filename: string): string { return filename.split(".").pop()?.toLowerCase() || ""; }
 function originalMime(filename: string, supplied = ""): string {
   const ext = fileExt(filename);
+  if (ext === "html" || ext === "htm") return htmlMime(supplied);
   if (Object.hasOwn(MIME, ext)) return MIME[ext];
   if (TEXT_EXTENSIONS.has(ext)) return "text/plain; charset=utf-8";
   const media = Object.values(MIME).find((mime) => /^(image|audio|video)\//.test(mime) && mime === supplied);
   return media || "application/octet-stream";
+}
+
+/** Keep authored decoding without allowing arbitrary upload MIME or header syntax through. */
+function htmlMime(supplied: string): string {
+  if (!/^\s*text\/html(?:\s*;|\s*$)/i.test(supplied)) return "text/html";
+  const charset = /;\s*charset\s*=\s*(?:"([a-z0-9._:-]{1,40})"|([a-z0-9._:-]{1,40}))\s*(?:;|$)/i.exec(supplied);
+  return charset ? `text/html; charset=${charset[1] || charset[2]}` : "text/html";
 }
 function formatOf(filename: string, supplied: string): Format {
   const ext = fileExt(filename);
@@ -173,7 +186,7 @@ async function originalResponse(doc: ResolvedDocument, variant: "raw" | "downloa
   // A weak tag cannot validate a byte range. Mismatch returns the complete representation.
   const range = !ifRange || ifRange === etag ? parseRange(request.headers.get("Range"), primary.sizeBytes) : null;
   const noBody = unchanged || range === "unsatisfiable" || request.method === "HEAD";
-  const obj = await doc.openBody(noBody ? { maxBytes: 1 } : range ? { range } : undefined);
+  const obj = await doc.openBody(primary.sizeBytes === 0 ? undefined : noBody ? { maxBytes: 1 } : range ? { range } : undefined);
   if (!obj) return missingResponse();
   if (noBody) await obj.body.cancel();
   if (unchanged) return new Response(null, { status: 304, headers });
@@ -227,28 +240,45 @@ function linesBody(text: string, prefix: boolean): string {
 <pre class="line-view">${shown.map((line, index) => `<span class="line" id="L${index + 1}"><span class="line-number" aria-hidden="true">${index + 1}</span><span class="line-text">${escapeHtml(line) || " "}</span></span>`).join("\n")}</pre></section>`;
 }
 
-/** Validate depth and the formatted-output budget before stringify can expand indentation.
- * A small byte-bounded input can otherwise produce quadratic output from deep nesting.
+/** JSON.parse validates grammar only: its numeric values are never used for display. Preserve
+ * original tokens so large integers, exponent ranges, negative zero and duplicate keys survive.
+ * Check depth/token/output budgets before indentation can expand a small input quadratically.
  */
 function prettyJson(text: string): string {
-  let value: unknown;
-  try { value = JSON.parse(text); }
+  try { JSON.parse(text); }
   catch { throw new PreviewFailure("This file is not valid JSON. Download the original to inspect it."); }
-  const pending = [{ value, depth: 0 }];
-  let budget = 0, nodes = 0;
-  while (pending.length) {
-    const item = pending.pop()!;
-    if (item.depth > 32 || ++nodes > 10000) throw new PreviewFailure("This JSON exceeds the nesting or item preview limit. Download the original.");
-    budget += item.depth * 2 + 8;
-    if (item.value !== null && typeof item.value === "object") {
-      for (const [key, child] of Object.entries(item.value)) {
-        budget += JSON.stringify(key).length + item.depth * 2 + 4;
-        pending.push({ value: child, depth: item.depth + 1 });
-      }
-    } else budget += JSON.stringify(item.value).length;
-    if (budget > TEXT_BYTES) throw new PreviewFailure("This JSON exceeds the formatted preview limit. Download the original.");
+  const lexer = /"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|[{}\[\],:]/gy;
+  const tokens: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    if (/[ \t\r\n]/.test(text[offset])) { offset++; continue; }
+    lexer.lastIndex = offset;
+    const match = lexer.exec(text);
+    if (!match || tokens.length >= 10000) throw new PreviewFailure("This JSON exceeds the token preview limit. Download the original.");
+    tokens.push(match[0]); offset = lexer.lastIndex;
   }
-  return JSON.stringify(value, null, 2);
+  const output: string[] = [], encoder = new TextEncoder();
+  let depth = 0, bytes = 0;
+  const append = (part: string) => {
+    bytes += encoder.encode(part).length;
+    if (bytes > TEXT_BYTES) throw new PreviewFailure("This JSON exceeds the formatted preview limit. Download the original.");
+    output.push(part);
+  };
+  const newline = () => append("\n" + "  ".repeat(depth));
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token === "{" || token === "[") {
+      if (++depth > 32) throw new PreviewFailure("This JSON exceeds the nesting preview limit. Download the original.");
+      append(token);
+      if (tokens[index + 1] !== (token === "{" ? "}" : "]")) newline();
+    } else if (token === "}" || token === "]") {
+      depth--;
+      if (tokens[index - 1] !== (token === "}" ? "{" : "[")) newline();
+      append(token);
+    } else if (token === ",") { append(token); newline(); }
+    else append(token === ":" ? ": " : token);
+  }
+  return output.join("");
 }
 
 /** RFC-style quoted fields include escaped quotes, delimiters and embedded newlines. Input is
@@ -315,7 +345,7 @@ function viewerPage(doc: DocumentSummary, format: Format, body: string): string 
 const VIEWER_CSS = `
 :root{--bg:#fff;--well:#f2f2f2;--rule:#e5e5e5;--control:#8f8f8f;--text:#111;--text-2:#555;--text-3:#767676;--accent:#2458e6;--mark:#e6edfd;color-scheme:light}
 :root[data-theme=dark]{--bg:#0e0e0e;--well:#1a1a1a;--rule:#2a2a2a;--control:#6b6b6b;--text:#f2f2f2;--text-2:#b3b3b3;--text-3:#8c8c8c;--accent:#7ea2ff;--mark:#1e2a4a;color-scheme:dark}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/22px Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}a{color:var(--accent);text-underline-offset:3px}button{font:inherit;cursor:pointer}button:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.viewer-bar{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--rule);padding:0 24px 12px}.viewer-top{display:flex;align-items:center;gap:16px;min-height:56px}.viewer-top h1{flex:1;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;line-height:22px;font-weight:500}.pill,button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:0 14px;border:0;border-radius:999px;text-decoration:none;background:var(--well);color:var(--text);font-size:13px;font-weight:500}.primary{background:var(--text);color:var(--bg)}.viewer-meta{margin:0;color:var(--accent);font:13px/20px "Geist Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;overflow-wrap:anywhere}.view-options{display:flex;align-items:center;gap:16px;padding:16px 24px;color:var(--text-2)}.view-options p{margin:0}.prose{max-width:68ch;padding:32px 24px 96px;margin:auto;font-size:17px;line-height:28px;overflow-wrap:anywhere}.prose h1{font-size:32px;line-height:38px;font-weight:600;letter-spacing:-.02em}.prose h2{font-size:24px;line-height:30px;font-weight:600;margin-top:48px}.prose h3{font-size:19px;line-height:26px;font-weight:600}.prose pre{background:var(--well);padding:16px 20px;overflow:auto;font:14px/22px ui-monospace,monospace}.prose code{background:var(--well);font-family:ui-monospace,monospace}.prose img{max-width:100%;height:auto}.prose blockquote{margin-left:0;border-left:2px solid var(--rule);padding-left:20px;color:var(--text-2)}table{border-collapse:collapse;width:100%}th,td{padding:12px 16px;border-bottom:1px solid var(--rule);text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}.numeric{text-align:right;font-variant-numeric:tabular-nums}.table-view{padding:16px 24px}.table-scroll{overflow:auto;max-height:calc(100vh - 180px)}thead{position:sticky;top:0;background:var(--bg)}.table-scroll table{min-width:500px}.line-view{margin:0;padding:0 24px 48px;overflow:auto;font:13px/20px "Geist Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace}.line{display:inline-flex;min-width:100%}.line-number{display:inline-block;flex:none;width:5ch;margin-right:20px;text-align:right;color:var(--text-3);user-select:none}.line-text{white-space:pre}.line:target{background:var(--mark)}.wrap .line-text{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}.wrap .line-view{white-space:normal}.notice{color:var(--text-2);padding:12px 24px;margin:0}.pdf-view iframe{display:block;border:0;width:100%;height:calc(100vh - 150px);min-height:400px}.media-stage{background:var(--well);min-height:calc(100vh - 100px);padding:24px;text-align:center;overflow:auto}.media-stage img{max-width:100%;max-height:calc(100vh - 220px);object-fit:contain}.media-stage.actual img{max-width:none;max-height:none}.media-stage video{display:block;margin:auto;max-width:100%;width:1120px;max-height:calc(100vh - 220px)}.media-stage.audio{max-width:640px;min-height:0;margin:48px auto}.media-stage audio{width:100%}.extension{font-size:64px;line-height:1.2;font-weight:300;margin:24px 0;color:var(--text-2)}.download-card{max-width:600px;margin:48px auto;padding:24px}.download-card h2{font-size:28px;line-height:36px;font-weight:600;overflow-wrap:anywhere}.download-card dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 24px;margin:24px 0}.download-card dt{color:var(--text-2)}.download-card dd{margin:0;overflow-wrap:anywhere}[hidden]{display:none!important}@media(max-width:600px){.viewer-bar{padding-left:16px;padding-right:16px}.viewer-top{gap:10px}.prose{padding:24px 16px 64px}.view-options{padding:12px 16px;flex-wrap:wrap}.line-view{padding-left:8px;padding-right:16px}.download-card{margin:16px auto}.media-stage{padding:16px}}@media(pointer:coarse){button,.pill{min-height:36px}}`;
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/22px Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}a{color:var(--accent);text-underline-offset:3px}button{font:inherit;cursor:pointer}button:focus-visible,a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.viewer-bar{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--rule);padding:0 24px 12px}.viewer-top{display:flex;align-items:center;gap:16px;min-height:56px}.viewer-top>a{display:inline-flex;align-items:center;min-height:32px;min-width:24px}.viewer-top h1{flex:1;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;line-height:22px;font-weight:500}.pill,button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:0 14px;border:0;border-radius:999px;text-decoration:none;background:var(--well);color:var(--text);font-size:13px;font-weight:500}.primary{background:var(--text);color:var(--bg)}.viewer-meta{margin:0;color:var(--accent);font:13px/20px "Geist Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;overflow-wrap:anywhere}.view-options{display:flex;align-items:center;gap:16px;padding:16px 24px;color:var(--text-2)}.view-options p{margin:0}.prose{max-width:68ch;padding:32px 24px 96px;margin:auto;font-size:17px;line-height:28px;overflow-wrap:anywhere}.prose h1{font-size:32px;line-height:38px;font-weight:600;letter-spacing:-.02em}.prose h2{font-size:24px;line-height:30px;font-weight:600;margin-top:48px}.prose h3{font-size:19px;line-height:26px;font-weight:600}.prose pre{background:var(--well);padding:16px 20px;overflow:auto;font:14px/22px ui-monospace,monospace}.prose code{background:var(--well);font-family:ui-monospace,monospace}.prose img{max-width:100%;height:auto}.prose blockquote{margin-left:0;border-left:2px solid var(--rule);padding-left:20px;color:var(--text-2)}table{border-collapse:collapse;width:100%}th,td{padding:12px 16px;border-bottom:1px solid var(--rule);text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}.numeric{text-align:right;font-variant-numeric:tabular-nums}.table-view{padding:16px 24px}.table-scroll{overflow:auto;max-height:calc(100vh - 180px)}thead{position:sticky;top:0;background:var(--bg)}.table-scroll table{min-width:500px}.line-view{margin:0;padding:0 24px 48px;overflow:auto;font:13px/20px "Geist Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace}.line{display:inline-flex;min-width:100%}.line-number{display:inline-block;flex:none;width:5ch;margin-right:20px;text-align:right;color:var(--text-3);user-select:none}.line-text{white-space:pre}.line:target{background:var(--mark)}.wrap .line-text{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}.wrap .line-view{white-space:normal}.notice{color:var(--text-2);padding:12px 24px;margin:0}.pdf-view iframe{display:block;border:0;width:100%;height:calc(100vh - 150px);min-height:400px}.media-stage{background:var(--well);min-height:calc(100vh - 100px);padding:24px;text-align:center;overflow:auto}.media-stage img{max-width:100%;max-height:calc(100vh - 220px);object-fit:contain}.media-stage.actual img{max-width:none;max-height:none}.media-stage video{display:block;margin:auto;max-width:100%;width:1120px;max-height:calc(100vh - 220px)}.media-stage.audio{max-width:640px;min-height:0;margin:48px auto}.media-stage audio{width:100%}.extension{font-size:64px;line-height:1.2;font-weight:300;margin:24px 0;color:var(--text-2)}.download-card{max-width:600px;margin:48px auto;padding:24px}.download-card h2{font-size:28px;line-height:36px;font-weight:600;overflow-wrap:anywhere}.download-card dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 24px;margin:24px 0}.download-card dt{color:var(--text-2)}.download-card dd{margin:0;overflow-wrap:anywhere}[hidden]{display:none!important}@media(max-width:600px){.viewer-bar{padding-left:16px;padding-right:16px}.viewer-top{gap:10px}.prose{padding:24px 16px 64px}.view-options{padding:12px 16px;flex-wrap:wrap}.line-view{padding-left:8px;padding-right:16px}.download-card{margin:16px auto}.media-stage{padding:16px}}@media(pointer:coarse){button,.pill,.viewer-top a,.notice a{min-width:44px;min-height:44px}.viewer-top a,.notice a{display:inline-flex;align-items:center;justify-content:center}}`;
 
 // Static program: never interpolate source text, filenames, metadata or URLs into this script.
 const VIEWER_SCRIPT = `(()=>{

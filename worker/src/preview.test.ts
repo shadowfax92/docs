@@ -356,3 +356,39 @@ it("propagates storage read failures instead of caching a successful fallback", 
   fixture.doc.openBody = async () => ({ body: new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("R2 stream failed")); } }) }) as R2ObjectBody;
   await expect(renderDocument(fixture.doc, "page", request())).rejects.toThrow("R2 stream failed");
 });
+it("opens empty objects without an invalid R2 byte range before page/conditional/416 responses", async () => {
+  for (const [variant, headers, status] of [
+    ["page", {}, 200], ["raw", { "If-None-Match": "*" }, 304], ["download", { Range: "bytes=0-" }, 416],
+  ] as const) {
+    const fixture = document("empty.txt", "");
+    const open = fixture.doc.openBody;
+    fixture.doc.openBody = (opts) => {
+      if (opts?.range || opts?.maxBytes) throw new Error("Native R2 rejects empty ranges");
+      return open(opts);
+    };
+    const response = await renderDocument(fixture.doc, variant, request(headers));
+    expect(response.status).toBe(status);
+    await response.text();
+    expect(fixture.opened).toEqual([{}]);
+  }
+});
+
+it("formats JSON without changing numeric tokens, negative zero, or duplicate keys", async () => {
+  const input = '{"n":9007199254740993,"big":1e400,"small":1e-4000,"zero":-0,"same":1,"same":2}';
+  const html = await (await renderDocument(document("precise.json", input).doc, "page", request())).text();
+  for (const expected of ['9007199254740993', '1e400', '1e-4000', ': -0', '&#34;same&#34;: 1', '&#34;same&#34;: 2']) expect(html).toContain(expected);
+  expect(html).not.toContain('9007199254740992');
+  expect(html).not.toContain(': null');
+});
+
+it("preserves validated HTML charsets and exact originals", async () => {
+  for (const mime of ['text/html; charset=utf-8', 'text/html; charset="windows-1252"']) {
+    const bytes = mime.includes('windows') ? new Uint8Array([60,112,62,233,60,47,112,62]) : new TextEncoder().encode('<p>café €</p>');
+    for (const variant of ["page", "raw", "download"] as const) {
+      const response = await renderDocument(document("authored.html", bytes, { mime }).doc, variant, request());
+      expect(response.headers.get("Content-Type")).toBe(mime.replaceAll('"', ''));
+      if (variant === "page") await response.arrayBuffer();
+      else expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    }
+  }
+});
