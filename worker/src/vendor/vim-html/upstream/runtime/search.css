@@ -1,0 +1,231 @@
+/* search.css -- piece D: search highlights, the command line and its messages,
+   the wildmenu, the fuzzy pickers and the outline. Tokens only.
+
+   Search colours are the owner's nvim `Search` (bright red, white text) in both
+   schemes; the current match is a darker red with a yellow underline so it
+   stands out among the others. ::highlight() can only set colours and text
+   decoration, which is why the "ring" is an underline. */
+
+::highlight(vh-search) {
+  background-color: var(--vh-search);
+  color: var(--vh-on-search);
+}
+::highlight(vh-search-cur) {
+  background-color: var(--vh-search-cur);
+  color: var(--vh-on-search);
+  text-decoration: underline;
+  text-decoration-color: var(--vh-search-outline);
+  text-decoration-thickness: 3px;
+  text-underline-offset: 2px;
+}
+
+.vh-cmdline[hidden], .vh-cmdmsg[hidden], .vh-wild[hidden], .vh-ol[hidden], .vh-search-count[hidden] { display: none; }
+
+/* "[3/17]" after the current match's line (search.js showCount) */
+.vh-search-count {
+  position: absolute;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--vh-sunk);
+  color: var(--vh-muted);
+  font: 11px/18px var(--vh-font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* The command line and the message strip sit exactly over the status line
+   (chrome.css, 28px, z-index 2) while they show. */
+.vh-cmdline, .vh-cmdmsg {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 28px;
+  padding: 0 10px;
+  background: var(--vh-surface);
+  border-top: 1px solid var(--vh-edge);
+  color: var(--vh-ink);
+  font: 13px/27px var(--vh-font-mono);
+  z-index: 3;
+}
+.vh-cmdline { display: flex; align-items: center; gap: 1px; }
+.vh-cmd-prompt { color: var(--vh-accent-ink); font-weight: 700; }
+.vh-cmd-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--vh-ink);
+  caret-color: var(--vh-accent);
+  font: inherit;
+}
+.vh-cmdmsg { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vh-cmdmsg-error { color: var(--vh-bad); font-weight: 600; }
+.vh-cmdmsg-warn { color: var(--vh-warn); }
+
+/* wildmenu: the completions above the command line, current one filled */
+.vh-wild {
+  position: fixed;
+  left: 18px;
+  bottom: 32px;
+  min-width: 180px;
+  max-width: calc(100vw - 36px);
+  max-height: 40vh;
+  overflow: auto;
+  padding: 4px 0;
+  background: var(--vh-surface);
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  box-shadow: var(--vh-shadow);
+  font: 13px/1.5 var(--vh-font-mono);
+  z-index: 3;
+}
+.vh-wild-item { padding: 1px 14px; white-space: nowrap; color: var(--vh-ink); }
+.vh-wild-item.vh-sel { background: var(--vh-accent); color: var(--vh-on-accent); }
+
+/* ---- pickers: a centred float like fzf-lua's, prompt on top, best match first */
+
+.vh-pk {
+  position: fixed;
+  left: 50%;
+  top: 12vh;
+  transform: translateX(-50%);
+  width: min(780px, calc(100vw - 32px));
+  background: var(--vh-surface);
+  border: 1px solid var(--vh-edge);
+  border-radius: var(--vh-radius);
+  box-shadow: var(--vh-shadow);
+  color: var(--vh-ink);
+  font: 13px/1.4 var(--vh-font-mono);
+  overflow: hidden;
+  z-index: 4;
+}
+.vh-pk-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px 0;
+  font-family: var(--vh-font-body);
+  font-size: 12px;
+  color: var(--vh-muted);
+}
+.vh-pk-title { color: var(--vh-accent-ink); font-weight: 700; letter-spacing: 0.02em; }
+.vh-pk-count { font-family: var(--vh-font-mono); font-variant-numeric: tabular-nums; }
+.vh-pk-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 8px;
+  padding: 0 8px;
+  height: 32px;
+  border: 1px solid var(--vh-line);
+  border-radius: calc(var(--vh-radius) * 0.7);
+  background: var(--vh-bg);
+}
+.vh-pk-caret { color: var(--vh-accent-ink); font-weight: 700; }
+.vh-pk-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--vh-ink);
+  caret-color: var(--vh-accent);
+  font: inherit;
+  font-size: 14px;
+}
+.vh-pk-list { position: relative; overflow: hidden; padding-bottom: 4px; }
+.vh-pk-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 26px;
+  padding: 0 12px 0 10px;
+  border-left: 2px solid transparent;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.vh-pk-row:hover { background: var(--vh-sunk); }
+.vh-pk-row.vh-sel { background: var(--vh-accent-soft); border-left-color: var(--vh-accent); }
+.vh-pk-ln, .vh-pk-lv {
+  flex: none;
+  width: 4ch;
+  text-align: right;
+  color: var(--vh-faint);
+  font-variant-numeric: tabular-nums;
+}
+.vh-pk-lv { width: 3ch; text-align: left; font-size: 11px; }
+.vh-pk-tx { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--vh-ink); }
+.vh-pk-hit { background: none; color: var(--vh-accent-ink); font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+.vh-pk-empty { padding: 6px 14px; color: var(--vh-faint); }
+
+/* ---- outline: a narrow right-side panel above the status line.
+   --vh-ol-w is shared: chrome.css moves the sun/moon toggle to the outline's
+   left edge while html.vh-outline-open, so it never covers the close button. */
+
+:root { --vh-ol-w: clamp(190px, 18vw, 280px); }
+
+.vh-ol {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 28px;
+  width: var(--vh-ol-w);
+  display: flex;
+  flex-direction: column;
+  background: var(--vh-surface);
+  border-left: 1px solid var(--vh-line);
+  color: var(--vh-ink);
+  font: 12.5px/1.35 var(--vh-font-body);
+  z-index: 1;
+}
+.vh-ol-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 6px 6px 12px;
+  border-bottom: 1px solid var(--vh-line);
+  color: var(--vh-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.vh-ol.vh-focus .vh-ol-head { color: var(--vh-accent-ink); }
+.vh-ol-close {
+  padding: 0 6px;
+  border: 0;
+  border-radius: calc(var(--vh-radius) * 0.6);
+  background: none;
+  color: var(--vh-muted);
+  font: 16px/1.2 var(--vh-font-body);
+  cursor: pointer;
+}
+.vh-ol-close:hover { background: var(--vh-sunk); color: var(--vh-ink); }
+.vh-ol-list { position: relative; flex: 1; overflow: auto; padding: 4px 0 8px; outline: 0; }
+.vh-ol-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 10px;
+  border-left: 2px solid transparent;
+  color: var(--vh-muted);
+  cursor: pointer;
+}
+.vh-ol-item[data-level="1"], .vh-ol-item[data-level="2"] { color: var(--vh-ink); }
+.vh-ol-item:hover { background: var(--vh-sunk); }
+.vh-ol-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vh-ol-ln { flex: none; color: var(--vh-faint); font: 11px var(--vh-font-mono); font-variant-numeric: tabular-nums; }
+.vh-ol-item.vh-cur { border-left-color: var(--vh-accent); background: var(--vh-accent-soft); color: var(--vh-accent-ink); font-weight: 600; }
+.vh-ol-item.vh-sel { box-shadow: inset 0 0 0 1px var(--vh-accent); }
+.vh-ol-empty { padding: 8px 12px; color: var(--vh-faint); }
+
+@media print {
+  html.vh-outline-open { padding-right: 0 !important; }
+}

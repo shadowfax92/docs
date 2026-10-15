@@ -305,7 +305,12 @@ describe("legacy public document routes", () => {
       const response = await worker.fetch(new Request(`${result.url}${variant}`), env);
       expect(response.status).toBe(200);
       expect(response.headers.get("Content-Type")).toBe("text/html");
-      expect(await response.text()).toBe(body); // Vim is pass-through here, including baked HTML.
+      const served = await response.text();
+      if (variant) expect(served).toBe(body); // Raw/download retain the exact original bytes.
+      else {
+        expect(served.startsWith(body)).toBe(true); // Authored markup, scripts and styles survive.
+        expect(served).toContain('data-vh="runtime"');
+      }
       if (variant) expect(response.headers.get("Content-Disposition")).toBe(`${variant === "/raw" ? "inline" : "attachment"}; filename="a_report.html"`);
     }
     const deleted = await worker.fetch(request(`/upload/${result.id}`), env);
