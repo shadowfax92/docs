@@ -8,7 +8,7 @@
  *
  *   catalog origin (same-origin fetch)                    search Web Worker (postMessage)
  *   GET  /all-docs/session ─ csrfToken, expiresAt
- *   GET  /all-docs/api/documents?cursor ─ every page ─► observed set
+ *   GET  /all-docs/api/documents?cursor ─ every page ─► metadata(gen) ─► names ready(gen)
  *   GET  /all-docs/api/documents/:id/text?version (≤3) ───────► add(gen) ─► ready(gen)
  *   filters / query ──────────────────────────────────────────► query(gen) ─► results(gen)
  *   review ─► POST /all-docs/api/delete  (≤100 frozen refs per batch, sequential, oldest first)
@@ -267,8 +267,10 @@ export interface ContentProgress {
   truncated: number;
   nameOnly: number;   // metadata-only: matched by name/title only
   unreadable: number; // extraction error: in the index by name/title only
-  failed: number;     // fetch or index failure: absent from the index, so not even its name matches
-  skipped: number;    // over the in-tab budget: absent from the index
+  failed: number;     // body fetch/index failure; metadata may still be searchable
+  skipped: number;    // over the body budget; metadata admission is independent
+  names: number;      // worker-acknowledged title/filename records
+  metadataFailed: number;
   nameOnlyKinds: FileKind[];
   complete: boolean; // scan complete and every observed document settled
   budgetExceeded: boolean;
@@ -317,9 +319,14 @@ export type SelectAllGate = { ok: true; count: number } | { ok: false; reason: s
 interface Entry {
   summary: DocumentSummary;
   content: ContentState;
-  /** Coverage of the record posted to the worker, held only until the worker acknowledges it. */
-  indexMeta?: { coverage: Coverage; indexedBytes: number; reason: string | null };
+  metadata: "indexing" | "indexed" | "failed";
+  bodyCost?: number; // Reserved while posted, released on rejection/replacement/restart.
 }
+/** Each acknowledgement owns one exact Entry, not just an ID that discovery may replace. */
+type IndexFlight = { entry: Entry } & (
+  | { phase: "metadata" }
+  | { phase: "body"; coverage: { coverage: Coverage; indexedBytes: number; reason: string | null } }
+);
 interface QueryFlight { generation: number; key: string; corpus: number; timer: ReturnType<typeof setTimeout> }
 
 const NO_WINDOW: AgeWindow = { after: null, before: null };
@@ -360,14 +367,15 @@ export class CatalogClient {
   private worker: SearchPort | null = null;
   // Generation: one counter for every worker message, so replies correlate unambiguously.
   private generation = 0;
-  private readonly pendingAdds = new Map<number, UploadId>();
+  private readonly pendingAdds = new Map<number, IndexFlight>();
+  private workerIncarnation = 0; // Reject even crash callbacks from a terminated worker.
   private queue: UploadId[] = [];
   private resumeCursor: string | null = null; // Next unread listing page after a scan error.
   private textInFlight = 0;
   private indexedBytes = 0;
   private budgetExceeded = false;
   private searchBroken: string | null = null;
-  private corpusRevision = 0; // Bumped whenever the index gains a document.
+  private corpusRevision = 0; // Bumped on acknowledged metadata or body changes.
   private flight: QueryFlight | null = null;
   private queued = false;
   private requeryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -548,6 +556,7 @@ export class CatalogClient {
     if (this.view !== "library" || this.budgetExceeded || this.searchBroken || !this.worker) return;
     for (const [id, entry] of this.docs) {
       if (entry.content.status !== "failed") continue;
+      if (entry.metadata === "failed") this.indexMetadata(entry);
       entry.content = { status: "pending" };
       this.queue.push(id);
     }
@@ -597,7 +606,10 @@ export class CatalogClient {
         }
         const previous = this.docs.get(summary.id);
         if (previous && previous.summary.version === summary.version) continue;
-        this.docs.set(summary.id, { summary, content: { status: "pending" } });
+        this.indexedBytes -= previous?.bodyCost ?? 0;
+        const entry: Entry = { summary, content: { status: "pending" }, metadata: "indexing" };
+        this.docs.set(summary.id, entry);
+        this.indexMetadata(entry);
         this.queue.push(summary.id);
       }
       this.scan = { ...this.scan, pages: this.scan.pages + 1 };
@@ -695,10 +707,12 @@ export class CatalogClient {
     if (!this.worker) return settle({ status: "failed", reason: this.searchBroken ?? "Content search is unavailable." });
     this.indexedBytes += cost;
     const generation = ++this.generation;
-    this.pendingAdds.set(generation, summary.id);
+    const entry = this.docs.get(summary.id)!;
+    entry.bodyCost = cost;
+    this.pendingAdds.set(generation, {
+      entry, phase: "body", coverage: { coverage: record.coverage, indexedBytes: record.indexedBytes, reason: record.reason },
+    });
     settle({ status: "indexing" });
-    const entry = this.docs.get(summary.id);
-    if (entry) entry.indexMeta = { coverage: record.coverage, indexedBytes: record.indexedBytes, reason: record.reason };
     // The record is handed to the worker by structured clone; no reference to its text survives here.
     this.worker.post({ version: 1, generation, operation: "add", summary, text: record });
   }
@@ -706,15 +720,25 @@ export class CatalogClient {
   // ------------------------------------------------------------------------------------------
   // Search worker: one message counter, one query in flight, latest query wins.
 
+  /** Announce names before extraction. Its acknowledgement never settles body coverage. */
+  private indexMetadata(entry: Entry): void {
+    if (!this.worker) { entry.metadata = "failed"; return; }
+    entry.metadata = "indexing";
+    const generation = ++this.generation;
+    this.pendingAdds.set(generation, { entry, phase: "metadata" });
+    this.worker.post({ version: 1, generation, operation: "metadata", summary: entry.summary });
+  }
+
   private startWorker(): void {
     this.generation++;
+    const incarnation = ++this.workerIncarnation;
     this.pendingAdds.clear();
     this.flight = null;
     this.queued = false;
     try {
       this.worker = this.deps.openSearch({
-        message: (reply) => this.onReply(reply),
-        failure: (reason) => this.onWorkerFailure(reason),
+        message: (reply) => { if (incarnation === this.workerIncarnation) this.onReply(reply); },
+        failure: (reason) => { if (incarnation === this.workerIncarnation) this.onWorkerFailure(reason); },
       });
     } catch {
       this.worker = null;
@@ -723,6 +747,7 @@ export class CatalogClient {
   }
 
   private stopWorker(): void {
+    this.workerIncarnation++;
     if (this.flight) clearTimeout(this.flight.timer);
     if (this.requeryTimer !== null) clearTimeout(this.requeryTimer);
     this.requeryTimer = null;
@@ -756,21 +781,28 @@ export class CatalogClient {
     const added = this.pendingAdds.get(reply.generation);
     if (added !== undefined) {
       this.pendingAdds.delete(reply.generation);
-      const entry = this.docs.get(added);
-      if (entry && entry.content.status === "indexing") {
-        if (reply.status === "error" && reply.code === "search_budget_exceeded") {
-          // The index now refuses every query until cleared; stop fetching text the tab can't hold.
-          this.budgetExceeded = true;
-          entry.content = { status: "skipped", reason: reply.message || "Over this tab's search budget." };
-        } else {
-          entry.content = reply.status === "error"
-            ? { status: "failed", reason: reply.message || "The search index rejected this document." }
-            : {
-              status: "indexed", coverage: entry.indexMeta?.coverage ?? "metadata-only",
-              indexedBytes: entry.indexMeta?.indexedBytes ?? 0, reason: entry.indexMeta?.reason ?? null,
-            };
+      const { entry, phase } = added;
+      if (this.docs.get(entry.summary.id) !== entry) return; // Superseded version/scan entry.
+      if (reply.status !== "ready" && reply.status !== "error") return;
+      if (reply.status === "error" && reply.code === "search_budget_exceeded") {
+        this.budgetExceeded = true;
+        this.pump(); // Metadata rejection can arrive while all body slots are held: settle the queue now.
+      }
+      if (phase === "metadata") {
+        entry.metadata = reply.status === "ready" ? "indexed" : "failed";
+      } else {
+        if (reply.status === "error") {
+          this.indexedBytes -= entry.bodyCost ?? 0;
+          entry.bodyCost = 0;
         }
-        entry.indexMeta = undefined;
+        entry.content = reply.status === "error"
+          ? { status: reply.code === "search_budget_exceeded" ? "skipped" : "failed", reason: reply.message || "The search index rejected this document." }
+          : { status: "indexed", ...added.coverage };
+      }
+      // Metadata-budget rejection invalidates the worker's whole index. Invalidate query
+      // freshness too, so cached hits cannot stay "ready" after the hard admission failure.
+      // Body rejection leaves admitted names valid and does not change query freshness.
+      if (reply.status === "ready" || phase === "metadata") {
         this.corpusRevision++;
         this.scheduleRequery();
       }
@@ -856,10 +888,14 @@ export class CatalogClient {
     this.indexedBytes = 0;
     this.budgetExceeded = false;
     this.queue = [];
+    // A fresh process owns an empty corpus. Replay every name, including fetching/failed bodies;
+    // old hits cannot represent this new index. Existing fetches can upgrade it when they arrive.
+    this.search = { ...this.search, hits: null, hitsKey: null };
     for (const [id, entry] of this.docs) {
+      entry.bodyCost = 0;
+      this.indexMetadata(entry);
       if (entry.content.status === "fetching") continue; // Its in-flight fetch settles into the new worker.
       entry.content = { status: "pending" };
-      entry.indexMeta = undefined;
       this.queue.push(id);
     }
     if (key === this.currentKey()) this.search = { ...this.search, status: "timeout", message: null };
@@ -1024,10 +1060,12 @@ export class CatalogClient {
   contentProgress(): ContentProgress {
     const progress: ContentProgress = {
       total: this.docs.size, settled: 0, searched: 0, truncated: 0, nameOnly: 0, unreadable: 0, failed: 0, skipped: 0,
-      nameOnlyKinds: [], complete: false, budgetExceeded: this.budgetExceeded,
+      names: 0, metadataFailed: 0, nameOnlyKinds: [], complete: false, budgetExceeded: this.budgetExceeded,
     };
     const nameOnlyKinds = new Set<FileKind>();
-    for (const { summary, content } of this.docs.values()) {
+    for (const { summary, content, metadata } of this.docs.values()) {
+      if (metadata === "indexed") progress.names++;
+      if (metadata === "failed") progress.metadataFailed++;
       switch (content.status) {
         case "indexed":
           progress.settled++;
@@ -1062,7 +1100,8 @@ export class CatalogClient {
       if (this.searchBroken) return { ok: false, reason: "Unavailable while content search is down" };
       if (this.timedOut.has(key)) return { ok: false, reason: "Unavailable because this search stopped early" };
       if (!progress.complete) return { ok: false, reason: `Available when content indexing finishes (${progress.settled} of ${progress.total})` };
-      // A document missing from the index cannot match even by name, so the hit set is partial.
+      // Metadata hits do not prove body completeness; retain the conservative full-search gate.
+      if (progress.names !== progress.total) return { ok: false, reason: "Unavailable until every document's names are indexed" };
       if (progress.failed) return { ok: false, reason: `Unavailable: ${progress.failed} ${progress.failed === 1 ? "document" : "documents"} couldn't be indexed — retry them first` };
       if (this.flight || this.queued || this.search.hitsKey !== key || this.hitsCorpus !== this.corpusRevision
         || this.search.status !== "ready") {
@@ -1466,6 +1505,7 @@ function isSummary(value: DocumentSummary): boolean {
 
 function isTextRecord(value: TextRecord | null): value is TextRecord {
   return !!value && value.version === 1 && typeof value.text === "string" && typeof value.indexedBytes === "number"
+    && Number.isFinite(value.indexedBytes) && value.indexedBytes >= 0
     && ["full", "truncated", "metadata-only", "error"].includes(value.coverage);
 }
 

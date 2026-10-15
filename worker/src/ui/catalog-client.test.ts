@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DeleteBatchRequest, DeleteProgress, DocumentSummary, TextRecord } from "../contracts";
 import type { SearchHit, SearchWorkerRequest, SearchWorkerResponse } from "../search";
+import { createSearchIndex, SearchError } from "../search";
 import {
   CatalogClient, QUERY_BUDGET_MS, TEXT_CONCURRENCY, ageWindow, describeWindow, filtersFromParams, filtersToParams,
   formatBytes, formatRelative, type SearchPort,
@@ -140,6 +141,10 @@ class FakeSearch {
       port.handlers.message({ version: 1, generation: message.generation, status: "error", ...failure });
       return;
     }
+    if (message.operation === "metadata") {
+      const previous = docs.get(message.summary.id);
+      if (previous?.summary.version !== message.summary.version) docs.set(message.summary.id, { summary: message.summary, text: "" });
+    }
     if (message.operation === "add") docs.set(message.summary.id, { summary: message.summary, text: message.text.text });
     if (message.operation === "clear") docs.clear();
     if (message.operation !== "query") {
@@ -149,7 +154,7 @@ class FakeSearch {
     const needle = message.query.ignoreCase ? message.query.text.toLowerCase() : message.query.text;
     const hits: SearchHit[] = [];
     for (const { summary, text } of docs.values()) {
-      const haystack = `${summary.title}\n${text}`;
+      const haystack = `${summary.filename}\n${summary.title}\n${text}`;
       const subject = message.query.ignoreCase ? haystack.toLowerCase() : haystack;
       const count = subject.split(needle).length - 1;
       if (count) hits.push({ id: summary.id, version: summary.version, matchCount: count, snippet: haystack.slice(0, 40), ranges: [] });
@@ -187,6 +192,285 @@ async function ready(client: CatalogClient): Promise<void> {
   await client.start();
   await until(() => client.contentProgress().complete, "scan and indexing");
 }
+
+/** Same matcher/index as production, with only the process transport replaced by microtasks. */
+function realSearch(handlers: FakePort["handlers"]): SearchPort {
+  const index = createSearchIndex();
+  let stopped = false;
+  return {
+    post(message) {
+      queueMicrotask(() => {
+        if (stopped) return;
+        const envelope = { version: 1 as const, generation: message.generation };
+        try {
+          if (message.operation === "metadata") index.add(message.summary);
+          if (message.operation === "add") index.add(message.summary, message.text);
+          if (message.operation === "clear") index.clear();
+          handlers.message(message.operation === "query"
+            ? { ...envelope, status: "results", hits: index.query(message.query, message.filter) }
+            : { ...envelope, status: "ready" });
+        } catch (error) {
+          if (!(error instanceof SearchError)) throw error;
+          handlers.message({ ...envelope, status: "error", code: error.code, message: error.message });
+        }
+      });
+    },
+    terminate() { stopped = true; index.clear(); },
+  };
+}
+
+describe("catalog client: metadata with the real search engine", () => {
+  it("finds a unique title while every body request is held", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "UniqueTitleSentinel" })]];
+    let release!: () => void;
+    catalog.textGate = () => new Promise<void>((resolve) => { release = resolve; });
+    const client = new CatalogClient({ fetch: catalog.fetch, openSearch: realSearch, now: () => NOW }, new URLSearchParams("q=UniqueTitleSentinel"));
+    try {
+      await client.start();
+      await until(() => catalog.textInFlight === 1 && client.search.status === "ready", "held body and query reply");
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00001"]);
+      expect(client.contentProgress()).toMatchObject({ searched: 0, settled: 0, complete: false });
+      expect(client.selectAllGate().ok).toBe(false);
+    } finally {
+      await client.lock();
+      release?.();
+    }
+  });
+
+  it.each(["500", "409", "mismatch"])("keeps failed-body names searchable (%s), but refuses global selection", async (failure) => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "FailedTitleSentinel" })]];
+    if (failure === "mismatch") catalog.texts.set("doc00001", { documentVersion: "stale" });
+    let failing = true;
+    const client = new CatalogClient({
+      fetch: (input, init) => failing && input.includes("/text?") && failure !== "mismatch"
+        ? Promise.resolve(error(Number(failure))) : catalog.fetch(input, init),
+      openSearch: realSearch, now: () => NOW,
+    }, new URLSearchParams("q=FailedTitleSentinel"));
+    try {
+      await ready(client);
+      await until(() => client.search.status === "ready");
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00001"]);
+      expect(client.contentProgress()).toMatchObject({ names: 1, failed: 1, searched: 0 });
+      expect(client.selectAllMatching()).toBe(false);
+      failing = false;
+      catalog.texts.clear();
+      client.retryContent();
+      await until(() => client.selectAllGate().ok);
+      expect(client.contentProgress()).toMatchObject({ names: 1, failed: 0, searched: 1 });
+    } finally { await client.lock(); }
+  });
+
+  it("finds filenames, upgrades body-only hits and counts once across metadata replays", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "title needle", filename: "needle.md" })], [summary(1, { title: "title needle", filename: "needle.md" })]];
+    catalog.texts.set("doc00001", { text: "BodySentinel needle needle" });
+    let release!: () => void;
+    catalog.textGate = () => new Promise<void>((resolve) => { release = resolve; });
+    const client = new CatalogClient({ fetch: catalog.fetch, openSearch: realSearch, now: () => NOW }, new URLSearchParams("q=needle.md"));
+    try {
+      await client.start();
+      await until(() => client.search.status === "ready");
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00001"]);
+      client.setFilters({ text: "needle" });
+      await until(() => client.search.status === "ready");
+      expect(client.hitFor(summary(1))?.matchCount).toBe(2);
+      release();
+      await until(() => client.hitFor(summary(1))?.matchCount === 4);
+      expect(client.results().matching).toHaveLength(1);
+      client.setFilters({ text: "BodySentinel" });
+      await until(() => client.selectAllGate().ok);
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00001"]);
+      expect(client.contentProgress()).toMatchObject({ total: 1, names: 1, searched: 1 });
+    } finally { await client.lock(); release?.(); }
+  });
+
+  it("uses real literal/regex/case and Unicode title matching while bodies are held", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "Kſ Élan 😀 𐐀 Core Insights" })]];
+    let release!: () => void;
+    catalog.textGate = () => new Promise<void>((resolve) => { release = resolve; });
+    const client = new CatalogClient({ fetch: catalog.fetch, openSearch: realSearch, now: () => NOW });
+    try {
+      await client.start();
+      await until(() => client.contentProgress().names === 1);
+      for (const [text, regex, matchCase, count] of [
+        ["core insights", false, false, 1], ["core insights", false, true, 0],
+        ["Core Insights", false, true, 1], ["core.*insights", true, false, 1],
+        ["core.*insights", false, false, 0], ["élan", false, false, 1],
+        ["ks", false, false, 1], ["𐐨", false, false, 1], ["😀", true, true, 1],
+      ] as const) {
+        client.setFilters({ text, regex, matchCase });
+        await until(() => client.search.status === "ready");
+        expect(client.results().matching).toHaveLength(count);
+        if (count) {
+          const hit = client.hitFor(summary(1))!;
+          expect(hit.ranges.every(([start, end]) => end > start && end <= hit.snippet.length)).toBe(true);
+        }
+      }
+      client.setFilters({ text: "(?=x)", regex: true });
+      await until(() => client.search.status === "error");
+      expect(client.selectAllGate().ok).toBe(false);
+    } finally { await client.lock(); release?.(); }
+  });
+
+  it("searches metadata-only files and budget-skipped names with truthful body coverage", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "BudgetSentinel" }), summary(2, { title: "BudgetSentinel image", kind: "image" }), ...range(4, 3).map((doc) => ({ ...doc, title: "BudgetSentinel" }))]];
+    catalog.texts.set("doc00001", { indexedBytes: 40 * 1024 * 1024 });
+    catalog.texts.set("doc00002", { coverage: "metadata-only", text: "", indexedBytes: 0, reason: "No OCR" });
+    const client = new CatalogClient({ fetch: catalog.fetch, openSearch: realSearch, now: () => NOW }, new URLSearchParams("q=BudgetSentinel"));
+    try {
+      await ready(client);
+      await until(() => client.search.status === "ready");
+      expect(client.results().matching).toHaveLength(6);
+      expect(client.contentProgress()).toMatchObject({ names: 6, nameOnly: 1, searched: 1, skipped: 4, budgetExceeded: true });
+      expect(client.selectAllMatching()).toBe(false);
+      client.setFilters({ kinds: ["image"] });
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00002"]);
+      client.setFilters({ age: "gt90" });
+      expect(client.results().matching).toEqual([]);
+    } finally { await client.lock(); }
+  });
+
+
+  it("owns acknowledgements by version across duplicate cursor pages", async () => {
+    const catalog = new FakeCatalog();
+    const old = summary(1, { title: "OldTitleSentinel" });
+    const next = summary(1, { title: "NewTitleSentinel", version: "v2" });
+    catalog.pages = [[old], [old, next]];
+    let releasePage!: () => void, releaseBody!: () => void;
+    const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+    const bodyGate = new Promise<void>((resolve) => { releaseBody = resolve; });
+    let heldGeneration = -1;
+    let oldAck: SearchWorkerResponse | null = null;
+    let deliver!: (reply: SearchWorkerResponse) => void;
+    const openSearch = (handlers: FakePort["handlers"]): SearchPort => {
+      deliver = handlers.message;
+      const port = realSearch({ ...handlers, message: (reply) => {
+        if (reply.generation === heldGeneration) oldAck = reply;
+        else handlers.message(reply);
+      } });
+      return { terminate: () => port.terminate(), post: (message) => {
+        if (message.operation === "add" && message.summary.version === old.version) heldGeneration = message.generation;
+        port.post(message);
+      } };
+    };
+    const client = new CatalogClient({
+      fetch: async (input, init) => {
+        if (input.includes("cursor=1")) await pageGate;
+        if (input.includes("/text?version=v2")) await bodyGate;
+        return catalog.fetch(input, init);
+      }, openSearch, now: () => NOW,
+    }, new URLSearchParams("q=OldTitleSentinel"));
+    try {
+      await client.start();
+      await until(() => oldAck !== null && client.results().matching.length === 1);
+      expect(client.scan.status).toBe("running");
+      expect(client.contentProgress()).toMatchObject({ names: 1, searched: 0 });
+      expect(client.selectAllMatching()).toBe(false);
+      releasePage();
+      await until(() => client.summary("doc00001")?.version === "v2" && client.contentProgress().names === 1);
+      deliver(oldAck!);
+      expect(client.contentOf("doc00001")?.status).toBe("fetching");
+      await until(() => client.search.status === "ready" && client.results().matching.length === 0);
+      client.setFilters({ text: "NewTitleSentinel" });
+      await until(() => client.search.status === "ready");
+      expect(client.results().matching.map((doc) => doc.version)).toEqual(["v2"]);
+      expect(client.contentProgress()).toMatchObject({ total: 1, searched: 0, complete: false });
+      releaseBody();
+      await until(() => client.selectAllGate().ok);
+      expect(client.contentProgress()).toMatchObject({ total: 1, names: 1, searched: 1 });
+    } finally { releasePage(); releaseBody(); await client.lock(); }
+  });
+
+  it("drops old text, replies and crash callbacks after refresh", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "OldTitleSentinel" })]];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const handlers: FakePort["handlers"][] = [];
+    const client = new CatalogClient({
+      fetch: async (input, init) => {
+        if (input.includes("/text?version=v1")) await gate;
+        return catalog.fetch(input, init);
+      },
+      openSearch: (callbacks) => { handlers.push(callbacks); return realSearch(callbacks); }, now: () => NOW,
+    }, new URLSearchParams("q=OldTitleSentinel"));
+    try {
+      await client.start();
+      await until(() => client.scan.status === "complete" && client.results().matching.length === 1);
+      catalog.pages = [[summary(1, { title: "NewTitleSentinel", version: "v2" })]];
+      client.refresh();
+      client.setFilters({ text: "NewTitleSentinel" });
+      await until(() => client.selectAllGate().ok);
+      handlers[0].failure("late crash from replaced worker");
+      handlers[0].message({ version: 1, generation: 99999, status: "results", hits: [] });
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(client.search.status).toBe("ready");
+      expect(client.results().matching.map((doc) => doc.version)).toEqual(["v2"]);
+      expect(client.contentProgress()).toMatchObject({ total: 1, names: 1, searched: 1 });
+    } finally { release(); await client.lock(); }
+  });
+
+  it("replays names after a query timeout while bodies stay held, with latest query wins", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const catalog = new FakeCatalog();
+    catalog.pages = [[summary(1, { title: "RestartTitleSentinel" })]];
+    let release!: () => void;
+    catalog.textGate = () => new Promise<void>((resolve) => { release = resolve; });
+    let opened = 0;
+    const client = new CatalogClient({
+      fetch: catalog.fetch, now: () => NOW,
+      openSearch: (handlers) => {
+        const first = ++opened === 1;
+        return realSearch({ ...handlers, message: (reply) => {
+          if (first && reply.status === "results") return; // Simulate a stuck query transport.
+          handlers.message(reply);
+        } });
+      },
+    }, new URLSearchParams("q=Stall"));
+    try {
+      await client.start();
+      await vi.advanceTimersByTimeAsync(QUERY_BUDGET_MS + 500);
+      expect(opened).toBe(2);
+      expect(client.search.status).toBe("timeout");
+      expect(client.contentProgress()).toMatchObject({ names: 1, searched: 0, complete: false });
+      client.setFilters({ text: "absent" });
+      client.setFilters({ text: "RestartTitleSentinel" });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(client.results().matching.map((doc) => doc.id)).toEqual(["doc00001"]);
+      expect(client.selectAllMatching()).toBe(false);
+    } finally { await client.lock(); release?.(); }
+  });
+
+
+  it("invalidates a successful query when metadata admission overflows", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[...range(10000).map((doc, index) => index ? doc : { ...doc, title: "OverflowTitleSentinel" })], [summary(10001)]];
+    let releasePage!: () => void;
+    const gate = new Promise<void>((resolve) => { releasePage = resolve; });
+    const releaseBodies: (() => void)[] = [];
+    catalog.textGate = () => new Promise<void>((resolve) => { releaseBodies.push(resolve); });
+    const client = new CatalogClient({
+      fetch: async (input, init) => { if (input.includes("cursor=1")) await gate; return catalog.fetch(input, init); },
+      openSearch: realSearch, now: () => NOW,
+    }, new URLSearchParams("q=OverflowTitleSentinel"));
+    try {
+      await client.start();
+      await until(() => client.search.status === "ready" && client.results().matching.length === 1);
+      releasePage();
+      await until(() => client.contentProgress().metadataFailed === 1);
+      await until(() => client.search.status === "error", "metadata overflow invalidates active search");
+      expect(client.search.message).toMatch(/budget/);
+      expect(client.contentProgress()).toMatchObject({ names: 10000, metadataFailed: 1, skipped: 9998, budgetExceeded: true });
+      expect(client.selectAllMatching()).toBe(false);
+    } finally { releasePage(); await client.lock(); for (const release of releaseBodies) release(); }
+  });
+
+});
 
 function range(count: number, start = 1): DocumentSummary[] {
   return Array.from({ length: count }, (_, index) => summary(start + index));

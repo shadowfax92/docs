@@ -801,7 +801,7 @@ class LibraryApp {
     } else if (client.search.status === "unavailable" && client.filters.text) {
       content = [`Content search is unavailable: ${client.search.message ?? "the search worker stopped"}. Filters, sorting and deletion still work.`];
     } else if (progress.budgetExceeded && client.filters.text) {
-      content = ["Content indexing stopped at this tab's 32 MB search budget. Search results are incomplete and Select all is disabled while searching."];
+      content = ["Search indexing stopped at this tab's memory or document limit. Search results are incomplete and Select all is disabled while searching."];
     }
     const key = content ? content.map((part) => typeof part === "string" ? part : "btn").join("|") : "";
     if (banner.dataset.key === key) return;
@@ -891,8 +891,10 @@ class LibraryApp {
     }
     if (progress.truncated) parts.push(`${progress.truncated.toLocaleString("en-US")} searched partially`);
     if (progress.unreadable) parts.push(`${progress.unreadable.toLocaleString("en-US")} unreadable (searched by name)`);
-    if (progress.failed) parts.push(`${progress.failed.toLocaleString("en-US")} couldn't be indexed`);
-    if (progress.skipped) parts.push(`${progress.skipped.toLocaleString("en-US")} over the search budget`);
+    parts.push(`Titles and filenames searched in ${plural(progress.names, "document")}`);
+    if (progress.metadataFailed) parts.push(`${progress.metadataFailed.toLocaleString("en-US")} names unavailable`);
+    if (progress.failed) parts.push(`${progress.failed.toLocaleString("en-US")} content unavailable`);
+    if (progress.skipped) parts.push(`${progress.skipped.toLocaleString("en-US")} content over the search budget`);
     if (!progress.complete) parts.push(client.scan.status === "running" ? "scanning…" : "indexing…");
     const text = parts.join(" · ");
     const key = `${text}|${progress.settled}|${progress.budgetExceeded}|${client.search.status}`;
