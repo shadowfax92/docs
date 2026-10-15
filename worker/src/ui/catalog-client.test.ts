@@ -108,6 +108,8 @@ interface FakePort extends SearchPort {
 class FakeSearch {
   ports: FakePort[] = [];
   auto = true;
+  /** Optional per-document add failure, mimicking the real index's budget/validation errors. */
+  addError: ((id: string) => { code: string; message: string } | null) | null = null;
   private readonly corpus = new Map<FakePort, Map<string, { summary: DocumentSummary; text: string }>>();
 
   readonly open = (handlers: FakePort["handlers"]): SearchPort => {
@@ -133,6 +135,11 @@ class FakeSearch {
   respond(port: FakePort, message: SearchWorkerRequest): void {
     if (port.terminated) return;
     const docs = this.corpus.get(port) as Map<string, { summary: DocumentSummary; text: string }>;
+    const failure = message.operation === "add" ? this.addError?.(message.summary.id) : null;
+    if (failure) {
+      port.handlers.message({ version: 1, generation: message.generation, status: "error", ...failure });
+      return;
+    }
     if (message.operation === "add") docs.set(message.summary.id, { summary: message.summary, text: message.text.text });
     if (message.operation === "clear") docs.clear();
     if (message.operation !== "query") {
@@ -412,6 +419,37 @@ describe("catalog client: extraction and search generations", () => {
     expect(client.search).toMatchObject({ status: "unavailable", message: "Content search stopped working in this tab." });
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable while content search is down" });
   });
+
+  it("refuses select-all while a document is missing from the index, until its retry succeeds", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [range(3)];
+    let failing = true;
+    const flaky = async (input: string, init?: RequestInit) =>
+      failing && input.includes("doc00002/text") ? error(500) : catalog.fetch(input, init);
+    const client = new CatalogClient({ fetch: flaky, openSearch: new FakeSearch().open, now: () => NOW });
+    await ready(client);
+    client.setFilters({ text: "invoice" });
+    await until(() => client.search.status === "ready");
+
+    expect(client.contentProgress()).toMatchObject({ failed: 1, complete: true });
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: 1 document couldn't be indexed — retry them first" });
+    expect(client.selectAllMatching()).toBe(false);
+
+    failing = false;
+    client.retryContent();
+    await until(() => client.selectAllGate().ok, "gate after retry");
+    expect(client.selectAllGate()).toEqual({ ok: true, count: 3 });
+  });
+
+  it("treats an index budget error on add as the tab budget and stops fetching text", async () => {
+    const { client, catalog, search } = setup([range(8)]);
+    search.addError = (id) => id === "doc00001" ? { code: "search_budget_exceeded", message: "The library exceeds the 32 MiB budget." } : null;
+    await ready(client);
+
+    expect(client.contentProgress()).toMatchObject({ budgetExceeded: true, complete: true });
+    expect(client.contentProgress().skipped).toBeGreaterThanOrEqual(1);
+    expect(catalog.requests("GET", "/all-docs/api/documents/doc").length).toBeLessThan(8);
+  });
 });
 
 describe("catalog client: filters", () => {
@@ -663,6 +701,37 @@ describe("catalog client: delete review", () => {
     expect(client.view).toBe("login");
     expect(client.login.problem).toBe("expired");
     expect(search.port.terminated).toBe(true);
+  });
+
+  it("keeps a failed single-card delete selected alongside the existing selection", async () => {
+    const { client, catalog } = setup([range(3)]);
+    await ready(client);
+    client.toggle("doc00001");
+    catalog.deleteReply = (request) => Response.json({
+      version: 1, outcomes: request.items.map((item) => ({ id: item.id, status: "failed" as const })),
+    } satisfies DeleteProgress);
+
+    client.openReview("doc00003");
+    await client.confirmReview("");
+    expect(client.review?.phase).toBe("partial");
+    client.closeReview();
+
+    expect([...client.selectedIds()].sort()).toEqual(["doc00001", "doc00003"]);
+    expect(client.observed()).toHaveLength(3);
+  });
+
+  it("shows the age cutoff for page selections made under one age window, not for mixed ones", async () => {
+    const docs = [100, 120, 140].map((days, index) => summary(index + 1, { uploadedAt: new Date(NOW - days * DAY).toISOString() }));
+    const { client } = setup([[...docs, summary(4)]]);
+    await ready(client);
+    client.setFilters({ age: "gt90" });
+    client.selectPage();
+    expect(client.openReview()?.window).toEqual({ after: null, before: NOW - 90 * DAY });
+    client.closeReview();
+
+    client.setFilters({ age: "any" });
+    client.toggle("doc00004");
+    expect(client.openReview()?.window).toBeNull();
   });
 
   it("deletes a single card without a typed count and leaves other selections intact", async () => {

@@ -6,6 +6,9 @@
  * loaded as a classic blocking script from <head>: the theme is applied before first paint, and
  * everything else waits for DOMContentLoaded. The bundle must therefore stay free of exports.
  *
+ * Filter state lives in the URL fragment (/all-docs#q=…&age=gt90): the catalog serves the shell only
+ * without a query string, and a fragment keeps search terms out of requests and server logs.
+ *
  * Safety: uploaded strings (titles, filenames, snippets, warnings) only ever become text nodes;
  * nothing here assigns innerHTML. Document links go to http(s) URLs on another origin, in a new tab
  * with noopener/noreferrer, so no uploaded markup can run with this origin's session.
@@ -47,12 +50,15 @@ function boot(): void {
       fetch: (input, init) => fetch(input, init),
       openSearch: openSearchWorker,
       now: () => Date.now(),
-    }, new URLSearchParams(location.search));
+    }, new URLSearchParams(location.hash.slice(1)));
     new LibraryApp(client).mount();
     void client.start();
   } catch (error) {
-    // Fall back to the plain form, which works without any of this script.
+    // Show the login view with an explanation; its submit stays disabled because the catalog only
+    // accepts the JSON login this script sends.
     document.documentElement.dataset.view = "login";
+    const message = document.getElementById("login-error");
+    if (message) message.textContent = "The library couldn't start in this browser.";
     console.error(error);
   }
 }
@@ -216,13 +222,17 @@ class LibraryApp {
     if (slot) slot.appendChild(this.themeButton());
     this.loginForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      void this.client.signIn(this.password.value);
+      // The secret leaves the DOM as soon as it is sent, so a locked screen never holds it.
+      const password = this.password.value;
+      this.password.value = "";
+      void this.client.signIn(password);
     });
+    (this.loginForm.querySelector("button") as HTMLButtonElement).disabled = false;
     this.client.subscribe(() => this.schedule());
     this.client.onAnnounce((text) => this.announce(text));
-    window.addEventListener("popstate", () => {
-      this.client.setFilters(filtersFromParams(new URLSearchParams(location.search)));
-    });
+    const fromUrl = () => this.client.setFilters(filtersFromParams(new URLSearchParams(location.hash.slice(1))));
+    window.addEventListener("popstate", fromUrl);
+    window.addEventListener("hashchange", fromUrl);
     document.addEventListener("keydown", (event) => this.onGlobalKey(event));
     // Relative ages ("5 min ago") stay honest without re-rendering on every tick of the clock.
     setInterval(() => {
@@ -454,11 +464,11 @@ class LibraryApp {
     this.announceCountSoon();
   }
 
-  /** Mirrors filters into the URL: replaceState while typing, pushState for discrete changes. */
+  /** Mirrors filters into the URL fragment: replaceState while typing, pushState for discrete changes. */
   private syncUrl(push: boolean): void {
-    const query = filtersToParams(this.client.filters).toString();
-    const url = `/all-docs${query ? `?${query}` : ""}`;
-    if (url === `${location.pathname}${location.search}`) return;
+    const state = filtersToParams(this.client.filters).toString();
+    const url = `/all-docs${state ? `#${state}` : ""}`;
+    if (url === `${location.pathname}${location.search}${location.hash}`) return;
     if (push) history.pushState(null, "", url);
     else history.replaceState(null, "", url);
   }
@@ -574,7 +584,10 @@ class LibraryApp {
     if (client.view === "library") this.renderLibrary();
     else this.clearLibrary();
     if (this.lastView !== client.view) {
-      if (client.view === "login") this.password.focus();
+      if (client.view === "login") {
+        this.password.value = "";
+        this.password.focus();
+      }
       this.lastView = client.view;
     }
   }
@@ -597,10 +610,7 @@ class LibraryApp {
     const submit = this.loginForm.querySelector("button") as HTMLButtonElement;
     submit.disabled = busy;
     submit.textContent = busy ? "Unlocking…" : "Unlock";
-    if (problem === "wrong-password" && !busy && this.password.value) {
-      this.password.value = "";
-      this.password.focus();
-    }
+    if (problem === "wrong-password" && !busy && document.activeElement !== this.password) this.password.focus();
     this.loginNotice.textContent = this.client.lockNotice ?? "";
   }
 
@@ -745,7 +755,10 @@ class LibraryApp {
     if (scan.status === "error") {
       const retry = h("button", { type: "button", class: "pill secondary" }, "Retry");
       retry.addEventListener("click", () => client.retryScan());
-      content = [`${scan.error ?? "Couldn't reach storage."} The documents found so far stay listed.`, retry];
+      // Listing cursors are signed and expire, so a stale one needs a fresh scan rather than a retry.
+      const refresh = h("button", { type: "button", class: "text-button" }, "Refresh");
+      refresh.addEventListener("click", () => client.refresh());
+      content = [`${scan.error ?? "Couldn't reach storage."} The documents found so far stay listed.`, retry, refresh];
     } else if (scan.status === "incomplete") {
       const refresh = h("button", { type: "button", class: "pill secondary" }, "Refresh");
       refresh.addEventListener("click", () => client.refresh());
@@ -844,15 +857,21 @@ class LibraryApp {
       parts.push(`${progress.nameOnly.toLocaleString("en-US")} by name only${kinds ? ` (${kinds})` : ""}`);
     }
     if (progress.truncated) parts.push(`${progress.truncated.toLocaleString("en-US")} searched partially`);
+    if (progress.unreadable) parts.push(`${progress.unreadable.toLocaleString("en-US")} unreadable (searched by name)`);
     if (progress.failed) parts.push(`${progress.failed.toLocaleString("en-US")} couldn't be indexed`);
     if (progress.skipped) parts.push(`${progress.skipped.toLocaleString("en-US")} over the search budget`);
     if (!progress.complete) parts.push(client.scan.status === "running" ? "scanning…" : "indexing…");
     const text = parts.join(" · ");
-    const key = `${text}|${progress.settled}`;
+    const key = `${text}|${progress.settled}|${progress.budgetExceeded}|${client.search.status}`;
     coverage.hidden = false;
     if (coverage.dataset.key === key) return;
     coverage.dataset.key = key;
     const children: Child[] = [h("span", null, text)];
+    if (progress.failed && !progress.budgetExceeded && client.search.status !== "unavailable") {
+      const retry = h("button", { type: "button", class: "text-button" }, "Retry");
+      retry.addEventListener("click", () => client.retryContent());
+      children.push(" ", retry);
+    }
     if (!progress.complete) {
       children.push(h("progress", {
         max: Math.max(1, progress.total), value: progress.settled,

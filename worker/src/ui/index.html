@@ -12,8 +12,9 @@
   <script src="/all-docs/assets/app.js"></script>
 </head>
 <body>
-  <!-- Trusted shell only: uploaded documents never render on this origin. The form works without
-       JavaScript; app.js enhances it into a JSON login and builds the library after a session. -->
+  <!-- Trusted shell only: uploaded documents never render on this origin. app.js turns the form
+       into a JSON login and builds the library after a session. The form keeps method="post" so a
+       password can never be submitted into a URL, even if the script fails to load. -->
   <main class="login" id="login" aria-labelledby="login-title">
     <div class="login-head">
       <p class="wordmark">docs<span class="micro">all-docs</span></p>
@@ -27,8 +28,10 @@
       <input class="field" id="password" type="password" name="password" autocomplete="current-password"
         required autofocus aria-describedby="login-error">
       <p class="error" id="login-error" role="alert"></p>
-      <button class="pill primary" type="submit">Unlock</button>
+      <!-- Enabled by app.js: the catalog accepts only the JSON login it sends. -->
+      <button class="pill primary" type="submit" disabled>Unlock</button>
     </form>
+    <noscript><p class="notice">Signing in to the private library needs JavaScript.</p></noscript>
     <p class="notice" id="login-notice"></p>
   </main>
   <div class="library" id="library"></div>

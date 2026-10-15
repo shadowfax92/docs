@@ -263,11 +263,12 @@ export interface SearchState {
 export interface ContentProgress {
   total: number;
   settled: number;
-  searched: number;  // full or truncated text in the index
+  searched: number;   // full or truncated text in the index
   truncated: number;
-  nameOnly: number;  // metadata-only: matched by name/title only
-  failed: number;
-  skipped: number;
+  nameOnly: number;   // metadata-only: matched by name/title only
+  unreadable: number; // extraction error: in the index by name/title only
+  failed: number;     // fetch or index failure: absent from the index, so not even its name matches
+  skipped: number;    // over the in-tab budget: absent from the index
   nameOnlyKinds: FileKind[];
   complete: boolean; // scan complete and every observed document settled
   budgetExceeded: boolean;
@@ -279,7 +280,10 @@ export interface SelectionState {
   /** Only in "matching" scope: cards the user unticked after selecting all matching. */
   excluded: Set<UploadId>;
   label: string | null;
+  /** Age window active when refs were chosen, shown again in the review; null when none applied. */
   window: AgeWindow | null;
+  /** Refs were added under different age windows, so no single cutoff describes them. */
+  windowMixed: boolean;
   anchor: UploadId | null;
 }
 
@@ -325,7 +329,7 @@ function queryKey(query: SearchQuery): string {
 }
 
 function emptySelection(): SelectionState {
-  return { scope: "none", refs: new Map(), excluded: new Set(), label: null, window: null, anchor: null };
+  return { scope: "none", refs: new Map(), excluded: new Set(), label: null, window: null, windowMixed: false, anchor: null };
 }
 
 export class CatalogClient {
@@ -539,6 +543,18 @@ export class CatalogClient {
     void this.discover(this.epoch, cursor);
   }
 
+  /** Re-queues documents whose text fetch or indexing failed, keeping everything already indexed. */
+  retryContent(): void {
+    if (this.view !== "library" || this.budgetExceeded || this.searchBroken || !this.worker) return;
+    for (const [id, entry] of this.docs) {
+      if (entry.content.status !== "failed") continue;
+      entry.content = { status: "pending" };
+      this.queue.push(id);
+    }
+    this.pump();
+    this.changed();
+  }
+
   private startCorpus(): void {
     this.searchBroken = null;
     this.timedOut.clear();
@@ -742,12 +758,18 @@ export class CatalogClient {
       this.pendingAdds.delete(reply.generation);
       const entry = this.docs.get(added);
       if (entry && entry.content.status === "indexing") {
-        entry.content = reply.status === "error"
-          ? { status: "failed", reason: reply.message || "The search index rejected this document." }
-          : {
-            status: "indexed", coverage: entry.indexMeta?.coverage ?? "metadata-only",
-            indexedBytes: entry.indexMeta?.indexedBytes ?? 0, reason: entry.indexMeta?.reason ?? null,
-          };
+        if (reply.status === "error" && reply.code === "search_budget_exceeded") {
+          // The index now refuses every query until cleared; stop fetching text the tab can't hold.
+          this.budgetExceeded = true;
+          entry.content = { status: "skipped", reason: reply.message || "Over this tab's search budget." };
+        } else {
+          entry.content = reply.status === "error"
+            ? { status: "failed", reason: reply.message || "The search index rejected this document." }
+            : {
+              status: "indexed", coverage: entry.indexMeta?.coverage ?? "metadata-only",
+              indexedBytes: entry.indexMeta?.indexedBytes ?? 0, reason: entry.indexMeta?.reason ?? null,
+            };
+        }
         entry.indexMeta = undefined;
         this.corpusRevision++;
         this.scheduleRequery();
@@ -1001,7 +1023,7 @@ export class CatalogClient {
 
   contentProgress(): ContentProgress {
     const progress: ContentProgress = {
-      total: this.docs.size, settled: 0, searched: 0, truncated: 0, nameOnly: 0, failed: 0, skipped: 0,
+      total: this.docs.size, settled: 0, searched: 0, truncated: 0, nameOnly: 0, unreadable: 0, failed: 0, skipped: 0,
       nameOnlyKinds: [], complete: false, budgetExceeded: this.budgetExceeded,
     };
     const nameOnlyKinds = new Set<FileKind>();
@@ -1015,7 +1037,7 @@ export class CatalogClient {
             progress.nameOnly++;
             nameOnlyKinds.add(summary.kind);
           }
-          if (content.coverage === "error") progress.failed++;
+          if (content.coverage === "error") progress.unreadable++;
           break;
         case "failed": progress.settled++; progress.failed++; break;
         case "skipped": progress.settled++; progress.skipped++; break;
@@ -1040,6 +1062,8 @@ export class CatalogClient {
       if (this.searchBroken) return { ok: false, reason: "Unavailable while content search is down" };
       if (this.timedOut.has(key)) return { ok: false, reason: "Unavailable because this search stopped early" };
       if (!progress.complete) return { ok: false, reason: `Available when content indexing finishes (${progress.settled} of ${progress.total})` };
+      // A document missing from the index cannot match even by name, so the hit set is partial.
+      if (progress.failed) return { ok: false, reason: `Unavailable: ${progress.failed} ${progress.failed === 1 ? "document" : "documents"} couldn't be indexed — retry them first` };
       if (this.flight || this.queued || this.search.hitsKey !== key || this.hitsCorpus !== this.corpusRevision
         || this.search.status !== "ready") {
         return { ok: false, reason: this.search.status === "error" ? "Unavailable while the search reports an error" : "Available when the search finishes" };
@@ -1083,7 +1107,9 @@ export class CatalogClient {
       ? order.slice(Math.min(order.indexOf(anchor), order.indexOf(id)), Math.max(order.indexOf(anchor), order.indexOf(id)) + 1)
       : [id];
     const select = !this.isSelected(id);
-    const selection = this.selection.scope === "none" ? { ...emptySelection(), scope: "refs" as const } : this.selection;
+    const wasEmpty = this.selection.scope === "none";
+    const selection = wasEmpty ? { ...emptySelection(), scope: "refs" as const } : this.selection;
+    if (select && selection.scope === "refs") this.noteWindow(selection, wasEmpty);
     for (const target of targets) {
       const summary = this.docs.get(target)?.summary;
       if (!summary) continue;
@@ -1110,11 +1136,25 @@ export class CatalogClient {
     if (this.selection.scope === "matching") {
       for (const doc of rendered) this.selection.excluded.delete(doc.id);
     } else {
+      const wasEmpty = this.selection.scope === "none";
       const refs = new Map(this.selection.refs);
       for (const doc of rendered) refs.set(doc.id, { id: doc.id, version: doc.version });
-      this.selection = { ...emptySelection(), scope: "refs", refs, anchor: this.selection.anchor };
+      this.selection = { ...this.selection, scope: "refs", refs, excluded: new Set(), label: null };
+      this.noteWindow(this.selection, wasEmpty);
     }
     this.changed();
+  }
+
+  /** Records the age window refs were chosen under; a second, different window makes it mixed. */
+  private noteWindow(selection: SelectionState, wasEmpty: boolean): void {
+    const window = this.window();
+    const active = window.after === null && window.before === null ? null : window;
+    if (wasEmpty) {
+      selection.window = active;
+      selection.windowMixed = false;
+    } else if (selection.window?.after !== active?.after || selection.window?.before !== active?.before) {
+      selection.windowMixed = true;
+    }
   }
 
   /** Freezes the exact ID/version refs of the complete matching set, or refuses. */
@@ -1126,7 +1166,7 @@ export class CatalogClient {
     const window = this.window();
     this.selection = {
       scope: "matching", refs, excluded: new Set(), label: this.filterLabel(),
-      window: window.after === null && window.before === null ? null : window, anchor: null,
+      window: window.after === null && window.before === null ? null : window, windowMixed: false, anchor: null,
     };
     this.changed();
     return true;
@@ -1179,13 +1219,16 @@ export class CatalogClient {
     }
     if (!items.length) return null;
     items.sort((a, b) => Date.parse(a.summary.uploadedAt) - Date.parse(b.summary.uploadedAt) || compareText(a.ref.id, b.ref.id));
-    const fromSelection = !single && this.selection.scope === "matching";
+    // The cutoff is display context for the frozen refs, never a predicate: it is shown only when
+    // the refs were chosen under one age window and every frozen item still satisfies it.
+    const chosen = single || this.selection.windowMixed ? null : this.selection.window;
+    const window = chosen && items.every((item) => inWindow(Date.parse(item.summary.uploadedAt), chosen)) ? chosen : null;
     this.review = {
       source: single ? "single" : "selection",
       items,
       totalBytes: items.reduce((sum, item) => sum + item.summary.sizeBytes, 0),
-      label: fromSelection ? this.selection.label : null,
-      window: fromSelection ? this.selection.window : null,
+      label: !single && this.selection.scope === "matching" ? this.selection.label : null,
+      window,
       phase: "review",
       outcomes: new Map(items.map((item) => [item.ref.id, "unprocessed" as DeleteOutcome])),
       reasons: new Map(),
@@ -1322,13 +1365,20 @@ export class CatalogClient {
         kept.set(item.ref.id, item.ref);
       }
     }
-    if (review.source === "selection" && review.phase !== "review") {
+    if (review.phase !== "review" && review.source === "selection") {
       // Unprocessed, changed and failed refs stay selected as explicit refs, never as a predicate.
-      this.selection = kept.size ? { ...emptySelection(), scope: "refs", refs: kept } : emptySelection();
-      if (!kept.size) this.selectedOnly = false;
-    } else {
-      this.normalizeSelection();
+      const { window, windowMixed } = this.selection;
+      this.selection = { ...emptySelection(), scope: "refs", refs: kept, window, windowMixed };
+    } else if (review.phase !== "review" && kept.size) {
+      // A single-card delete that didn't succeed joins the existing selection, which is otherwise kept.
+      const selection = this.selection.scope === "none" ? { ...emptySelection(), scope: "refs" as const } : this.selection;
+      for (const [id, ref] of kept) {
+        if (selection.scope === "matching" && selection.refs.has(id)) selection.excluded.delete(id);
+        else selection.refs.set(id, ref);
+      }
+      this.selection = selection;
     }
+    this.normalizeSelection();
     if (removed) {
       this.renderLimit = Math.max(RENDER_STEP, this.renderLimit);
       this.announcer(`${deleted} ${deleted === 1 ? "document" : "documents"} deleted.`);
