@@ -85,10 +85,6 @@ function escapeHtml(s: string): string {
   return s.replace(/[<>&"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-function titleFromFilename(filename: string): string {
-  return filename.replace(/\.[^.]+$/, "").replace(/[_-]/g, " ");
-}
-
 function formatBytes(size: number): string {
   const units = ["B", "KB", "MB", "GB", "TB"];
   let value = size;
