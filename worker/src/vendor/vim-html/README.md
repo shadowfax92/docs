@@ -18,10 +18,18 @@ or network access are needed. `generate.py` applies three small hosting changes:
   modes, storage, folding and help are the authentic skill implementation.
 - The gutter margin and status `body::after` rules are omitted to retain authored
   layout and pseudo-content. Gutters may clip on pages without left whitespace.
-- `host.js`/`host.css` add small help/off buttons inside the existing UI layer.
+- `host.js`/`host.css` add small help/off buttons inside the existing UI layer,
+  stacked beneath every runtime surface so toasts, which-key, the sidebar and
+  help are never covered.
   The hosting init synchronously turns numbers off through `VH.gutter` before
   first paint, retaining line identity, comment/mark signs and `Space u l`.
   This is a page-load default, with no change to global skill preferences.
+  It also maps normal-mode `dC` to the skill's own `:clear`: every comment of
+  this document (detached and folded ones included) goes in one undo step, with
+  the count toast, storage and highlight refresh; `u`/`Ctrl-r` undo and redo it,
+  and an empty clear adds no history. `dc` still clears only the cursor line;
+  which-key under `d` and `Space ?` list both. Page fields, the comment editor,
+  the command line, the sidebar (its own `D`) and Vim off never dispatch `dC`.
   Off clears pending key sequences and remembers `docs-vim=off` on this public
   origin (session-only if storage fails), leaving stored comments intact. A global guard
   prevents this bundle from booting over an already-live `window.__VH`.
@@ -29,7 +37,7 @@ or network access are needed. `generate.py` applies three small hosting changes:
 Upstream's `make_script_safe` and `make_style_safe` protect HTML end tags and make
 injected content ASCII. The hosting module separately escapes config JSON.
 The generator also records the verbatim upstream script's SHA-256 (normalized
-HTML line endings/outer whitespace) and embeds adapter-owned `baked-quiet.js`.
+HTML line endings/outer whitespace) and embeds adapter-owned `baked-hook.js`.
 The fingerprint recognizes common skill-built uploads without shipping another
 copy of the original runtime or relying on a guessed interface version.
 
@@ -41,7 +49,10 @@ only one `data-docs-vim-quiet` startup script. Its original bytes remain an exac
 prefix: no runtime/config/theme/dock is replaced or added, and source/storage/
 comment identity stays authored. This hook intentionally overrides initial
 numbers-on, then leaves later authored/ready handlers and manual toggles alone.
-Its marker makes repeated enhancement byte-idempotent. Config-only, unknown,
+It maps the same `dC` key onto the baked runtime's own `:clear`, so clearing
+uses that page's authored storage key (shared by re-uploads of one source).
+Its marker, named before the hook gained `dC`, makes repeated enhancement
+byte-idempotent and keeps saved hooked copies from being hooked twice. Config-only, unknown,
 modified, asynchronous/module or incompatible runtimes remain unchanged; the
 hook also guards the actual live instance and startup timing before using it.
 Only canonical assembler script annotations qualify; unfamiliar, duplicate,
@@ -69,10 +80,11 @@ assembler before enhancement, and `fragment` omits head/body/html. `raw` bypasse
 enhancement. The harness imports the same production module through esbuild;
 it serves no owner data, opens no browser and modifies no installed tools.
 
-For an automated headless proof of quiet defaults and the real generated preview
-path, run from the Worker directory:
+For automated headless proofs over the real Preview and generated-preview path,
+run from the Worker directory (both serve fixtures through `proof-server.mjs`):
 
     node src/vendor/vim-html/quiet-browser-proof.mjs <output-dir>
+    node src/vendor/vim-html/clear-browser-proof.mjs <output-dir>
 
 It owns its loopback server and isolated Chromium, closes both, and writes JSON
 and screenshots. It checks initial render samples, both number toggle states,
@@ -83,3 +95,11 @@ export and manual toggling. Later authored changes still work; unsupported/CSP/
 inert source stays byte-identical. Stored source and raw/download bytes are never
 changed. Already cached immutable copies need a fresh URL/cache refresh to receive
 the hook; restrictive CSP is left intact rather than weakened.
+
+The clear proof types `d` `Shift-C` on authored, generated and baked pages with
+line, character-range, line-range, folded/off-screen and detached comments. It
+checks the which-key row, count toast, highlights, gutter signs, sidebar and
+storage; one-step `u`, `Ctrl-r`, a history-free empty clear, `dc`, `gy`, reload
+persistence, another document's comments, preferences, numbers, and that page
+fields, the editor, the command line and Vim off type `dC` as text. Twice-enhanced
+pages keep one binding; raw/download stay exact.

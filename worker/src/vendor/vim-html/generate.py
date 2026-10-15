@@ -21,7 +21,7 @@ js = build.runtime_js()
 # Recognize the verbatim baked runtime without shipping a second copy of it.
 # HTML normalizes line endings; the hosting scanner applies the same normalization.
 baked_runtime_sha256 = hashlib.sha256(js.strip().encode("utf-8")).hexdigest()
-baked_quiet = build.make_script_safe((ROOT / "baked-quiet.js").read_text())
+baked_hook = build.make_script_safe((ROOT / "baked-hook.js").read_text())
 needle = "function onKeydown(e) {"
 assert js.count(needle) == 1
 js = js.replace(needle, needle + """
@@ -66,6 +66,6 @@ css = build.make_style_safe(css + (ROOT / "host.css").read_text())
     + "export const runtimeScript = " + json.dumps(js, ensure_ascii=True) + ";\n"
     + "export const runtimeStyle = " + json.dumps(css, ensure_ascii=True) + ";\n"
     + "export const bakedRuntimeSha256 = " + json.dumps(baked_runtime_sha256) + ";\n"
-    + "export const bakedQuietScript = " + json.dumps(baked_quiet, ensure_ascii=True) + ";\n"
+    + "export const bakedHookScript = " + json.dumps(baked_hook, ensure_ascii=True) + ";\n"
 )
 print(f"vim-html theme none: {len(js)} script bytes, {len(css)} style bytes")

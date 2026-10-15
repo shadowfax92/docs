@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { bakedHookScript } from "./vendor/vim-html/generated";
 import { enhanceHtml } from "./vim";
 
 const identity = { id: "Ab12Cd34", title: "Authored report", publicUrl: "https://docs.example/Ab12Cd34" };
@@ -38,6 +39,36 @@ describe("public HTML vim enhancement", () => {
     expect(await response.text()).toBe(source);
     expect(response.headers.get("ETag")).toBe('"baked"');
     expect(response.headers.get("Content-Length")).toBe(String(source.length));
+  });
+
+  it("baked startup hook adds one dC alias for the baked runtime's own :clear on the verified instance only", () => {
+    // A stand-in for the fingerprinted v1 runtime: only the interface the hook
+    // may touch. The real runtime's behavior is proved in clear-browser-proof.mjs.
+    const boot = ({ version = 1, replaced = false } = {}) => {
+      let numbers = true;
+      const inits: Array<() => void> = [];
+      const maps: Array<{ modes: string; seq: string; run: () => unknown; group: string }> = [];
+      const commands: string[] = [];
+      const VH = {
+        version, booted: false, init: (fn: () => void) => inits.push(fn),
+        gutter: { numbers: () => numbers, toggleNumbers: () => (numbers = !numbers) },
+        keys: { map: (modes: string, seq: string, run: () => unknown, opts: { group: string }) => maps.push({ modes, seq, run, group: opts.group }) },
+        commands: { run: (text: string) => commands.push(text) },
+      };
+      const window: { __VH: unknown } = { __VH: VH };
+      new Function("window", "document", bakedHookScript)(window, { readyState: "loading" });
+      if (replaced) window.__VH = { ...VH };
+      inits.forEach(fn => fn());
+      return { numbers, inits, maps, commands };
+    };
+    const hooked = boot();
+    expect(hooked.numbers).toBe(false);
+    expect(hooked.maps.map(({ modes, seq, group }) => ({ modes, seq, group }))).toEqual([{ modes: "normal", seq: "dC", group: "comments" }]);
+    hooked.maps[0].run();
+    expect(hooked.commands).toEqual(["clear"]);
+    const replaced = boot({ replaced: true });
+    expect([replaced.numbers, replaced.maps.length]).toEqual([true, 0]);
+    expect(boot({ version: 2 }).inits).toEqual([]);
   });
 
   it("preserves an already-hooked representation exactly without registering another startup init", async () => {

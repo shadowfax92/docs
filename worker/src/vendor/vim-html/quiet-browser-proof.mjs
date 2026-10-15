@@ -3,32 +3,19 @@
  * Run from worker: node src/vendor/vim-html/quiet-browser-proof.mjs <output-dir>.
  */
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { build } from "esbuild";
 import { chromium } from "playwright";
+import { bake, enhanceHtml, startProofServer } from "./proof-server.mjs";
 
 const output = resolve(process.argv[2] || "../.scratch/docs-vim-quiet/browser");
 await mkdir(output, { recursive: true });
-const bundle = await build({
-  entryPoints: [fileURLToPath(new URL("../../preview.ts", import.meta.url))],
-  bundle: true, write: false, platform: "node", format: "esm", target: "es2022",
-});
-const { renderDocument } = await import("data:text/javascript;base64," + Buffer.from(bundle.outputFiles[0].text).toString("base64"));
-const vimBundle = await build({ entryPoints: [fileURLToPath(new URL("../../vim.ts", import.meta.url))], bundle: true, write: false, platform: "node", format: "esm", target: "es2022" });
-const { enhanceHtml } = await import("data:text/javascript;base64," + Buffer.from(vimBundle.outputFiles[0].text).toString("base64"));
 const authored = `<!doctype html><html><head><meta charset="utf-8"><title>Quiet fixture</title>
 <style>body{margin:0;background:rgb(248,245,239);font:18px Georgia}main{margin:40px auto;width:620px}body::after{content:"Authored footer"}</style></head><body><main>
 <h1>Quiet fixture</h1><p>Alpha point.</p><p>Needle search point.</p><p>Final comment target.</p>
 <form><label>Notes <input id="notes"></label><button>Save notes</button><output></output></form></main>
 <script>document.querySelector('form').onsubmit=e=>{e.preventDefault();document.querySelector('output').textContent=document.querySelector('input').value;};</script></body></html>`;
-const baked = execFileSync("python3", ["-B", "-c",
-  "import sys;sys.path.insert(0,sys.argv[1]);import build;print(build.build(sys.stdin.read(),theme='none',source='/synthetic/quiet.html',key='quiet-baked')[0])",
-  fileURLToPath(new URL("upstream/scripts", import.meta.url)),
-], { input: authored, encoding: "utf8" });
+const baked = bake(authored, "/synthetic/quiet.html", "quiet-baked");
 // An explicit config (even without a baked runtime) remains the author's choice.
 const configured = authored.replace("</head>", '<script>window.VIM_HTML={source:"/authored/config.html",storageKey:"authored-config"};</script></head>');
 // Matching public method names do not make a second, unknown core compatible.
@@ -47,55 +34,29 @@ const sources = {
   "/baked-duplicate-unquoted": baked + "<script data-vh=runtime>" + replacement + "</script>",
   "/baked-duplicate-encoded": baked + '<script data-vh="runt&#105;me">' + replacement + "</script>",
   "/configured": configured,
-  "/preview": "# Generated fixture\n\nAlpha point.\n\nNeedle search point.\n\nFinal comment target.",
+  "/preview": { markdown: "# Generated fixture\n\nAlpha point.\n\nNeedle search point.\n\nFinal comment target." },
 };
-const serverErrors = [];
-const server = createServer(async (req, res) => {
-  try {
-    const requested = new URL(req.url, origin).pathname;
-    const variant = requested.endsWith("/raw") ? "raw" : requested.endsWith("/download") ? "download" : "page";
-    const path = requested.replace(/\/(?:raw|download)$/, "");
-    if (!(path in sources)) { res.writeHead(404); res.end(); return; }
-    const generated = path === "/preview";
-    const source = sources[path];
-    const bytes = new TextEncoder().encode(source);
-    const summary = {
-      id: "Quiet123", version: "fixture-v1", title: "Quiet fixture", filename: generated ? "quiet.md" : "quiet.html",
-      kind: generated ? "markdown" : "html", mime: generated ? "text/markdown" : "text/html",
-      sizeBytes: bytes.length, uploadedAt: "2026-10-15T00:00:00.000Z", timeSource: "r2", createdAt: null,
-      publicUrl: origin + path, rawUrl: origin + path + "/raw", downloadUrl: origin + path + "/download", objectCount: 1, warnings: [],
-    };
-    const doc = {
-      summary, objects: [{ sizeBytes: bytes.length, etag: "fixture-etag", uploadedAt: summary.uploadedAt }],
-      // Preview opens once, exactly as it would at the Documents seam; every
-      // request gets a fresh disposable stream instead of an R2 dependency.
-      openBody: async () => ({ body: new Response(bytes).body }),
-    };
-    // Preview intentionally owns authored headers. Cross the enhancement seam
-    // directly for header-CSP rejection without discarding an opened response.
-    let response = path === "/baked-csp" && variant === "page"
-      ? await enhanceHtml(new Response(baked, { headers: { "Content-Type": "text/html", "Content-Security-Policy": "script-src 'none'" } }), summary)
-      : await renderDocument(doc, variant, new Request(origin + requested));
-    if (path === "/baked-repeat" && variant === "page") {
-      // Cross the same production seam with already-enhanced source. Exact
-      // equality guards against two startup hooks as well as two runtime cores.
-      const once = await response.text();
-      response = await enhanceHtml(new Response(once, response), { id: "Other123", title: "Do not replace", publicUrl: "https://wrong.example" });
-      const twice = await response.text();
-      assert.equal(twice, once);
-      response = new Response(twice, response);
-    }
-    res.writeHead(response.status, { ...Object.fromEntries(response.headers), "Cache-Control": "no-store" });
-    res.end(Buffer.from(await response.arrayBuffer()));
-  } catch (error) { serverErrors.push(String(error)); res.writeHead(500); res.end("Fixture failed"); }
-});
-let origin;
+let server;
 let browser;
-const result = { complete: false, checks: [], errors: [], serverErrors };
+const result = { complete: false, checks: [], errors: [], serverErrors: [] };
 const check = (name, detail = {}) => { result.checks.push({ name, ...detail }); console.log("PASS " + name); };
 try {
-  await new Promise((ok, fail) => { server.once("error", fail); server.listen(0, "127.0.0.1", ok); });
-  origin = `http://127.0.0.1:${server.address().port}`;
+  server = await startProofServer({ sources, id: "Quiet123", title: "Quiet fixture", route: async ({ path, variant, summary, render }) => {
+    if (variant !== "page") return;
+    // Preview intentionally owns authored headers. Cross the enhancement seam
+    // directly for header-CSP rejection without discarding an opened response.
+    if (path === "/baked-csp") return enhanceHtml(new Response(baked, { headers: { "Content-Type": "text/html", "Content-Security-Policy": "script-src 'none'" } }), summary);
+    if (path !== "/baked-repeat") return;
+    // Cross the same production seam with already-enhanced source. Exact
+    // equality guards against two startup hooks as well as two runtime cores.
+    const response = await render();
+    const once = await response.text();
+    const twice = await (await enhanceHtml(new Response(once, response), { id: "Other123", title: "Do not replace", publicUrl: "https://wrong.example" })).text();
+    assert.equal(twice, once);
+    return new Response(twice, response);
+  } });
+  result.serverErrors = server.serverErrors;
+  const origin = server.origin;
   browser = await chromium.launch({ headless: true, channel: "chromium" });
   result.browser = browser.version();
   const newContext = () => browser.newContext({ viewport: { width: 1280, height: 900 }, permissions: ["clipboard-read", "clipboard-write"] });
@@ -242,14 +203,14 @@ try {
   check("later authored ready handler and manual toggle can override startup default");
   await laterContext.close();
   assert.deepEqual(result.errors, []);
-  assert.deepEqual(serverErrors, []);
+  assert.deepEqual(server.serverErrors, []);
   result.complete = true;
 } finally {
   // Only resources created by this process are closed. Persist a failing proof
   // too, so an interrupted run cannot be mistaken for browser acceptance.
   try { if (browser) await browser.close(); }
   finally {
-    await new Promise(ok => server.close(ok));
+    if (server) await server.close();
     await writeFile(resolve(output, "quiet-browser-proof.json"), JSON.stringify(result, null, 2) + "\n");
   }
 }

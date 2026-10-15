@@ -1,5 +1,9 @@
-/* Keep the discoverable hosting controls inside the runtime's own UI layer. */
-#vh-ui .docs-vim-controls { position: fixed; right: 8px; bottom: 36px; display: flex; gap: 4px; z-index: 10; }
+/* Keep the discoverable hosting controls inside the runtime's own UI layer,
+ * beneath every runtime surface (chrome.css stacks 2 status .. 9 copy dialog).
+ * The toast and which-key share this corner: their "u to undo" and dC rows
+ * must stay readable. The toast and first-load hint ignore pointer events, so
+ * the buttons remain clickable under them. */
+#vh-ui .docs-vim-controls { position: fixed; right: 8px; bottom: 36px; display: flex; gap: 4px; z-index: 1; }
 #vh-ui .docs-vim-controls button { font: 12px/1.4 system-ui, sans-serif; color: var(--vh-ink); background: var(--vh-bg); border: 1px solid var(--vh-edge); border-radius: 4px; padding: 3px 6px; cursor: pointer; }
 [data-docs-vim-off] #vh-ui > :not(.docs-vim-controls) { display: none !important; }
 @media print { #vh-ui .docs-vim-controls { display: none; } }
