@@ -9,8 +9,8 @@
  * Filter state lives in the URL fragment (/all-docs#q=…&age=gt90): the catalog serves the shell only
  * without a query string, and a fragment keeps search terms out of requests and server logs.
  *
- * Safety: uploaded strings (titles, filenames, snippets, warnings) only ever become text nodes;
- * nothing here assigns innerHTML. Document links go to http(s) URLs on another origin, in a new tab
+ * Safety: uploaded strings (titles, filenames, snippets, warnings) and extraction reasons only ever
+ * become text nodes; nothing here assigns innerHTML. Document links go to http(s) URLs on another origin, in a new tab
  * with noopener/noreferrer, so no uploaded markup can run with this origin's session.
  */
 import {
@@ -18,6 +18,7 @@ import {
   filtersFromParams, filtersToParams, formatBytes, formatDate, formatDateTime, formatRelative,
   type AgePreset, type ContentProgress, type DeleteOutcome, type Filters, type ReviewState, type SearchPort, type SortKey,
 } from "./catalog-client";
+import { coverageNote } from "./coverage-note";
 import type { DocumentSummary, FileKind } from "../contracts";
 import type { SearchHit, SearchWorkerResponse } from "../search";
 
@@ -888,8 +889,12 @@ class LibraryApp {
     const key = [
       this.minute, searching, client.search.hitsKey,
       ...rendered.map((doc) => {
-        const content = searching ? client.contentOf(doc.id)?.status ?? "" : "";
-        return `${doc.id}:${doc.version}:${client.isSelected(doc.id) ? 1 : 0}:${client.hitFor(doc)?.matchCount ?? ""}:${content}`;
+        // Content state settles asynchronously after the card first renders. The key carries the
+        // exact coverage note the card shows, not just the status, so new coverage or reason text
+        // from the extractor always rebuilds the card.
+        const content = searching ? client.contentOf(doc.id) : null;
+        const note = content ? `${content.status}:${JSON.stringify(coverageNote(content))}` : "";
+        return `${doc.id}:${doc.version}:${client.isSelected(doc.id) ? 1 : 0}:${client.hitFor(doc)?.matchCount ?? ""}:${note}`;
       }),
     ].join("|");
     if (key === this.gridKey) return;
@@ -945,19 +950,23 @@ class LibraryApp {
     return h("article", { class: selected ? "card selected" : "card", "data-id": doc.id, "aria-labelledby": titleId }, children);
   }
 
-  /** Match count, highlighted snippet and an honest note on how much content was searched. */
+  /**
+   * Match count, highlighted snippet and an honest coverage note. Partial, name-only and unreadable
+   * cards add the extractor's own reason (capped, text node only) under a neutral label; see
+   * coverage-note.ts. Full coverage and not-yet-indexed cards show no note.
+   */
   private searchDetails(doc: DocumentSummary): Child[] {
     const hit = this.client.hitFor(doc);
-    const content = this.client.contentOf(doc.id);
+    const note = coverageNote(this.client.contentOf(doc.id));
     const parts: Child[] = [];
     if (hit) {
       parts.push(h("p", { class: "matches" }, plural(hit.matchCount, "match", "matches")));
       if (hit.snippet) parts.push(h("p", { class: "snippet" }, snippet(hit)));
     }
-    if (content?.status === "indexed" && content.coverage === "metadata-only") parts.push(h("p", { class: "note" }, "name match only"));
-    else if (content?.status === "indexed" && content.coverage === "truncated") {
-      parts.push(h("p", { class: "note" }, `first ${formatBytes(content.indexedBytes)} searched`));
-    } else if (content?.status === "indexed" && content.coverage === "error") parts.push(h("p", { class: "note" }, "content unreadable · name only"));
+    if (note) {
+      parts.push(h("p", { class: "note", "data-coverage": "label" }, note.label));
+      if (note.reason) parts.push(h("p", { class: "note", "data-coverage": "reason" }, note.reason));
+    }
     return parts;
   }
 
