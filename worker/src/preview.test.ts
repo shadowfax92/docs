@@ -136,6 +136,23 @@ describe("public page rendering", () => {
     expect(html).toContain("Fixture &#60;title&#62;");
   });
 
+  it("gives a generated viewer one pre-paint theme control and flags only it for the hosted Vim layer", async () => {
+    const html = await (await renderDocument(document("note.md", "# Theme").doc, "page", request())).text();
+    const viewer = html.slice(0, html.indexOf("<!-- vim-html:head:begin -->"));
+    expect(viewer.match(/<button[^>]*\bdata-theme-toggle\b/g)).toHaveLength(1);
+    // The stored choice is applied in <head>, before any body content can paint.
+    expect(viewer.indexOf("<script data-docs-theme>")).toBeLessThan(viewer.indexOf("<body>"));
+    // enhanceHtml treats a page naming the runtime's globals as already carrying
+    // Vim; the viewer must never do so, or generated pages silently lose Vim.
+    expect(viewer).not.toMatch(/__VH|VIM_HTML|data-vh\s*=/);
+    expect(html.match(/<script data-vh="runtime">/g)).toHaveLength(1);
+    expect(html).toContain('"docsViewer":true');
+
+    const authored = await (await renderDocument(document("custom.html", '<nav class="viewer-bar"><button data-theme-toggle>Theme</button></nav>').doc, "page", request())).text();
+    expect(authored).toContain('<script data-vh="runtime">');
+    expect(authored).not.toContain('"docsViewer":true');
+  });
+
   it("keeps authored HTML styling/scripts/forms without viewer chrome and keeps originals exact", async () => {
     const source = '<!doctype html><style>body{background:purple}</style><form><input name="q"></form><script>window.author=true</script>';
     for (const variant of ["page", "raw", "download"] as const) {

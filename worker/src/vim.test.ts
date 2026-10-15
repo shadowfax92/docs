@@ -19,6 +19,17 @@ describe("public HTML vim enhancement", () => {
     expect(result).not.toMatch(/<(?:script|link)\b[^>]*(?:src|href)=/i);
   });
 
+  it("passes the generated-viewer flag only into a newly injected runtime", async () => {
+    const page = "<main><p>Generated text</p></main>";
+    const flagged = await (await enhanceHtml(htmlResponse(page), identity, { generatedViewer: true })).text();
+    expect(flagged).toContain('"docsViewer":true');
+    expect(await (await enhanceHtml(htmlResponse(page), identity)).text()).not.toContain('"docsViewer":true');
+    // Already-enhanced output stays byte-identical whether or not the caller flags it.
+    expect(await (await enhanceHtml(htmlResponse(flagged), identity)).text()).toBe(flagged);
+    const baked = '<!-- vim-html:body:begin --><script data-vh="config">window.VIM_HTML={source:"/original.html",storageKey:"original"}</script><script data-vh="runtime">window.__VH={version:99}</script><!-- vim-html:body:end -->';
+    expect(await (await enhanceHtml(htmlResponse(baked), identity, { generatedViewer: true })).text()).toBe(baked);
+  });
+
   it("is byte-idempotent and preserves baked comment/source identity", async () => {
     const first = await enhanceHtml(htmlResponse("<main><h1>Fragment</h1><p>Text</p></main>"), identity);
     const built = await first.text();

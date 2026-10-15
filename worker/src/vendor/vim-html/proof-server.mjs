@@ -28,9 +28,12 @@ export function bake(html, source, key) {
   ], { input: html, encoding: "utf8" });
 }
 
-/** Serve `sources` ({path: html | {markdown}}) and their /raw and /download
- * variants on 127.0.0.1. `route(context)` may return a Response to cross the
- * enhancement seam differently for one request; undefined uses Preview.
+/** Serve `sources` ({path: html | {markdown} | {filename, mime, body}}) and their
+ * /raw and /download variants on 127.0.0.1. A string is authored HTML, {markdown}
+ * a generated Markdown preview, and {filename, mime, body} any other upload
+ * (body: string or bytes), so every generated viewer format crosses Preview.
+ * `route(context)` may return a Response to cross the enhancement seam
+ * differently for one request; undefined uses Preview.
  * Handler failures become 500s recorded in serverErrors for the caller to assert.
  */
 export async function startProofServer({ sources, id, title, route }) {
@@ -42,12 +45,14 @@ export async function startProofServer({ sources, id, title, route }) {
       const variant = requested.endsWith("/raw") ? "raw" : requested.endsWith("/download") ? "download" : "page";
       const path = requested.replace(/\/(?:raw|download)$/, "");
       if (!(path in sources)) { res.writeHead(404); res.end(); return; }
-      const generated = typeof sources[path] !== "string";
-      const bytes = new TextEncoder().encode(generated ? sources[path].markdown : sources[path]);
+      const source = sources[path];
       const name = title.toLowerCase().replace(/\W+/g, "-");
+      const file = typeof source === "string" ? { filename: name + ".html", mime: "text/html", body: source }
+        : "markdown" in source ? { filename: name + ".md", mime: "text/markdown", body: source.markdown } : source;
+      const bytes = typeof file.body === "string" ? new TextEncoder().encode(file.body) : file.body;
       const summary = {
-        id, version: "fixture-v1", title, filename: name + (generated ? ".md" : ".html"),
-        kind: generated ? "markdown" : "html", mime: generated ? "text/markdown" : "text/html",
+        id, version: "fixture-v1", title, filename: file.filename,
+        kind: file.filename.split(".").pop(), mime: file.mime,
         sizeBytes: bytes.length, uploadedAt: "2026-10-15T00:00:00.000Z", timeSource: "r2", createdAt: null,
         publicUrl: origin + path, rawUrl: origin + path + "/raw", downloadUrl: origin + path + "/download", objectCount: 1, warnings: [],
       };
