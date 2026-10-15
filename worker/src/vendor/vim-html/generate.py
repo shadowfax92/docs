@@ -6,6 +6,7 @@ The narrow hosting adaptations below are intentionally kept out of upstream/ so
 its provenance hashes continue to identify the authentic sources verbatim.
 """
 import importlib.util
+import hashlib
 import json
 import sys
 sys.dont_write_bytecode = True
@@ -17,6 +18,10 @@ build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build)
 
 js = build.runtime_js()
+# Recognize the verbatim baked runtime without shipping a second copy of it.
+# HTML normalizes line endings; the hosting scanner applies the same normalization.
+baked_runtime_sha256 = hashlib.sha256(js.strip().encode("utf-8")).hexdigest()
+baked_quiet = build.make_script_safe((ROOT / "baked-quiet.js").read_text())
 needle = "function onKeydown(e) {"
 assert js.count(needle) == 1
 js = js.replace(needle, needle + """
@@ -60,5 +65,7 @@ css = build.make_style_safe(css + (ROOT / "host.css").read_text())
     "// Generated offline by vendor/vim-html/generate.py; see README.md for provenance.\n"
     + "export const runtimeScript = " + json.dumps(js, ensure_ascii=True) + ";\n"
     + "export const runtimeStyle = " + json.dumps(css, ensure_ascii=True) + ";\n"
+    + "export const bakedRuntimeSha256 = " + json.dumps(baked_runtime_sha256) + ";\n"
+    + "export const bakedQuietScript = " + json.dumps(baked_quiet, ensure_ascii=True) + ";\n"
 )
 print(f"vim-html theme none: {len(js)} script bytes, {len(css)} style bytes")

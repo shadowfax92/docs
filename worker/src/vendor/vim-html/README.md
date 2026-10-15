@@ -28,11 +28,22 @@ or network access are needed. `generate.py` applies three small hosting changes:
 
 Upstream's `make_script_safe` and `make_style_safe` protect HTML end tags and make
 injected content ASCII. The hosting module separately escapes config JSON.
+The generator also records the verbatim upstream script's SHA-256 (normalized
+HTML line endings/outer whitespace) and embeds adapter-owned `baked-quiet.js`.
+The fingerprint recognizes common skill-built uploads without shipping another
+copy of the original runtime or relying on a guessed interface version.
 
 `enhanceHtml(Response, DocumentIdentity)` owns bounded inspection and injection:
 UTF-8 HTML up to 4 MiB gets a suffix after the untouched original bytes, including
-fragments and omitted head/body tags. Baked markers/config/runtime anywhere in the
-source are conservatively left untouched, retaining comment/source identity.
+fragments and omitted head/body tags. A standard baked body block with exactly
+one synchronous inline config/runtime and the recognized script fingerprint gets
+only one `data-docs-vim-quiet` startup script. Its original bytes remain an exact
+prefix: no runtime/config/theme/dock is replaced or added, and source/storage/
+comment identity stays authored. This hook intentionally overrides initial
+numbers-on, then leaves later authored/ready handlers and manual toggles alone.
+Its marker makes repeated enhancement byte-idempotent. Config-only, unknown,
+modified, asynchronous/module or incompatible runtimes remain unchanged; the
+hook also guards the actual live instance and startup timing before using it.
 Restrictive/non-ASCII header CSP, any meta CSP, no-transform, non-UTF-8, compressed, partial, attachment, malformed
 unclosed raw-text/inert contexts, and larger pages are served unchanged. No CSP
 is relaxed. Generated previews' existing inline-permissive header CSP is retained
@@ -64,6 +75,9 @@ path, run from the Worker directory:
 It owns its loopback server and isolated Chromium, closes both, and writes JSON
 and screenshots. It checks initial render samples, both number toggle states,
 navigation/search/selection/comments/export/help, gutter signs, native styles/forms
-and byte-identical baked/configured sources. Baked sources retain their authored
-runtime, including upstream's numbers-on default; changing those requires rebuilding
-the source rather than overwriting an uploaded runtime or its comment identity.
+and unchanged baked source/config/theme/comment identity. Baked, twice-enhanced
+and CRLF fixtures prove one hook, before-paint initialization, comment reload/
+export and manual toggling. Later authored changes still work; unsupported/CSP/
+inert source stays byte-identical. Stored source and raw/download bytes are never
+changed. Already cached immutable copies need a fresh URL/cache refresh to receive
+the hook; restrictive CSP is left intact rather than weakened.

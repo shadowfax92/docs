@@ -28,6 +28,25 @@ describe("public HTML vim enhancement", () => {
   });
 
   it.each([
+    '<script data-vh="runtime">window.__VH={version:99}</script>',
+    '<script async data-vh="runtime">window.__VH={}</script>',
+    '<script type="module" data-vh="runtime">window.__VH={}</script>',
+    '<script data-vh="runtime" src="/authored-runtime.js"></script>',
+  ])("keeps unknown or asynchronous baked runtimes and their validators unchanged", async runtime => {
+    const source = '<!-- vim-html:body:begin --><script data-vh="config">window.VIM_HTML={source:"/original.html",storageKey:"original"}</script>' + runtime + '<!-- vim-html:body:end -->';
+    const response = await enhanceHtml(htmlResponse(source, { ETag: '"baked"', "Content-Length": String(source.length) }), identity);
+    expect(await response.text()).toBe(source);
+    expect(response.headers.get("ETag")).toBe('"baked"');
+    expect(response.headers.get("Content-Length")).toBe(String(source.length));
+  });
+
+  it("preserves an already-hooked representation exactly without registering another startup init", async () => {
+    const source = '<p>Original</p><script data-docs-vim-quiet>/* a previous served hook */</script>';
+    const response = await enhanceHtml(htmlResponse(source), identity);
+    expect(await response.text()).toBe(source);
+  });
+
+  it.each([
     '<h1>Fragment</h1><p>Text</p>',
     '<html><title>No optional tags</title><h1>Title</h1><p>Body</p></html>',
     '<p title="a > b">Text</p><script>window.tag="<body>";</script>',

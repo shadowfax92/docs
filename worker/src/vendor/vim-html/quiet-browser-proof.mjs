@@ -18,6 +18,8 @@ const bundle = await build({
   bundle: true, write: false, platform: "node", format: "esm", target: "es2022",
 });
 const { renderDocument } = await import("data:text/javascript;base64," + Buffer.from(bundle.outputFiles[0].text).toString("base64"));
+const vimBundle = await build({ entryPoints: [fileURLToPath(new URL("../../vim.ts", import.meta.url))], bundle: true, write: false, platform: "node", format: "esm", target: "es2022" });
+const { enhanceHtml } = await import("data:text/javascript;base64," + Buffer.from(vimBundle.outputFiles[0].text).toString("base64"));
 const authored = `<!doctype html><html><head><meta charset="utf-8"><title>Quiet fixture</title>
 <style>body{margin:0;background:rgb(248,245,239);font:18px Georgia}main{margin:40px auto;width:620px}body::after{content:"Authored footer"}</style></head><body><main>
 <h1>Quiet fixture</h1><p>Alpha point.</p><p>Needle search point.</p><p>Final comment target.</p>
@@ -29,11 +31,25 @@ const baked = execFileSync("python3", ["-B", "-c",
 ], { input: authored, encoding: "utf8" });
 // An explicit config (even without a baked runtime) remains the author's choice.
 const configured = authored.replace("</head>", '<script>window.VIM_HTML={source:"/authored/config.html",storageKey:"authored-config"};</script></head>');
-const sources = { "/authored": authored, "/baked": baked, "/configured": configured, "/preview": "# Generated fixture\n\nAlpha point.\n\nNeedle search point.\n\nFinal comment target." };
+const sources = {
+  "/authored": authored, "/baked": baked, "/baked-repeat": baked,
+  "/baked-crlf": baked.replace(/\n/g, "\r\n"),
+  "/baked-later": baked + "<script>window.__VH.on('ready',function(){if(!window.__VH.gutter.numbers())window.__VH.gutter.toggleNumbers();});</script>",
+  "/baked-unknown": baked.replace("VH.version = 1;", "VH.version = 2;"),
+  "/baked-async": baked.replace('<script data-vh="runtime">', '<script type="module" data-vh="runtime">'),
+  "/baked-csp": baked,
+  "/baked-meta": baked.replace("</head>", '<meta http-equiv="Content-Security-Policy" content="script-src \'unsafe-inline\'; style-src \'unsafe-inline\'"></head>'),
+  "/baked-inert": "<template>" + baked + "</template>",
+  "/baked-unclosed": baked + "<template>",
+  "/configured": configured,
+  "/preview": "# Generated fixture\n\nAlpha point.\n\nNeedle search point.\n\nFinal comment target.",
+};
 const serverErrors = [];
 const server = createServer(async (req, res) => {
   try {
-    const path = new URL(req.url, origin).pathname;
+    const requested = new URL(req.url, origin).pathname;
+    const variant = requested.endsWith("/raw") ? "raw" : requested.endsWith("/download") ? "download" : "page";
+    const path = requested.replace(/\/(?:raw|download)$/, "");
     if (!(path in sources)) { res.writeHead(404); res.end(); return; }
     const generated = path === "/preview";
     const source = sources[path];
@@ -44,13 +60,27 @@ const server = createServer(async (req, res) => {
       sizeBytes: bytes.length, uploadedAt: "2026-10-15T00:00:00.000Z", timeSource: "r2", createdAt: null,
       publicUrl: origin + path, rawUrl: origin + path + "/raw", downloadUrl: origin + path + "/download", objectCount: 1, warnings: [],
     };
-    const response = await renderDocument({
-      summary, objects: [{ sizeBytes: bytes.length }],
+    const doc = {
+      summary, objects: [{ sizeBytes: bytes.length, etag: "fixture-etag", uploadedAt: summary.uploadedAt }],
       // Preview opens once, exactly as it would at the Documents seam; every
       // request gets a fresh disposable stream instead of an R2 dependency.
       openBody: async () => ({ body: new Response(bytes).body }),
-    }, "page", new Request(origin + path));
-    res.writeHead(response.status, Object.fromEntries(response.headers));
+    };
+    // Preview intentionally owns authored headers. Cross the enhancement seam
+    // directly for header-CSP rejection without discarding an opened response.
+    let response = path === "/baked-csp" && variant === "page"
+      ? await enhanceHtml(new Response(baked, { headers: { "Content-Type": "text/html", "Content-Security-Policy": "script-src 'none'" } }), summary)
+      : await renderDocument(doc, variant, new Request(origin + requested));
+    if (path === "/baked-repeat" && variant === "page") {
+      // Cross the same production seam with already-enhanced source. Exact
+      // equality guards against two startup hooks as well as two runtime cores.
+      const once = await response.text();
+      response = await enhanceHtml(new Response(once, response), { id: "Other123", title: "Do not replace", publicUrl: "https://wrong.example" });
+      const twice = await response.text();
+      assert.equal(twice, once);
+      response = new Response(twice, response);
+    }
+    res.writeHead(response.status, { ...Object.fromEntries(response.headers), "Cache-Control": "no-store" });
     res.end(Buffer.from(await response.arrayBuffer()));
   } catch (error) { serverErrors.push(String(error)); res.writeHead(500); res.end("Fixture failed"); }
 });
@@ -63,9 +93,12 @@ try {
   origin = `http://127.0.0.1:${server.address().port}`;
   browser = await chromium.launch({ headless: true, channel: "chromium" });
   result.browser = browser.version();
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, permissions: ["clipboard-read", "clipboard-write"] });
-  context.setDefaultTimeout(10000);
-  for (const path of ["/authored", "/preview"]) {
+  const newContext = () => browser.newContext({ viewport: { width: 1280, height: 900 }, permissions: ["clipboard-read", "clipboard-write"] });
+  for (const path of ["/authored", "/preview", "/baked", "/baked-repeat", "/baked-crlf"]) {
+    // Baked routes intentionally share a source key; isolated profiles prevent
+    // comments/preferences from a previous fixture from contaminating the next.
+    const context = await newContext();
+    context.setDefaultTimeout(10000);
     const page = await context.newPage();
     page.on("pageerror", error => result.errors.push(String(error)));
     await page.addInitScript(() => {
@@ -104,6 +137,16 @@ try {
     assert.equal(initial.numberDisplay, "none");
     assert.equal(initial.relativeDisplay, "none");
     check(path + " starts quiet without number flash and retains line model", initial);
+    const served = await (await fetch(origin + path)).text();
+    if (path.startsWith("/baked")) {
+      assert(served.startsWith(sources[path]));
+      assert.equal(await page.locator("[data-docs-vim-quiet]").count(), 1);
+      assert.equal(await page.locator('script[data-vh="runtime"]').count(), 1);
+      assert.equal(await page.locator('script[data-vh="config"]').count(), 1);
+      assert.equal(await page.locator(".docs-vim-controls").count(), 0);
+      assert.deepEqual(await page.evaluate(() => ({ source: window.__VH.cfg.source, key: window.__VH.cfg.storageKey, theme: window.__VH.cfg.theme })), { source: "/synthetic/quiet.html", key: "quiet-baked", theme: "none" });
+      check(path + " preserves original source prefix, runtime/config/theme/comment identity and has exactly one hook");
+    }
     await page.screenshot({ path: resolve(output, path.slice(1) + "-quiet.png") });
 
     const initialPrefs = await page.evaluate(() => localStorage.getItem("vim-html:prefs"));
@@ -134,7 +177,8 @@ try {
     await page.keyboard.type("gy");
     await page.waitForFunction(() => window.__VH.clip.last.includes("Quiet selection comment"));
     const exported = await page.evaluate(() => window.__VH.clip.last);
-    assert(exported.includes("@" + origin + path + "#L3") && exported.includes("#L1-2"));
+    const sourceIdentity = path.startsWith("/baked") ? "/synthetic/quiet.html" : origin + path;
+    assert(exported.includes("@" + sourceIdentity + "#L3") && exported.includes("#L1-2"));
     await page.keyboard.press("Space"); await page.keyboard.press("?");
     await page.locator("#vh-help").waitFor({ state: "visible" });
     assert((await page.locator("#vh-help").innerText()).includes("toggle line numbers"));
@@ -163,29 +207,26 @@ try {
     assert.equal(await page.evaluate(() => window.__VH.gutter.numbers()), false);
     assert.equal(await page.evaluate(() => localStorage.getItem("vim-html:prefs")), prefsBeforeReload);
     check(path + " reload restores quiet default and stored comments without global preferences");
-    await page.close();
+    await context.close();
   }
-  for (const path of ["/baked", "/configured"]) {
+  for (const path of ["/configured", "/baked-unknown", "/baked-async", "/baked-csp", "/baked-meta", "/baked-inert", "/baked-unclosed"]) {
     assert.equal(await (await fetch(origin + path)).text(), sources[path]);
-    const page = await context.newPage();
-    page.on("pageerror", error => result.errors.push(String(error)));
-    await page.goto(origin + path);
-    if (path === "/baked") {
-      assert.equal(await page.locator('script[data-vh="runtime"]').count(), 1);
-      assert.equal(await page.locator('script[data-vh="config"]').count(), 1);
-      assert.deepEqual(await page.evaluate(() => ({ source: window.__VH.cfg.source, key: window.__VH.cfg.storageKey, numbers: window.__VH.gutter.numbers() })), { source: "/synthetic/quiet.html", key: "quiet-baked", numbers: true });
-      assert.equal(await page.locator(".docs-vim-controls").count(), 0);
-      await page.keyboard.type("gggcc");
-      await page.getByRole("textbox", { name: "Comment", exact: true }).fill("Baked identity comment"); await page.keyboard.press("Enter");
-      await page.keyboard.type("gy");
-      await page.waitForFunction(() => window.__VH.clip.last.includes("@/synthetic/quiet.html#L1"));
-    } else {
-      assert.equal(await page.locator('script[data-vh="runtime"]').count(), 0);
-      assert.equal(await page.evaluate(() => window.VIM_HTML.storageKey), "authored-config");
-    }
-    check(path + " bytes and authored runtime/config identity unchanged");
-    await page.close();
+    check(path + " unsupported source remains byte-identical");
   }
+  for (const variant of ["raw", "download"]) {
+    assert.equal(await (await fetch(origin + "/baked/" + variant)).text(), baked);
+    check("baked " + variant + " returns exact stored bytes without the startup hook");
+  }
+  const laterContext = await newContext();
+  const later = await laterContext.newPage();
+  await later.goto(origin + "/baked-later");
+  await later.waitForFunction(() => window.__VH?.booted);
+  assert.equal(await later.locator("[data-docs-vim-quiet]").count(), 1);
+  assert.equal(await later.evaluate(() => window.__VH.gutter.numbers()), true);
+  await later.keyboard.press("Space"); await later.keyboard.type("ul");
+  assert.equal(await later.evaluate(() => window.__VH.gutter.numbers()), false);
+  check("later authored ready handler and manual toggle can override startup default");
+  await laterContext.close();
   assert.deepEqual(result.errors, []);
   assert.deepEqual(serverErrors, []);
   result.complete = true;
