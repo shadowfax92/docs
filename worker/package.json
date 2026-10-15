@@ -9,8 +9,10 @@
     "build": "wrangler deploy --dry-run --no-bundle --outdir dist/public && wrangler deploy --config wrangler.catalog.toml --dry-run --no-bundle --outdir dist/catalog",
     "dev": "wrangler dev --no-bundle",
     "dev:catalog": "wrangler dev --no-bundle --config wrangler.catalog.toml",
-    "deploy": "wrangler deploy --no-bundle",
-    "deploy:catalog": "wrangler deploy --no-bundle --config wrangler.catalog.toml"
+    "deploy": "node scripts/deploy.mjs all",
+    "deploy:all": "node scripts/deploy.mjs all",
+    "deploy:public": "node scripts/deploy.mjs public",
+    "deploy:catalog": "node scripts/deploy.mjs catalog"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",
@@ -20,6 +22,7 @@
     "wrangler": "^3.99.0"
   },
   "dependencies": {
+    "entities": "8.1.0",
     "fflate": "0.8.3",
     "mammoth": "1.13.0",
     "markdown-it": "15.0.2",
