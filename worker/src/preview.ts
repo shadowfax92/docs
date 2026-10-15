@@ -263,4 +263,3 @@ ${ogTags(pageUrl, title, `Download ${filename}`, "article")}
 </body>
 </html>`;
 }
-

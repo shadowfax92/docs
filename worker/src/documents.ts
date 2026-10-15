@@ -20,6 +20,7 @@ export interface RemoveResult {
 }
 
 /** Owns R2 key resolution and mutation. Native R2 is the external dependency, replaced only in tests.
+ * Create streams must have a known length, as required by native R2 (pass the original Request.body).
  * Storage failures throw, absence stays null/not-found. Capture all keys before a delete; batches
  * never exceed 1,000. Discovery and reviewed/version-checked removal are unavailable in this slice.
  */
