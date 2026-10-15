@@ -80,6 +80,27 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
+	// net/http infers lengths for its standard in-memory readers, but not *os.File.
+	// Native R2 requires a known-length stream. Use only regular-file metadata and
+	// the current offset without reading ahead or buffering the file.
+	if file, ok := content.(*os.File); ok {
+		info, err := file.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("cannot stat upload file: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			offset, err := file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return nil, fmt.Errorf("cannot determine upload file offset: %w", err)
+			}
+			req.ContentLength = max(0, info.Size()-offset)
+			if req.ContentLength == 0 {
+				// A non-nil body with length zero means unknown length to net/http.
+				// NoBody is necessary for empty files and readers already at/past EOF.
+				req.Body = http.NoBody
+			}
+		}
+	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Filename", filename)
