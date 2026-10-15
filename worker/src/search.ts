@@ -110,7 +110,7 @@ export function createSearchIndex(): SearchIndex {
       const before = cutoff(filter.uploadedBefore);
       const after = cutoff(filter.uploadedAfter);
       const pattern = compile(query);
-      const regex = query.mode === "regex";
+      const scanBranches = query.mode === "regex" ? literalAlternatives(query.text) : 1;
       const instructions = pattern?.programSize() ?? 0;
       const hits: SearchHit[] = [];
       let work = 0;
@@ -125,13 +125,13 @@ export function createSearchIndex(): SearchIndex {
           let matchCount = 0;
           let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: record.title.slice(0, SNIPPET_LENGTH), ranges: [] };
           for (const field of [record.filename, record.title, record.body]) {
-            // A quoted literal's nonoverlapping finds consume one field, rather than restarting
-            // a regex search over each remaining suffix. Charge that text once, independent of
-            // literal length; multiplying by program size rejected ordinary terms on admitted
-            // libraries. RE2 still owns Unicode simple folding and UTF-16 offsets. Its constant
-            // costs (including shared literal prefixes) remain bounded by the pattern-size,
-            // find-count and wall-clock guards; this is a scan budget, not an instruction count.
-            if (!regex) work += field.length;
+            // Literal searches and flat alternatives of nonempty literals have bounded lookahead:
+            // charge one field scan per branch, independent of each term's length. Multiplying by
+            // program size rejected ordinary grep terms on admitted libraries. RE2 still owns
+            // matching, Unicode simple folding and UTF-16 offsets. Shared-prefix constant costs
+            // remain subject to the 256-byte pattern, find-count and wall-clock guards; this is
+            // a scan budget, not an instruction count. All other regexes retain suffix accounting.
+            if (scanBranches !== null) work += field.length * scanBranches;
             if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
             if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
             const matcher = pattern.matcher(field);
@@ -140,8 +140,8 @@ export function createSearchIndex(): SearchIndex {
             while (true) {
               // Each regex find can rescan the entire remaining suffix (a.*b|a). Charge that
               // conservative upper bound before entering RE2, including the final failing find.
-              // Quoted literal finds only advance, so their aggregate field scan is charged once.
-              if (regex) work += (field.length - searchedThrough + 1) * instructions;
+              // Bounded literal alternatives cannot perform that unbounded suffix lookahead.
+              if (scanBranches === null) work += (field.length - searchedThrough + 1) * instructions;
               if (work > MAX_QUERY_WORK || ++finds > MAX_FINDS || performance.now() > deadline) queryBudget();
               const found = matcher.find();
               if (performance.now() > deadline) queryBudget();
@@ -188,6 +188,30 @@ function cutoff(value: string | null): number | null {
 
 function queryBudget(): never {
   throw new SearchError("search_budget_exceeded", "The query exceeds its matching work/time budget. Narrow the filters or simplify the pattern.");
+}
+
+/** Recognize only flat alternatives of nonempty literals for scan accounting, never execution.
+ * Any regex operator, empty arm or non-punctuation escape keeps conservative RE2 suffix charging.
+ * A permissive guess here would let patterns such as a.*b|a bypass the repeated-rescan guard.
+ */
+function literalAlternatives(source: string): number | null {
+  let branches = 1;
+  let nonempty = false;
+  for (let index = 0; index < source.length; index++) {
+    const character = source[index];
+    if (character === "|") {
+      if (!nonempty) return null;
+      branches++;
+      nonempty = false;
+      continue;
+    }
+    if (character === "\\") {
+      const escaped = source[++index];
+      if (!escaped || !"\\.^$*+?()[]{}|".includes(escaped)) return null;
+    } else if (".^$*+?()[]{}".includes(character)) return null;
+    nonempty = true;
+  }
+  return nonempty ? branches : null;
 }
 
 function compile(query: SearchQuery): RE2JS | null {

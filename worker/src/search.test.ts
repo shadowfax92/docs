@@ -89,7 +89,7 @@ describe("createSearchIndex", () => {
     expect(astral.ranges).toEqual([[33, 35]]);
   });
 
-  it("searches long body and filename literals over a fully admitted 485-document, 10 MiB corpus", () => {
+  it("searches literals and flat regex alternatives over a fully admitted 485-document, 10 MiB corpus", () => {
     const index = createSearchIndex();
     const needle = "OwnedBodyNeedleec059c3e";
     const filename = "owned-ec059c3e-pdf-acceptance";
@@ -114,6 +114,17 @@ describe("createSearchIndex", () => {
       expect(index.query(literal("ec059c3e", ignoreCase), all).map(({ id, matchCount }) => [id, matchCount]))
         .toEqual([["00000000", 3], ["00000001", 1], ["00000484", 1]]);
     }
+    for (const ignoreCase of [false, true]) {
+      expect(index.query({ text: `${needle}|CaseNeedle`, mode: "regex", ignoreCase }, all)
+        .map(({ id, matchCount }) => [id, matchCount]))
+        .toEqual([["00000000", ignoreCase ? 3 : 2], ["00000001", 1]]);
+    }
+    expect(index.query({ text: `${filename}\\.pdf|absent\\|filename`, mode: "regex", ignoreCase: false }, all)
+      .map(({ id, matchCount }) => [id, matchCount])).toEqual([["00000484", 1]]);
+    // Many finite alternatives still spend aggregate scan work; ordinary grep does not grant
+    // an unbounded exemption merely because each individual arm contains literal characters.
+    expect(() => index.query({ text: Array.from({ length: 14 }, (_, n) => `absent${n}`).join("|"), mode: "regex", ignoreCase: false }, all))
+      .toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
   });
 
   it("treats empty queries as filtered listing and never counts zero-width matches", () => {
@@ -142,12 +153,12 @@ describe("createSearchIndex", () => {
     expect(index.query({ text: "(a+)+$", mode: "regex", ignoreCase: false }, all)).toEqual([]);
   });
 
-  it("stops repeated greedy suffix rescans with an explicit budget error", () => {
+  it.each(["a.*b|a", "a\\w*b|a", "[a].*b|a", "(a.*b)|a", "a.+b|a", "a.*b|"])("stops repeated greedy suffix rescans with an explicit budget error (%s)", (text) => {
     const index = createSearchIndex();
     for (const body of ["a".repeat(100000), "a".repeat(255) + "c".repeat(524033)]) {
       const fixture = document("Rescans1", body);
       index.add(fixture.summary, fixture.text);
-      expect(() => index.query({ text: "a.*b|a", mode: "regex", ignoreCase: false }, all))
+      expect(() => index.query({ text, mode: "regex", ignoreCase: false }, all))
         .toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
     }
   });
