@@ -457,20 +457,6 @@ try {
   await p.getByRole('button', { name: 'Switch to light theme' }).click().catch(() => {});
   check('light/dark at 1440, 900, 375 and 320: no horizontal scroll, aligned text column, ≤80px mobile thumbnails only on HTML rows, compact rows elsewhere, long metadata clamped', { mobile, longCard });
 
-  // ---- Loading state (delayed /raw) and lock teardown
-  const slow = await context.newPage();
-  await slow.route(`${pub}/Visual01/raw`, async (route) => { await new Promise((ok) => setTimeout(ok, 2500)); await route.continue(); });
-  await slow.goto(`${cat}/all-docs`);
-  await slow.locator('#library-title').waitFor({ state: 'visible' });
-  await slow.waitForFunction(() => document.querySelector('article[data-id="Visual01"] .preview')?.dataset.state === 'loading');
-  await slow.locator('article[data-id="Visual01"]').screenshot({ path: resolve(state, 'screenshots', 'loading-state.png') });
-  await slow.waitForFunction(() => document.querySelector('article[data-id="Visual01"] .preview')?.dataset.state === 'ready', null, { timeout: 10000 });
-  await slow.getByRole('button', { name: 'Lock', exact: true }).click();
-  await slow.locator('#password').waitFor({ state: 'visible' });
-  assert.equal(await slow.locator('iframe').count(), 0, 'lock tears every frame down');
-  await slow.close();
-  check('loading state shows the quiet well until the frame loads; Lock removes every preview frame');
-
   // ---- Held-open /raw responses: the pending budget is not released by the reveal timer
   const held = await context.newPage();
   const heldRoutes = [];
@@ -515,6 +501,21 @@ try {
   assert.equal(rawHeaders.get('x-frame-options'), null);
   assert(!/frame-ancestors/i.test(rawHeaders.get('content-security-policy') ?? ''));
   check('an aborted /raw is indistinguishable from success to the catalog (same load event, same zeroed Resource Timing); the card keeps its link and actions and the pending slot is released; public raw responses do not forbid framing', { timing });
+
+  // Lock ends this context's session, so it runs last before the fallback page logs in again.
+  // ---- Loading state (delayed /raw) and lock teardown
+  const slow = await context.newPage();
+  await slow.route(`${pub}/Visual01/raw`, async (route) => { await new Promise((ok) => setTimeout(ok, 2500)); await route.continue(); });
+  await slow.goto(`${cat}/all-docs`);
+  await slow.locator('#library-title').waitFor({ state: 'visible' });
+  await slow.waitForFunction(() => document.querySelector('article[data-id="Visual01"] .preview')?.dataset.state === 'loading');
+  await slow.locator('article[data-id="Visual01"]').screenshot({ path: resolve(state, 'screenshots', 'loading-state.png') });
+  await slow.waitForFunction(() => document.querySelector('article[data-id="Visual01"] .preview')?.dataset.state === 'ready', null, { timeout: 10000 });
+  await slow.getByRole('button', { name: 'Lock', exact: true }).click();
+  await slow.locator('#password').waitFor({ state: 'visible' });
+  assert.equal(await slow.locator('iframe').count(), 0, 'lock tears every frame down');
+  await slow.close();
+  check('loading state shows the quiet well until the frame loads; Lock removes every preview frame');
 
   // ---- CSP refusal fallback: a deployment without frame-src degrades to compact cards
   const strict = await context.newPage();
