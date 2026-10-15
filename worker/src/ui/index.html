@@ -4,11 +4,34 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow, noarchive">
-  <title>Private library</title>
+  <meta name="referrer" content="no-referrer">
+  <title>Private library · docs</title>
   <link rel="stylesheet" href="/all-docs/assets/styles.css">
+  <!-- Classic, blocking on purpose: it applies the saved theme before first paint (the catalog CSP
+       forbids inline scripts) and then waits for DOMContentLoaded. The bundle has no exports. -->
+  <script src="/all-docs/assets/app.js"></script>
 </head>
 <body>
-  <main><p data-library-status>The private library is not available yet.</p></main>
-  <script type="module" src="/all-docs/assets/app.js"></script>
+  <!-- Trusted shell only: uploaded documents never render on this origin. The form works without
+       JavaScript; app.js enhances it into a JSON login and builds the library after a session. -->
+  <main class="login" id="login" aria-labelledby="login-title">
+    <div class="login-head">
+      <p class="wordmark">docs<span class="micro">all-docs</span></p>
+      <span class="theme-slot" data-theme-slot></span>
+    </div>
+    <h1 id="login-title">Private library</h1>
+    <p class="lead">Enter the library password.</p>
+    <form method="post" action="/all-docs/session" id="login-form">
+      <input class="visually-hidden" type="text" autocomplete="username" value="all-docs" tabindex="-1" aria-hidden="true" readonly>
+      <label for="password">Password</label>
+      <input class="field" id="password" type="password" name="password" autocomplete="current-password"
+        required autofocus aria-describedby="login-error">
+      <p class="error" id="login-error" role="alert"></p>
+      <button class="pill primary" type="submit">Unlock</button>
+    </form>
+    <p class="notice" id="login-notice"></p>
+  </main>
+  <div class="library" id="library"></div>
+  <div class="visually-hidden" id="status" role="status" aria-live="polite" aria-atomic="true"></div>
 </body>
 </html>
