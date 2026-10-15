@@ -19,6 +19,9 @@ or network access are needed. `generate.py` applies three small hosting changes:
 - The gutter margin and status `body::after` rules are omitted to retain authored
   layout and pseudo-content. Gutters may clip on pages without left whitespace.
 - `host.js`/`host.css` add small help/off buttons inside the existing UI layer.
+  The hosting init synchronously turns numbers off through `VH.gutter` before
+  first paint, retaining line identity, comment/mark signs and `Space u l`.
+  This is a page-load default, with no change to global skill preferences.
   Off clears pending key sequences and remembers `docs-vim=off` on this public
   origin (session-only if storage fails), leaving stored comments intact. A global guard
   prevents this bundle from booting over an already-live `window.__VH`.
@@ -52,3 +55,15 @@ Open the printed loopback URLs in BrowserOS Neo. `plain` is authored HTML,
 assembler before enhancement, and `fragment` omits head/body/html. `raw` bypasses
 enhancement. The harness imports the same production module through esbuild;
 it serves no owner data, opens no browser and modifies no installed tools.
+
+For an automated headless proof of quiet defaults and the real generated preview
+path, run from the Worker directory:
+
+    node src/vendor/vim-html/quiet-browser-proof.mjs <output-dir>
+
+It owns its loopback server and isolated Chromium, closes both, and writes JSON
+and screenshots. It checks initial render samples, both number toggle states,
+navigation/search/selection/comments/export/help, gutter signs, native styles/forms
+and byte-identical baked/configured sources. Baked sources retain their authored
+runtime, including upstream's numbers-on default; changing those requires rebuilding
+the source rather than overwriting an uploaded runtime or its comment identity.
