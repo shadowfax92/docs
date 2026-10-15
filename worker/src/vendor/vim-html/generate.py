@@ -48,6 +48,14 @@ js = js.replace(editable, editable + """
 """)
 # A defensive guard also covers authors dynamically loading a runtime before us.
 js = "if (!window.__VH) {\n" + js + "\n" + build.make_script_safe((ROOT / "host.js").read_text()) + "\n}"
+# keymap-search.js (Space s k) is a private hosted module, appended to both
+# layers: inside the guard above, after host.js, so it only meets the runtime
+# this bundle creates; and after the baked hook, where its own gate re-checks
+# the live baked instance and boot timing exactly as baked-hook.js does.
+keymap_search = build.make_script_safe((ROOT / "keymap-search.js").read_text())
+assert js.endswith("\n}")
+js = js[:-1] + keymap_search + "\n}"
+baked_hook += "\n" + keymap_search
 
 css = build.neutral_css() + build.runtime_css()
 # Theme-none's upstream gutter/status accommodations change body layout and can
