@@ -44,6 +44,8 @@ numbers-on, then leaves later authored/ready handlers and manual toggles alone.
 Its marker makes repeated enhancement byte-idempotent. Config-only, unknown,
 modified, asynchronous/module or incompatible runtimes remain unchanged; the
 hook also guards the actual live instance and startup timing before using it.
+Only canonical assembler script annotations qualify; unfamiliar, duplicate,
+unquoted or entity-encoded annotations are conservatively left unchanged.
 Restrictive/non-ASCII header CSP, any meta CSP, no-transform, non-UTF-8, compressed, partial, attachment, malformed
 unclosed raw-text/inert contexts, and larger pages are served unchanged. No CSP
 is relaxed. Generated previews' existing inline-permissive header CSP is retained

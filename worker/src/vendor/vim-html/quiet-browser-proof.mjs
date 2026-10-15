@@ -31,6 +31,9 @@ const baked = execFileSync("python3", ["-B", "-c",
 ], { input: authored, encoding: "utf8" });
 // An explicit config (even without a baked runtime) remains the author's choice.
 const configured = authored.replace("</head>", '<script>window.VIM_HTML={source:"/authored/config.html",storageKey:"authored-config"};</script></head>');
+// Matching public method names do not make a second, unknown core compatible.
+// HTML accepts both unquoted and entity-encoded data-vh attribute values.
+const replacement = "window.extraNumbers=true;window.__VH={version:1,booted:false,init:function(fn){fn();},gutter:{numbers:function(){return window.extraNumbers;},toggleNumbers:function(){window.extraNumbers=!window.extraNumbers;}}};";
 const sources = {
   "/authored": authored, "/baked": baked, "/baked-repeat": baked,
   "/baked-crlf": baked.replace(/\n/g, "\r\n"),
@@ -41,6 +44,8 @@ const sources = {
   "/baked-meta": baked.replace("</head>", '<meta http-equiv="Content-Security-Policy" content="script-src \'unsafe-inline\'; style-src \'unsafe-inline\'"></head>'),
   "/baked-inert": "<template>" + baked + "</template>",
   "/baked-unclosed": baked + "<template>",
+  "/baked-duplicate-unquoted": baked + "<script data-vh=runtime>" + replacement + "</script>",
+  "/baked-duplicate-encoded": baked + '<script data-vh="runt&#105;me">' + replacement + "</script>",
   "/configured": configured,
   "/preview": "# Generated fixture\n\nAlpha point.\n\nNeedle search point.\n\nFinal comment target.",
 };
@@ -209,9 +214,18 @@ try {
     check(path + " reload restores quiet default and stored comments without global preferences");
     await context.close();
   }
-  for (const path of ["/configured", "/baked-unknown", "/baked-async", "/baked-csp", "/baked-meta", "/baked-inert", "/baked-unclosed"]) {
+  for (const path of ["/configured", "/baked-unknown", "/baked-async", "/baked-csp", "/baked-meta", "/baked-inert", "/baked-unclosed", "/baked-duplicate-unquoted", "/baked-duplicate-encoded"]) {
     assert.equal(await (await fetch(origin + path)).text(), sources[path]);
     check(path + " unsupported source remains byte-identical");
+    if (path.startsWith("/baked-duplicate")) {
+      const context = await newContext();
+      const page = await context.newPage();
+      await page.goto(origin + path);
+      assert.equal(await page.evaluate(() => window.extraNumbers), true);
+      assert.equal(await page.locator("[data-docs-vim-quiet]").count(), 0);
+      check(path + " does not initialize or change the incompatible live runtime");
+      await context.close();
+    }
   }
   for (const variant of ["raw", "download"]) {
     assert.equal(await (await fetch(origin + "/baked/" + variant)).text(), baked);

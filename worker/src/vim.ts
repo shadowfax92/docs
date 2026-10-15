@@ -203,8 +203,13 @@ function inspectHtml(html: string): { kind: "new" } | { kind: "baked"; runtime: 
         // Only the assembler's inline classic script tags qualify. Attributes
         // such as src/type/async/defer change execution order and are declined.
         const opening = html.slice(start, end + 1);
-        if (/\bdata-vh\s*=\s*(?:"(?:config|runtime)"|'(?:config|runtime)')/i.test(opening)) {
-          if (/^<script\s+data-vh\s*=\s*(?:"config"|'config')\s*>$/i.test(opening) && bakedStage === 1) bakedStage = 2;
+        // Reject unfamiliar data-vh spellings before interpreting their value.
+        // HTML also accepts unquoted/entity-encoded values and duplicate attrs;
+        // accepting only assembler tags prevents a second unknown core from
+        // replacing window.__VH and receiving a hook meant for the known one.
+        if (/\bdata-vh\b/i.test(opening)) {
+          if (/^<script\s+data-vh\s*=\s*(?:"prepaint"|'prepaint')\s*>$/i.test(opening) && bakedStage === 0) { /* original head script */ }
+          else if (/^<script\s+data-vh\s*=\s*(?:"config"|'config')\s*>$/i.test(opening) && bakedStage === 1) bakedStage = 2;
           else if (/^<script\s+data-vh\s*=\s*(?:"runtime"|'runtime')\s*>$/i.test(opening) && bakedStage === 2) {
             bakedRuntime = html.slice(at, closing.index);
             bakedStage = 3;
