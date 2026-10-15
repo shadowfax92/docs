@@ -10,8 +10,9 @@
  * without a query string, and a fragment keeps search terms out of requests and server logs.
  *
  * Safety: uploaded strings (titles, filenames, snippets, warnings) and extraction reasons only ever
- * become text nodes; nothing here assigns innerHTML. Document links go to http(s) URLs on another origin, in a new tab
- * with noopener/noreferrer, so no uploaded markup can run with this origin's session.
+ * become text nodes; nothing here assigns innerHTML. Document links go to http(s) URLs on another
+ * origin, in a new tab with noopener/noreferrer, so no uploaded markup can run with this origin's
+ * session.
  */
 import {
   AGE_PRESETS, CatalogClient, FILE_KINDS, KIND_LABEL, RENDER_STEP, SORT_LABEL, describeWindow, displayTitle,
