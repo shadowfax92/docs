@@ -1,6 +1,14 @@
 name = "docs"
-main = "src/index.ts"
+main = ".wrangler/build/index.js"
 compatibility_date = "2024-12-01"
+
+[build]
+command = "node scripts/build.mjs"
+
+[vars]
+APP_ROLE = "public"
+PUBLIC_DOCS_ORIGIN = "https://docs.shadowfax92.workers.dev"
+CATALOG_ORIGIN = "https://docs-library.shadowfax92.workers.dev"
 
 [[r2_buckets]]
 binding = "DOCS_BUCKET"
