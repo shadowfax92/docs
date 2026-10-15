@@ -3,7 +3,8 @@
  * display type, blue mono micro-labels as section identifiers, black/grey pill actions. Light is
  * the default; app.js sets data-theme from localStorage["docs-theme"] before first paint.
  * Self-contained by design: the catalog CSP allows no external fonts, images or data: URIs, so
- * every glyph here is text, CSS borders, or inline SVG created by app.js.
+ * every glyph here is text, CSS borders, or inline SVG created by app.js. The only foreign pixels
+ * are HTML card previews: sandboxed public-origin frames (see card-preview.ts).
  */
 
 :root {
@@ -269,26 +270,42 @@ mark { background: var(--mark); color: var(--text); border-radius: 2px; padding:
 .grid > li { min-width: 0; }
 
 .card {
-  position: relative; display: grid; grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "meta" "well" "body" "actions";
-}
-.card .meta {
-  grid-area: meta; display: flex; justify-content: space-between; gap: 8px;
-  margin-bottom: 8px; font-size: 13px; line-height: 20px;
-}
-.card .meta time { color: var(--text-2); }
-.card .well {
-  grid-area: well; display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--well); overflow: hidden;
-}
-.card .glyph {
-  max-width: 90%; font-size: 40px; line-height: 1; font-weight: 300; letter-spacing: -0.02em;
-  color: var(--text-2); overflow: hidden; text-overflow: ellipsis;
+  position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); align-content: start;
+  grid-template-areas: "check meta" "preview preview" "body body" "actions actions";
 }
 .card .check {
-  grid-area: well; align-self: start; justify-self: start; z-index: 2;
-  display: grid; place-items: center; width: 44px; height: 44px; cursor: pointer;
+  grid-area: check; z-index: 2; display: grid; place-items: center;
+  width: 28px; height: 28px; margin-left: -5px; cursor: pointer;
 }
+.card .meta {
+  grid-area: meta; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-width: 0; min-height: 28px; font-size: 13px; line-height: 20px;
+}
+.card .meta time { color: var(--text-2); }
+
+/* Live HTML preview: the framed page lays out at 1/scale of the well's size (a ~870px
+ * viewport on a 250px card) and is scaled down to fit. The well colour shows until the page has
+ * loaded (or REVEAL_MS passes), then the frame fades in. The ::after rule draws the edge over the
+ * page, so a white document still reads as a card on a white ground. */
+.card .preview {
+  --preview-scale: 0.3;
+  grid-area: preview; position: relative; margin-top: 8px; aspect-ratio: 4 / 3;
+  overflow: hidden; background: var(--well);
+}
+.card .preview iframe {
+  position: absolute; top: 0; left: 0; border: 0; background: #ffffff;
+  width: calc(100% / var(--preview-scale)); height: calc(100% / var(--preview-scale));
+  transform: scale(var(--preview-scale)); transform-origin: 0 0;
+  pointer-events: none; opacity: 0; transition: opacity 200ms ease-out;
+}
+.card .preview[data-state="ready"] iframe { opacity: 1; }
+.card .preview::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  box-shadow: inset 0 0 0 1px var(--rule); transition: box-shadow 120ms;
+}
+.card:hover .preview::after { box-shadow: inset 0 0 0 1px var(--control); }
 .card .body { grid-area: body; min-width: 0; padding-top: 12px; }
+.card:not([data-preview]) .body { padding-top: 4px; }
 .card h3 {
   font-size: 15px; line-height: 22px; font-weight: 500;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere;
@@ -318,7 +335,7 @@ mark { background: var(--mark); color: var(--text); border-radius: 2px; padding:
 .card .actions a { color: var(--text-2); font-size: 13px; line-height: 24px; text-decoration-color: var(--rule); text-underline-offset: 3px; }
 
 .card.selected { outline: 2px solid var(--text); outline-offset: 4px; }
-.card.selected .well { background: color-mix(in srgb, var(--accent) 8%, var(--well)); }
+.card.selected .preview::after { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
 .more { display: flex; justify-content: center; margin-top: 48px; }
 .more[hidden] { display: none; }
@@ -405,15 +422,20 @@ dialog progress { width: 100%; height: 6px; accent-color: var(--text); }
   .filters { gap: 8px; }
   .grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .grid > li { border-bottom: 1px solid var(--rule); }
+  /* Rows: the text column stays aligned on every row; HTML rows add a small page thumbnail on
+   * the right instead of a placeholder well on the left. */
   .card {
-    grid-template-columns: 44px 56px minmax(0, 1fr); column-gap: 12px; padding: 12px 0;
-    grid-template-areas: "check well meta" "check well body" "check well actions";
+    grid-template-columns: 44px minmax(0, 1fr) auto; column-gap: 12px; padding: 12px 0;
+    grid-template-areas: "check meta preview" "check body preview" "check actions preview";
   }
-  .card .check { grid-area: check; align-self: start; justify-self: center; }
-  .card .well { width: 56px; height: 56px; aspect-ratio: auto; align-self: start; }
-  .card .glyph { font-size: 15px; font-weight: 500; }
-  .card .meta { margin-bottom: 0; justify-content: flex-start; }
-  .card .body { padding-top: 0; }
+  .card:not([data-preview]) {
+    grid-template-columns: 44px minmax(0, 1fr);
+    grid-template-areas: "check meta" "check body" "check actions";
+  }
+  .card .check { width: 44px; height: 44px; margin: -12px 0 0; align-self: start; justify-self: center; }
+  .card .meta { min-height: 20px; justify-content: flex-start; }
+  .card .preview { --preview-scale: 0.075; width: 72px; margin-top: 2px; align-self: start; }
+  .card .body, .card:not([data-preview]) .body { padding-top: 0; }
   .card.selected { outline-offset: -2px; }
   .card .actions { opacity: 1; }
   .selection-bar { margin-left: calc(-1 * var(--gutter)); margin-right: calc(-1 * var(--gutter)); padding-left: var(--gutter); padding-right: var(--gutter); }
@@ -426,6 +448,11 @@ dialog progress { width: 100%; height: 6px; accent-color: var(--text); }
   .rail label { min-height: 44px; }
   .search .toggle { min-width: 44px; height: 44px; }
   .select select, .date { height: 44px; }
+}
+
+/* Grid cards under a coarse pointer: a 44px selection target in the meta row (rows already have one). */
+@media (pointer: coarse) and (min-width: 600px) {
+  .card .check { width: 44px; height: 44px; margin-left: -13px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

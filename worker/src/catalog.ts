@@ -43,6 +43,9 @@ export function createCatalog(deps: {
   assets: (path: string) => Response | null;
 }): { fetch(request: Request): Promise<Response> } {
   const { security } = deps;
+  // Card previews frame the configured public origin only (sandboxed, inert; see ui/card-preview.ts).
+  // A misconfigured deployment gets no frame-src at all, so default-src 'none' blocks every frame.
+  const frameSource = configured(security) ? security.publicOrigin : null;
   let signingKey: Promise<CryptoKey> | undefined;
   function key() {
     // Lazy initialization keeps bad/missing deployment config on the private 503 path. Including
@@ -223,7 +226,7 @@ export function createCatalog(deps: {
   }
   return {
     async fetch(request) {
-      try { return privatize(await route(request)); }
+      try { return privatize(await route(request), frameSource); }
       catch (error) {
         const failure = error instanceof HttpError ? error : new HttpError(503, "catalog_failure", "The library operation could not complete.", true);
         return privatize(Response.json({ version: 1, error: {
@@ -231,7 +234,7 @@ export function createCatalog(deps: {
         } } satisfies CatalogError, {
           status: failure.status,
           ...(failure.status === 429 ? { headers: { "Retry-After": String(THROTTLE_WINDOW - now() % THROTTLE_WINDOW) } } : {}),
-        }));
+        }), frameSource);
       }
     },
   };
@@ -330,7 +333,10 @@ async function boundedText(body: ReadableStream<Uint8Array> | null, maxBytes: nu
     reader.releaseLock();
   }
 }
-function privatize(response: Response): Response {
+/** `frameSource` is a validated literal origin (URL-serialized, so it cannot add a directive). It is
+ * the only frame the catalog may embed; scripts, connections and framing of the catalog itself
+ * stay as strict as without it. */
+function privatize(response: Response, frameSource: string | null): Response {
   const headers = new Headers(response.headers);
   for (const key of [...headers.keys()]) if (key.toLowerCase().startsWith("access-control-")) headers.delete(key);
   headers.set("Cache-Control", "no-store");
@@ -341,6 +347,6 @@ function privatize(response: Response): Response {
   headers.set("Cross-Origin-Opener-Policy", "same-origin");
   headers.set("Cross-Origin-Resource-Policy", "same-origin");
   headers.set("Origin-Agent-Cluster", "?1");
-  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  headers.set("Content-Security-Policy", `default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; ${frameSource ? `frame-src ${frameSource}; ` : ""}object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }

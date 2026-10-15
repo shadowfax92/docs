@@ -12,13 +12,15 @@
  * Safety: uploaded strings (titles, filenames, snippets, warnings) and extraction reasons only ever
  * become text nodes; nothing here assigns innerHTML. Document links go to http(s) URLs on another
  * origin, in a new tab with noopener/noreferrer, so no uploaded markup can run with this origin's
- * session.
+ * session. HTML card previews are inert, fully sandboxed frames of the public origin, owned by
+ * card-preview.ts; the catalog never fetches or parses uploaded markup itself.
  */
 import {
   AGE_PRESETS, CatalogClient, FILE_KINDS, KIND_LABEL, RENDER_STEP, SORT_LABEL, describeWindow, displayTitle,
   filtersFromParams, filtersToParams, formatBytes, formatDate, formatDateTime, formatRelative,
   type AgePreset, type ContentProgress, type DeleteOutcome, type Filters, type ReviewState, type SearchPort, type SortKey,
 } from "./catalog-client";
+import { CardPreviews, previewKey } from "./card-preview";
 import { coverageNote } from "./coverage-note";
 import type { DocumentSummary, FileKind } from "../contracts";
 import type { SearchHit, SearchWorkerResponse } from "../search";
@@ -155,10 +157,30 @@ function plural(count: number, one: string, many = `${one}s`): string {
   return `${count.toLocaleString("en-US")} ${count === 1 ? one : many}`;
 }
 
-/** Extension glyph for the card well ("PDF", "MD"), falling back to the kind label. */
-function glyph(doc: DocumentSummary): string {
-  const match = /\.([A-Za-z0-9]{1,4})$/.exec(doc.filename);
-  return match ? match[1].toUpperCase() : KIND_LABEL[doc.kind];
+/**
+ * Makes `parent`'s children exactly `nodes`, in order, without detaching a node that is already in
+ * place: removing an <iframe> from the document discards its page, so a live preview reloads (and
+ * flashes) on any detach. Stale children go first, so kept nodes never need to move past them.
+ * A kept node that must move uses the state-preserving moveBefore() where the browser has it.
+ */
+function syncChildren(parent: Node, nodes: readonly Node[]): void {
+  const keep = new Set(nodes);
+  for (const child of Array.from(parent.childNodes)) if (!keep.has(child)) parent.removeChild(child);
+  let cursor = parent.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) {
+      cursor = cursor.nextSibling;
+      continue;
+    }
+    const move = (parent as Node & { moveBefore?: (node: Node, child: Node | null) => void }).moveBefore;
+    if (move && node.isConnected && parent.isConnected) {
+      try {
+        move.call(parent, node, cursor);
+        continue;
+      } catch { /* Fall back to a plain (reloading) insert. */ }
+    }
+    parent.insertBefore(node, cursor);
+  }
 }
 
 const OLDER_AGES: readonly AgePreset[] = ["gt30", "gt90", "gt365"];
@@ -214,6 +236,13 @@ class LibraryApp {
   private countTimer: ReturnType<typeof setTimeout> | null = null;
   private lastView = "";
   private minute = 0;
+  /** One list item per rendered document ID, reused across renders so its preview stays live. */
+  private readonly cardItems = new Map<string, HTMLLIElement>();
+  // A refused preview frame turns previews off for the tab; the next render is all compact cards.
+  private readonly previews = new CardPreviews(() => {
+    this.gridKey = "";
+    this.schedule();
+  });
 
   constructor(private readonly client: CatalogClient) {}
 
@@ -632,6 +661,8 @@ class LibraryApp {
     refs.to.value = "";
     refs.subtitle.textContent = "";
     refs.resultsLabel.textContent = "";
+    this.cardItems.clear();
+    this.previews.clear();
     this.gridKey = "";
     this.reviewKey = "";
   }
@@ -905,14 +936,34 @@ class LibraryApp {
     const focusCard = active && this.refs.grid.contains(active) ? active.closest<HTMLElement>("[data-id]")?.dataset.id : undefined;
     const focusRole = active?.dataset.focus;
     const now = Date.now();
-    replace(this.refs.grid, rendered.map((doc) => h("li", null, this.card(doc, now))));
+    // Cards are patched in place, not rebuilt: a selection toggle or the minute tick must not
+    // reload every live preview frame on the page.
+    const items = rendered.map((doc) => {
+      let item = this.cardItems.get(doc.id);
+      if (!item || item.dataset.version !== doc.version) {
+        item = h("li", { "data-version": doc.version });
+        this.cardItems.set(doc.id, item);
+      }
+      this.card(item, doc, now);
+      return item;
+    });
+    const live = new Set(rendered.map((doc) => doc.id));
+    for (const id of [...this.cardItems.keys()]) if (!live.has(id)) this.cardItems.delete(id);
+    syncChildren(this.refs.grid, items);
+    this.previews.retain(new Set(rendered.map(previewKey)));
     if (focusCard && focusRole) {
       const target = this.refs.grid.querySelector<HTMLElement>(`[data-id="${CSS.escape(focusCard)}"] [data-focus="${focusRole}"]`);
       target?.focus({ preventScroll: true });
     }
   }
 
-  private card(doc: DocumentSummary, now: number): HTMLElement {
+  /**
+   * Fills `item` with the card for `doc`. Everything is rebuilt except the preview node, which
+   * CardPreviews caches per document version and syncChildren leaves in place. Cards without a
+   * live preview (non-HTML, oversized, or previews off) are compact: the type is named once, in
+   * the meta row, never repeated as a placeholder well.
+   */
+  private card(item: HTMLLIElement, doc: DocumentSummary, now: number): void {
     const client = this.client;
     const title = displayTitle(doc);
     const uploaded = Date.parse(doc.uploadedAt);
@@ -921,15 +972,13 @@ class LibraryApp {
     const publicUrl = externalUrl(doc.publicUrl);
     const rawUrl = externalUrl(doc.rawUrl);
     const full = formatDateTime(uploaded, client.timeZone);
+    const preview = this.previews.slot(doc, title);
 
-    const children: Child[] = [
-      h("label", { class: "check" },
-        h("input", { type: "checkbox", checked: selected, "data-action": "toggle", "data-focus": "check", "aria-label": `Select ${title}` })),
-      h("div", { class: "meta" },
-        h("span", { class: "kind" }, KIND_LABEL[doc.kind]),
-        h("time", { datetime: doc.uploadedAt, title: `Uploaded ${full}` }, formatRelative(uploaded, now))),
-      h("div", { class: "well", title: doc.mime || null }, h("span", { class: "glyph", "aria-hidden": "true" }, glyph(doc))),
-    ];
+    const check = h("label", { class: "check" },
+      h("input", { type: "checkbox", checked: selected, "data-action": "toggle", "data-focus": "check", "aria-label": `Select ${title}` }));
+    const meta = h("div", { class: "meta" },
+      h("span", { class: "kind" }, KIND_LABEL[doc.kind]),
+      h("time", { datetime: doc.uploadedAt, title: `Uploaded ${full}` }, formatRelative(uploaded, now)));
     const body: Child[] = [
       h("h3", { id: titleId }, publicUrl
         ? h("a", { href: publicUrl, target: "_blank", rel: "noopener noreferrer", "data-focus": "title" }, title)
@@ -941,14 +990,20 @@ class LibraryApp {
     if (doc.objectCount > 1) body.push(h("p", { class: "note" }, `${doc.objectCount} stored objects · deleting removes all`));
     for (const warning of doc.warnings) body.push(h("p", { class: "note" }, warning));
     if (client.filters.text) body.push(this.searchDetails(doc));
-    children.push(h("div", { class: "body" }, body));
 
     const actions: Child[] = [];
     if (publicUrl) actions.push(h("button", { type: "button", class: "text-button", "data-action": "copy", "data-focus": "copy", "aria-label": `Copy link for ${title}` }, "Copy link"));
     if (rawUrl) actions.push(h("a", { href: rawUrl, target: "_blank", rel: "noopener noreferrer", "data-focus": "raw", "aria-label": `Raw ${title}` }, "Raw"));
     actions.push(h("button", { type: "button", class: "text-button", "data-action": "delete", "data-focus": "delete", "aria-label": `Delete ${title}…` }, "Delete"));
-    children.push(h("div", { class: "actions" }, actions));
-    return h("article", { class: selected ? "card selected" : "card", "data-id": doc.id, "aria-labelledby": titleId }, children);
+
+    let article = item.firstElementChild as HTMLElement | null;
+    if (!article) article = item.appendChild(h("article"));
+    article.className = selected ? "card selected" : "card";
+    article.dataset.id = doc.id;
+    article.setAttribute("aria-labelledby", titleId);
+    if (preview) article.dataset.preview = "live";
+    else delete article.dataset.preview;
+    syncChildren(article, [check, meta, ...(preview ? [preview] : []), h("div", { class: "body" }, body), h("div", { class: "actions" }, actions)]);
   }
 
   /**

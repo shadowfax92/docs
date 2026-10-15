@@ -78,6 +78,9 @@ describe("Catalog HTTP security", () => {
     expect(shell.status).toBe(200);
     expect(await shell.text()).toBe("<h1>Trusted shell</h1>");
     privateHeaders(shell);
+    // Card previews may frame only the configured public origin; nothing else is loosened.
+    expect(shell.headers.get("Content-Security-Policy")).toBe(
+      "default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; frame-src https://docs.example; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     expect(app.bucket.writes).toBe(0);
     expect(app.page).not.toHaveBeenCalled();
     const { response, session, cookie } = await login(app);
@@ -102,6 +105,7 @@ describe("authentication, isolation and private failures", () => {
       const response = await app.catalog.fetch(req("/all-docs"));
       expect(response.status).toBe(503);
       privateHeaders(response);
+      expect(response.headers.get("Content-Security-Policy")).not.toContain("frame-src");
       expect(app.assets).not.toHaveBeenCalled();
       expect(app.bucket.writes).toBe(0);
     }
