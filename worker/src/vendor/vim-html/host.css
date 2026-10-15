@@ -6,4 +6,7 @@
 #vh-ui .docs-vim-controls { position: fixed; right: 8px; bottom: 36px; display: flex; gap: 4px; z-index: 1; }
 #vh-ui .docs-vim-controls button { font: 12px/1.4 system-ui, sans-serif; color: var(--vh-ink); background: var(--vh-bg); border: 1px solid var(--vh-edge); border-radius: 4px; padding: 3px 6px; cursor: pointer; }
 [data-docs-vim-off] #vh-ui > :not(.docs-vim-controls) { display: none !important; }
+/* On a generated viewer the toolbar toggle is the one light/dark control (host.js
+ * adoptViewerTheme); the skill's corner and phone status-line toggles sat on it. */
+[data-docs-viewer-theme] #vh-ui .vh-theme, [data-docs-viewer-theme] #vh-ui .vh-st-theme { display: none; }
 @media print { #vh-ui .docs-vim-controls { display: none; } }
