@@ -1,5 +1,5 @@
 import type { UploadId } from "./contracts";
-import { bakedQuietScript, bakedRuntimeSha256, runtimeScript, runtimeStyle } from "./vendor/vim-html/generated";
+import { bakedHookScript, bakedRuntimeSha256, runtimeScript, runtimeStyle } from "./vendor/vim-html/generated";
 
 /** Stable public identity; baked vim-html source/storage identity always takes precedence. */
 export interface DocumentIdentity { id: UploadId; title: string; publicUrl: string }
@@ -13,8 +13,9 @@ const encoder = new TextEncoder();
  * Dependencies are in-process vendored strings and a one-shot response stream.
  * Inspect at most 4 MiB before choosing; larger/unsupported pages replay exactly,
  * cancellation reaches the source, and read errors propagate without truncation.
- * Recognized baked pages get only a startup hook; their own runtime/config stay
- * authoritative. Raw/download callers bypass this module. No CSP is weakened.
+ * Recognized baked pages get only a startup hook (numbers off, dC for :clear);
+ * their own runtime/config/comment storage stay authoritative. Raw/download
+ * callers bypass this module. No CSP is weakened.
  */
 export async function enhanceHtml(response: Response, identity: DocumentIdentity): Promise<Response> {
   const headers = response.headers;
@@ -76,7 +77,9 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
     const digest = await crypto.subtle.digest("SHA-256", encoder.encode(layer.runtime.replace(/\r\n?/g, "\n").trim()));
     const fingerprint = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
     if (fingerprint !== bakedRuntimeSha256) return new Response(bytes, response);
-    suffix = encoder.encode(`\n<script data-docs-vim-quiet>${bakedQuietScript}</script>`);
+    // The marker keeps its original name: copies served (and saved) before the
+    // hook grew the dC key must still read as already hooked, never hooked twice.
+    suffix = encoder.encode(`\n<script data-docs-vim-quiet>${bakedHookScript}</script>`);
   } else {
     // JSON is script data, never markup. Escaping every '<' also prevents the HTML
     // parser's comment/double-escaped script states, not just literal end tags.
