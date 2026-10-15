@@ -6,6 +6,10 @@
 (function () {
   var VH = window.__VH;
   VH.init(function () {
+    // Run synchronously in the boot task, before any gutter can paint. Use the
+    // skill's toggle so its number state and CSS agree while signs, line IDs
+    // and the reader's Space u l binding stay intact; never write global prefs.
+    if (VH.gutter.numbers()) VH.gutter.toggleNumbers();
     var help = VH.ui.h('button', { type: 'button', text: 'Vim help', title: 'Vim keys: Space ?', onclick: function () {
       setEnabled(true);
       VH.commands.run('help');

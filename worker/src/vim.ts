@@ -1,5 +1,5 @@
 import type { UploadId } from "./contracts";
-import { runtimeScript, runtimeStyle } from "./vendor/vim-html/generated";
+import { bakedQuietScript, bakedRuntimeSha256, runtimeScript, runtimeStyle } from "./vendor/vim-html/generated";
 
 /** Stable public identity; baked vim-html source/storage identity always takes precedence. */
 export interface DocumentIdentity { id: UploadId; title: string; publicUrl: string }
@@ -13,7 +13,8 @@ const encoder = new TextEncoder();
  * Dependencies are in-process vendored strings and a one-shot response stream.
  * Inspect at most 4 MiB before choosing; larger/unsupported pages replay exactly,
  * cancellation reaches the source, and read errors propagate without truncation.
- * Raw/download callers must bypass this module. No CSP is weakened to add keys.
+ * Recognized baked pages get only a startup hook; their own runtime/config stay
+ * authoritative. Raw/download callers bypass this module. No CSP is weakened.
  */
 export async function enhanceHtml(response: Response, identity: DocumentIdentity): Promise<Response> {
   const headers = response.headers;
@@ -64,18 +65,30 @@ export async function enhanceHtml(response: Response, identity: DocumentIdentity
   let html: string;
   try { html = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes); }
   catch { return new Response(bytes, response); }
-  if (!canEnhance(html)) return new Response(bytes, response);
+  const layer = inspectHtml(html);
+  if (!layer) return new Response(bytes, response);
 
-  // JSON is script data, never markup. Escaping every '<' also prevents the HTML
-  // parser's comment/double-escaped script states, not just literal end tags.
-  const config = JSON.stringify({
-    source: identity.publicUrl,
-    storageKey: `docs:${identity.publicUrl}`,
-    docTitle: identity.title,
-    theme: "none", scheme: "light", debug: false,
-  }).replace(/</g, "\\u003c")
-    .replace(/[\u007f-\uffff]/g, ch => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
-  const suffix = encoder.encode(`\n<!-- vim-html:head:begin -->\n<style data-vh="theme">${runtimeStyle}</style>\n<!-- vim-html:head:end -->\n<!-- vim-html:body:begin -->\n<script data-vh="config">window.VIM_HTML=Object.assign(${config},window.VIM_HTML||{});</script>\n<script data-vh="runtime">${runtimeScript}</script>\n<!-- vim-html:body:end -->`);
+  let suffix: Uint8Array;
+  if (layer.kind === "baked") {
+    // Markers alone do not identify a compatible runtime. Match the actual
+    // synchronous upstream script, independent of its authored theme/config.
+    // Unknown, edited or async runtimes remain unchanged rather than being guessed at.
+    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(layer.runtime.replace(/\r\n?/g, "\n").trim()));
+    const fingerprint = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    if (fingerprint !== bakedRuntimeSha256) return new Response(bytes, response);
+    suffix = encoder.encode(`\n<script data-docs-vim-quiet>${bakedQuietScript}</script>`);
+  } else {
+    // JSON is script data, never markup. Escaping every '<' also prevents the HTML
+    // parser's comment/double-escaped script states, not just literal end tags.
+    const config = JSON.stringify({
+      source: identity.publicUrl,
+      storageKey: `docs:${identity.publicUrl}`,
+      docTitle: identity.title,
+      theme: "none", scheme: "light", debug: false,
+    }).replace(/</g, "\\u003c")
+      .replace(/[\u007f-\uffff]/g, ch => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+    suffix = encoder.encode(`\n<!-- vim-html:head:begin -->\n<style data-vh="theme">${runtimeStyle}</style>\n<!-- vim-html:head:end -->\n<!-- vim-html:body:begin -->\n<script data-vh="config">window.VIM_HTML=Object.assign(${config},window.VIM_HTML||{});</script>\n<script data-vh="runtime">${runtimeScript}</script>\n<!-- vim-html:body:end -->`);
+  }
   const updated = new Headers(headers);
   // Validators describe source bytes. Reusing them for an altered representation
   // can produce a false 304 or truncate a response at the old Content-Length.
@@ -118,19 +131,37 @@ function permitsInlineLayer(csp: string | null): boolean {
  * tags and fragments. Decline contexts that would swallow it as text or inert
  * content. False positives leave a page usable; false negatives risk two cores.
  */
-function canEnhance(html: string): boolean {
-  if (/vim-html:(?:head|body):(?:begin|end)|\bdata-vh\s*=|\b(?:window\.)?(?:VIM_HTML|__VH)\b/i.test(html)) return false;
+function inspectHtml(html: string): { kind: "new" } | { kind: "baked"; runtime: string } | null {
+  // This marker also makes a second enhancement byte-idempotent. Conservative
+  // false positives are preferable to registering the startup hook twice.
+  if (/\bdata-docs-vim-quiet\b/i.test(html)) return null;
+  const hasVim = /vim-html:(?:head|body):(?:begin|end)|\bdata-vh\s*=|\b(?:window\.)?(?:VIM_HTML|__VH)\b/i.test(html);
+  let bakedStage = 0; // authentic body block: begin -> config -> runtime -> end
+  let bakedRuntime = "";
   let at = 0;
   const inertTags: string[] = [];
   const token = /<!--|<!\[CDATA\[|<\/?[a-z][\w:-]*(?=[\s/>])|<!|<\?/ig;
   for (;;) {
     token.lastIndex = at;
     const match = token.exec(html);
-    if (!match) return inertTags.length === 0 && html.lastIndexOf("<") <= html.lastIndexOf(">");
+    if (!match) {
+      if (inertTags.length || html.lastIndexOf("<") > html.lastIndexOf(">")) return null;
+      return !hasVim ? { kind: "new" } : bakedStage === 4 ? { kind: "baked", runtime: bakedRuntime } : null;
+    }
     const start = match.index;
     if (match[0] === "<!--") {
       const end = html.indexOf("-->", token.lastIndex);
-      if (end < 0) return false;
+      if (end < 0) return null;
+      if (!inertTags.length) {
+        const comment = html.slice(start, end + 3);
+        if (comment === "<!-- vim-html:body:begin -->") {
+          if (bakedStage !== 0) return null;
+          bakedStage = 1;
+        } else if (comment === "<!-- vim-html:body:end -->") {
+          if (bakedStage !== 3) return null;
+          bakedStage = 4;
+        }
+      }
       at = end + 3;
       continue;
     }
@@ -143,19 +174,19 @@ function canEnhance(html: string): boolean {
       else if (ch === '"' || ch === "'") quote = ch;
       else if (ch === ">") break;
     }
-    if (end === html.length) return false;
+    if (end === html.length) return null;
     const tag = match[0].toLowerCase();
-    if (tag === "<meta" && /content-security-policy/i.test(html.slice(start, end + 1))) return false;
-    if (tag === "<plaintext" || tag === "<frameset" || tag === "<![cdata[") return false;
+    if (tag === "<meta" && /content-security-policy/i.test(html.slice(start, end + 1))) return null;
+    if (tag === "<plaintext" || tag === "<frameset" || tag === "<![cdata[") return null;
     // A legacy encoding declaration controls the browser even without an HTTP
     // charset. Leave it alone rather than append UTF-8 assumptions to that page.
     if (tag === "<meta" && /charset\s*=/i.test(html.slice(start, end + 1)) &&
-        !/charset\s*=\s*["']?utf-?8\b/i.test(html.slice(start, end + 1))) return false;
+        !/charset\s*=\s*["']?utf-?8\b/i.test(html.slice(start, end + 1))) return null;
     if (/^<\/?(?:template|svg|math|select)$/.test(tag)) {
       // Different inert contexts cannot balance one another. An unmatched
       // </svg>, for example, does not close an outstanding HTML <template>.
       if (tag.startsWith("</")) {
-        if (inertTags.pop() !== tag.slice(2)) return false;
+        if (inertTags.pop() !== tag.slice(2)) return null;
       } else inertTags.push(tag.slice(1));
     }
     at = end + 1;
@@ -163,11 +194,28 @@ function canEnhance(html: string): boolean {
       const close = new RegExp(`</${tag.slice(1)}\\s*>`, "ig");
       close.lastIndex = at;
       const closing = close.exec(html);
-      if (!closing) return false;
+      if (!closing) return null;
       // In script's legacy double-escaped state an apparent </script> may only
       // leave that state, rather than close the element. Decline nested script
       // text instead of attempting the browser's full script tokenizer here.
-      if (tag === "<script" && /<script(?=[\s/>])/i.test(html.slice(at, closing.index))) return false;
+      if (tag === "<script" && /<script(?=[\s/>])/i.test(html.slice(at, closing.index))) return null;
+      if (tag === "<script" && !inertTags.length) {
+        // Only the assembler's inline classic script tags qualify. Attributes
+        // such as src/type/async/defer change execution order and are declined.
+        const opening = html.slice(start, end + 1);
+        // Reject unfamiliar data-vh spellings before interpreting their value.
+        // HTML also accepts unquoted/entity-encoded values and duplicate attrs;
+        // accepting only assembler tags prevents a second unknown core from
+        // replacing window.__VH and receiving a hook meant for the known one.
+        if (/\bdata-vh\b/i.test(opening)) {
+          if (/^<script\s+data-vh\s*=\s*(?:"prepaint"|'prepaint')\s*>$/i.test(opening) && bakedStage === 0) { /* original head script */ }
+          else if (/^<script\s+data-vh\s*=\s*(?:"config"|'config')\s*>$/i.test(opening) && bakedStage === 1) bakedStage = 2;
+          else if (/^<script\s+data-vh\s*=\s*(?:"runtime"|'runtime')\s*>$/i.test(opening) && bakedStage === 2) {
+            bakedRuntime = html.slice(at, closing.index);
+            bakedStage = 3;
+          } else return null; // includes duplicates and asynchronous/foreign tags
+        }
+      }
       at = close.lastIndex;
     }
   }
