@@ -33,26 +33,103 @@ make install
 
 ## Setup
 
-### 1. Deploy the Worker
+### 1. Set up the deployment
+
+Requires Node **22.16+ on macOS/Linux**, npm, and the locally installed Wrangler
+from the lockfile. The public Worker is `https://docs.shadowfax92.workers.dev`;
+the private catalog is `https://docs-library.shadowfax92.workers.dev/all-docs`.
+Keep these origins distinct in their existing Wrangler configs.
 
 ```sh
 cd worker
-npm install
-npx wrangler login          # if not already logged in
-npx wrangler r2 bucket create docs-cli
-npx wrangler deploy
-npx wrangler secret put AUTH_TOKEN
+npm ci
+npx --no-install wrangler login  # explicit, only if not already logged in
+cp -n .env.example .env          # preserves an existing .env
+chmod 600 .env
+vi .env                         # set ALL_DOCS_PASSWORD locally
 ```
 
-Generate a token with `openssl rand -hex 32` and paste when prompted.
+The existing `docs-cli` R2 bucket and public `AUTH_TOKEN` must already be
+provisioned. For a new account, create the bucket and provision that bearer
+secret explicitly on **`wrangler.toml` only** before using the CLI. The recipe
+does not create buckets, change R2 rules, set public secrets, log in, or prompt.
 
-### 2. Configure the CLI
+`ALL_DOCS_PASSWORD` must be 1..1024 UTF-8 bytes. Use literal dotenv assignments;
+quote values containing `#` or leading/trailing spaces. Quoted multiline values
+work; shell expansion and escaped quotes are not supported. Duplicate catalog
+secret assignments and malformed files fail before deployment. Leave the
+`CATALOG_SESSION_KEY` assignment absent initially: a live run generates 32 random
+bytes, stores their hex encoding in the same ignored `.env`, and reuses it on
+every later run. An existing key must be independent of the password and
+32..1024 UTF-8 bytes; an empty assignment is an error. Unrelated entries and
+comments stay intact. Keep the file private, back it up securely, and edit it
+only when no deployment is running. Never commit or paste its contents.
+
+Before enabling catalog deletion, the operator must deploy the immutable public
+reservation writer, verify all public traffic uses it, finish old in-flight
+uploads, and stop any mutable out-of-band/S3 writers. Start that migration with
+`npm run deploy:public`. The recipe's ordering does **not** prove writer drainage.
+R2 has no conditional delete, so reviewed deletion depends on this coordination.
+
+Before sustained catalog use, the deployment mediator must add and read back
+**one-day expiration only for `__docs_internal/catalog/v1/throttle/`**, preserving
+every existing rule, including **Default Multipart Abort Rule** (abort incomplete
+uploads after 7 days). Keep upload claims/tombstones permanent. Never set
+bucket-wide document expiry. This is an operator prerequisite, not an action the
+recipe silently performs.
+
+### 2. Deploy or redeploy
+
+From `worker`, inspect a read-only plan, then explicitly execute it:
+
+```sh
+npm run deploy:all -- --plan
+npm run deploy:all
+```
+
+The live order is public source → catalog source/bootstrap → catalog secret bulk
+upload → final catalog source deployment. The bootstrap gives a new catalog a
+fail-closed source before secrets exist; an existing catalog keeps its secrets.
+Only `ALL_DOCS_PASSWORD` and `CATALOG_SESSION_KEY` enter catalog provisioning, via
+JSON stdin. Passwords/keys never enter command arguments or output. Public
+`AUTH_TOKEN` is retained. Each source deploy uses its explicit existing config
+and runs its configured build through logged-in local `npx --no-install wrangler`.
+
+After changing the password with `vi .env`, repeat those same two `deploy:all`
+commands. Plain `wrangler deploy` does not upload `.env` values as secrets. Keep
+`CATALOG_SESSION_KEY` unchanged when changing the password; both password changes
+and intentional key rotation invalidate existing catalog sessions/cursors.
+
+Explicit choices:
+
+```sh
+npm run deploy:public -- --plan     # source only; needs no catalog .env
+npm run deploy:public
+npm run deploy:catalog -- --public-ready --plan
+npm run deploy:catalog -- --public-ready
+```
+
+`--public-ready` acknowledges prior public-writer deployment/coordination; it does
+not verify it. Catalog-only still deploys catalog source before secret upload
+and again afterward. `npm run deploy` is an alias for `deploy:all`.
+
+Plan mode starts no child process, changes no permissions/files, and makes no
+cloud request. It prints ordered redacted commands and key names; a missing key
+is generated only during execution. Live runs enforce `.env` mode 0600 and use
+an empty `.env.deploy.lock` to serialize deployments. After a crash, remove a
+stale lock only after checking no deployment remains active. Child output/debug
+logs are discarded to prevent secret echoes. On failure, the recipe reports the
+failed step and stops; earlier cloud changes remain. Check login/config/build
+separately, then rerun the full recipe. Verify live behavior after completion;
+this script does not perform production acceptance.
+
+### 3. Configure the CLI
 
 ```sh
 docs config
 ```
 
-Enter your worker URL (printed after `wrangler deploy`) and the same auth token.
+Enter your public worker URL and its existing bearer auth token.
 
 Config stored at `~/.config/docs/config.yaml`:
 

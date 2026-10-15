@@ -6,4 +6,7 @@ worker/dist/
 worker/.wrangler/
 .DS_Store
 **/*.env
+worker/.env.*
+!worker/.env.example
+worker/.env.deploy.lock
 .grove/
