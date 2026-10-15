@@ -138,6 +138,19 @@ function idsInOrder(...byteValues: number[]) {
 }
 
 describe("Documents discovery", () => {
+  it.each([1000, 1, 2])("covers a directory marker in the same reviewed version as resolve/remove (page size %i)", async (pageSize) => {
+    const bucket = new LocalBucket();
+    bucket.pageSize = pageSize;
+    await seed(bucket, `${firstId}/`, "");
+    await seed(bucket, `${firstId}/note.txt`, "note");
+    const documents = createDocuments(bucket.binding(), origin);
+    const items = await discover(bucket);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toEqual((await documents.resolve(firstId))!.summary);
+    expect(items[0].objectCount).toBe(2);
+    expect(await documents.remove(firstId, items[0].version)).toEqual({ status: "deleted", deletedObjectCount: 2 });
+  });
+
   it("groups a legacy ID across short truncated pages and excludes private/unowned keys", async () => {
     const bucket = new LocalBucket();
     bucket.pageSize = 2;

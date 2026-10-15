@@ -140,7 +140,7 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       const groups = new Map<UploadId, R2Object[]>();
       for (const object of listed.objects) {
         // Private reservations/catalog state and unrelated bucket keys never become documents.
-        const id = /^([A-Za-z0-9]{8})\/.+$/s.exec(object.key)?.[1];
+        const id = /^([A-Za-z0-9]{8})\//.exec(object.key)?.[1];
         if (!id || id === state?.lastId) continue;
         const group = groups.get(id) ?? [];
         group.push(object);
@@ -150,7 +150,9 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       if (next && tail) groups.set(tail, await ownedObjects(tail, true));
       const items: DocumentSummary[] = [];
       for (const [id, objects] of groups) {
-        if (objects.length) items.push(await summarize(id, objects, publicOrigin));
+        // An ID/ marker alone is not an upload. Beside a file it is still an owned key, so include
+        // it in the version/count exactly as resolve/remove do, even across a cursor page seam.
+        if (objects.some((object) => object.key.length > id.length + 1)) items.push(await summarize(id, objects, publicOrigin));
       }
       return {
         version: 1, items, scanComplete: !next, observedAt,
