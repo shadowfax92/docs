@@ -319,11 +319,11 @@ describe("legacy public document routes", () => {
     expect((await worker.fetch(new Request(result.url), env)).status).toBe(404);
   });
 
-  it("renders the baseline Markdown, PDF and generic download wrappers", async () => {
+  it("renders safe Markdown, native PDF and metadata/download previews", async () => {
     for (const [filename, bytes, expected] of [
-      ["notes.md", "# A note\nSome Markdown", "marked.parse(raw)"],
-      ["report.pdf", "%PDF fixture", '<embed src="https://docs.example/Ab12Cd34/raw" type="application/pdf">'],
-      ["archive.zip", "binary fixture", '<a href="https://docs.example/Ab12Cd34/download">Download</a>'],
+      ["notes.md", "# A note\nSome Markdown", "<h1>A note</h1>"],
+      ["report.pdf", "%PDF fixture", '<iframe src="https://docs.example/Ab12Cd34/raw"'],
+      ["archive.zip", "binary fixture", "No preview for archive files."],
     ]) {
       const bucket = await fixture(filename, bytes);
       const env = memoryEnv(bucket);
