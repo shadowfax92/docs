@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare } from 'miniflare';
@@ -18,8 +20,10 @@ import { chromium } from 'playwright';
  *   public   http://127.0.0.1:18897   (/ID/raw framed by cards; uploads seeded directly into R2)
  *   external http://[::1]:18899       (subresources, nested frame, a request that never answers)
  *
- * Usage: node scripts/build.mjs && node scripts/card-polish-proof.mjs
+ * Usage: node scripts/build.mjs && node scripts/card-polish-proof.mjs [--serve]
  * Output: .wrangler/card-polish-proof/{results.json,screenshots/*.png}
+ * --serve keeps the seeded fixture origins running after a passing proof (nothing is deleted by
+ * the proof) and writes server.json with the origins, disposable password and stop command.
  */
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const state = resolve(root, '.wrangler/card-polish-proof');
@@ -29,7 +33,8 @@ const ext = 'http://[::1]:18899';
 const password = 'disposable-card-proof-password';
 const sessionKey = 'disposable-card-proof-session-key-32-bytes';
 // Mirrors card-preview.ts; asserted against the live page, not assumed.
-const MAX_LOADING = 4, MAX_LIVE = 36, REVEAL_MS = 4000, PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const MAX_PENDING = 6, MAX_LIVE = 36, REVEAL_MS = 4000, PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const serve = process.argv.includes('--serve');
 const SENTINEL = 'HOSTILE-SENTINEL-7f3a';
 
 await rm(state, { recursive: true, force: true });
@@ -171,7 +176,7 @@ const previewState = () => p.evaluate(() => {
   return {
     previews: all.length,
     live: document.querySelectorAll('.preview iframe').length,
-    loading: document.querySelectorAll('.preview[data-state="loading"]').length,
+    pending: document.querySelectorAll('.preview:is([data-state="loading"], [data-state="revealed"])').length,
     ready: document.querySelectorAll('.preview[data-state="ready"]').length,
     cards: document.querySelectorAll('article[data-id]').length,
   };
@@ -188,9 +193,9 @@ try {
   await p.locator('#library-title').waitFor({ state: 'visible' });
   // The sampler watches the live DOM for the whole run: peak loading and live frame counts.
   await p.evaluate(() => {
-    window.__proof.maxLoading = 0; window.__proof.maxLive = 0;
+    window.__proof.maxPending = 0; window.__proof.maxLive = 0;
     const sample = () => {
-      window.__proof.maxLoading = Math.max(window.__proof.maxLoading, document.querySelectorAll('.preview[data-state="loading"]').length);
+      window.__proof.maxPending = Math.max(window.__proof.maxPending, document.querySelectorAll('.preview:is([data-state="loading"], [data-state="revealed"])').length);
       window.__proof.maxLive = Math.max(window.__proof.maxLive, document.querySelectorAll('.preview iframe').length);
     };
     new MutationObserver(sample).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-state'] });
@@ -306,11 +311,12 @@ try {
   await p.locator('article[data-id="ScriptGn"]').screenshot({ path: resolve(state, 'screenshots', 'script-generated-blank.png') });
   check('script-generated HTML previews blank (no JavaScript runs in previews); documented, not claimed as rendered');
 
-  // ---- Stalled third-party request: revealed after REVEAL_MS while still pending
+  // ---- Stalled third-party request: shown after REVEAL_MS, still counted as pending
   assert(stalled.length >= 1, 'stalled request is pending');
   const stalledState = await p.locator('article[data-id="Stalled1"] .preview').getAttribute('data-state');
-  assert.equal(stalledState, 'ready');
-  check('a never-answering subresource cannot hide a preview or hold a loading slot (reveal fallback)', { pendingStalled: stalled.length });
+  assert.equal(stalledState, 'revealed');
+  assert.equal(await p.locator('article[data-id="Stalled1"] .preview iframe').evaluate((f) => getComputedStyle(f).opacity), '1');
+  check('a never-answering subresource cannot keep a painted preview hidden (shown after 4 s) and keeps its pending slot until load or drop', { pendingStalled: stalled.length });
 
   // ---- Re-render stability: selection patches cards without reloading frames
   await p.evaluate(() => document.querySelectorAll('.preview iframe').forEach((f) => { f.dataset.proofMark = '1'; }));
@@ -400,12 +406,12 @@ try {
   const bottom = await previewState();
   await p.evaluate(() => scrollTo(0, 0));
   await p.waitForFunction(() => document.querySelector('article[data-id="Visual01"] .preview')?.dataset.state === 'ready', null, { timeout: REVEAL_MS + 6000 });
-  const peaks = await p.evaluate(() => ({ maxLoading: window.__proof.maxLoading, maxLive: window.__proof.maxLive }));
+  const peaks = await p.evaluate(() => ({ maxPending: window.__proof.maxPending, maxLive: window.__proof.maxLive }));
   assert(total > MAX_LIVE, `fixture exceeds the live cap (${total} previews)`);
-  assert(peaks.maxLive <= MAX_LIVE && peaks.maxLoading <= MAX_LOADING, JSON.stringify(peaks));
-  assert(maxRawInflight <= MAX_LOADING, `max concurrent /raw ${maxRawInflight}`);
+  assert(peaks.maxLive <= MAX_LIVE && peaks.maxPending <= MAX_PENDING, JSON.stringify(peaks));
+  assert(maxRawInflight <= MAX_PENDING, `max concurrent /raw ${maxRawInflight}`);
   Object.assign(metrics, { totalPreviews: total, ...peaks, maxRawInflight, rawRequestsTotal: rawRequests().length, liveAtBottom: bottom.live });
-  check('bounded: across all previews the page never exceeded 36 live frames or 4 loading, evicted offscreen frames and re-attached them on return', metrics);
+  check('bounded: across all previews the page never exceeded 36 live frames or 6 pending loads, evicted offscreen frames and re-attached them on return', metrics);
 
   // ---- Themes and responsive layout
   await p.evaluate(() => scrollTo(0, 0));
@@ -465,6 +471,51 @@ try {
   await slow.close();
   check('loading state shows the quiet well until the frame loads; Lock removes every preview frame');
 
+  // ---- Held-open /raw responses: the pending budget is not released by the reveal timer
+  const held = await context.newPage();
+  const heldRoutes = [];
+  await held.route(/\/[A-Za-z0-9]{8}\/raw$/, (route) => { heldRoutes.push(route); });
+  await held.goto(`${cat}/all-docs`);
+  await held.locator('#library-title').waitFor({ state: 'visible' });
+  await held.waitForFunction((n) => document.querySelectorAll('.preview iframe').length === n, MAX_PENDING);
+  await held.waitForTimeout(REVEAL_MS + 2000);
+  const heldState = await held.evaluate(() => ({
+    frames: document.querySelectorAll('.preview iframe').length,
+    visiblePreviews: [...document.querySelectorAll('.preview')].filter((e) => { const r = e.getBoundingClientRect(); return r.bottom > 0 && r.top < innerHeight; }).length,
+  }));
+  assert.equal(heldState.frames, MAX_PENDING, 'no frame beyond the pending budget while /raw is held open');
+  assert.equal(heldRoutes.length, MAX_PENDING);
+  assert(heldState.visiblePreviews > MAX_PENDING, 'more previews were waiting');
+  for (const route of heldRoutes.splice(0)) await route.continue();
+  await held.unroute(/\/[A-Za-z0-9]{8}\/raw$/);
+  await held.waitForFunction((n) => document.querySelectorAll('.preview iframe').length > n, MAX_PENDING);
+  await held.close();
+  check('held-open /raw responses: exactly 6 frames attach and stay pending past the reveal delay; the rest attach only after those load', heldState);
+
+  // ---- Unobservable frame failure: an aborted /raw still fires load; the card stays usable
+  const failing = await context.newPage();
+  const failingErrors = [];
+  failing.on('pageerror', (e) => failingErrors.push(String(e)));
+  await failing.route(`${pub}/Visual02/raw`, (route) => route.abort('connectionrefused'));
+  await failing.goto(`${cat}/all-docs`);
+  await failing.locator('#library-title').waitFor({ state: 'visible' });
+  await failing.waitForFunction(() => ['Visual01', 'Visual02'].every((id) => document.querySelector(`article[data-id="${id}"] .preview`)?.dataset.state === 'ready'));
+  const timing = await failing.evaluate((urls) => urls.map((url) => {
+    const entry = performance.getEntriesByName(url)[0];
+    return entry && { url, initiator: entry.initiatorType, status: entry.responseStatus, transfer: entry.transferSize, decoded: entry.decodedBodySize };
+  }), [`${pub}/Visual01/raw`, `${pub}/Visual02/raw`]);
+  assert.deepEqual({ ...timing[0], url: null }, { ...timing[1], url: null }, 'success and failure look identical to the embedder');
+  const failedCard = failing.locator('article[data-id="Visual02"]');
+  assert.equal(await failedCard.locator('h3 a').getAttribute('href'), `${pub}/Visual02`);
+  assert.equal(await failedCard.locator('[data-action="copy"], [data-action="delete"]').count(), 2);
+  await failedCard.screenshot({ path: resolve(state, 'screenshots', 'raw-failure-card.png') });
+  assert.deepEqual(failingErrors, []);
+  await failing.close();
+  const rawHeaders = (await fetch(`${pub}/Visual01/raw`)).headers;
+  assert.equal(rawHeaders.get('x-frame-options'), null);
+  assert(!/frame-ancestors/i.test(rawHeaders.get('content-security-policy') ?? ''));
+  check('an aborted /raw is indistinguishable from success to the catalog (same load event, same zeroed Resource Timing); the card keeps its link and actions and the pending slot is released; public raw responses do not forbid framing', { timing });
+
   // ---- CSP refusal fallback: a deployment without frame-src degrades to compact cards
   const strict = await context.newPage();
   const strictViolations = [];
@@ -495,12 +546,32 @@ try {
 } finally {
   await writeFile(resolve(state, 'results.json'), JSON.stringify({
     complete, checks, metrics, browser: browser.version(), origins: { catalog: cat, public: pub, external: ext },
-    limits: { MAX_LOADING, MAX_LIVE, REVEAL_MS, PREVIEW_MAX_BYTES },
+    limits: { MAX_PENDING, MAX_LIVE, REVEAL_MS, PREVIEW_MAX_BYTES },
     pageErrors, downloads,
     limitations: 'Headless local Chromium only (Firefox/WebKit sandbox and scaling behaviour not exercised). Loopback origins: production docs/docs-library hosts are same-site, these are cross-site. Previews run no JavaScript, so script-built pages are blank and pages may differ from their scripted rendering.',
   }, null, 2));
-  for (const res of stalled) res.destroy();
   await browser.close();
-  await mf.dispose();
-  extServer.close();
+  if (!(serve && complete)) {
+    for (const res of stalled) res.destroy();
+    await mf.dispose();
+    extServer.close();
+  }
+}
+
+if (serve && complete) {
+  const manifest = {
+    pid: process.pid, catalog: `${cat}/all-docs`, public: pub, external: ext, password,
+    note: 'Disposable local fixtures only; the proof deleted nothing. Stop with the command below.',
+    sourceCommit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+    bundleSha256: createHash('sha256').update(await readFile(resolve(root, '.wrangler/build/index.js'))).digest('hex'),
+    startedAt: new Date().toISOString(), stop: `kill -TERM ${process.pid}`,
+  };
+  await writeFile(resolve(state, 'server.json'), JSON.stringify(manifest, null, 2));
+  console.log(`SERVING ${JSON.stringify(manifest)}`);
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
+    for (const res of stalled) res.destroy();
+    await mf.dispose();
+    extServer.close();
+    process.exit(0);
+  });
 }

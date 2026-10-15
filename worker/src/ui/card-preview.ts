@@ -22,22 +22,30 @@
  * would, but without scripts. Pages that build their content with JavaScript therefore preview
  * blank or partial; a preview is a static first-paint snapshot, not a faithful rendering.
  *
- * Cost is bounded here: frames attach only near the viewport, at most MAX_LOADING at a time, and
- * at most MAX_LIVE stay alive (least recently seen offscreen frames are dropped and re-attach on
- * return). Preview nodes are cached per document version, so callers must keep them attached
+ * Failure inside a frame is not observable here, by design: for a cross-origin frame, `load`
+ * fires and Resource Timing reports the same zeroed entry for a 200, a 404/500, a refused
+ * connection or a response that forbids framing. Such a card shows the browser's own frame error
+ * (or the public "Not found" text) in its well and keeps every action. Public raw responses must
+ * therefore never forbid framing (X-Frame-Options / frame-ancestors).
+ *
+ * Cost is bounded here: frames attach only near the viewport; at most MAX_PENDING frames may wait
+ * for their load event, and at most MAX_LIVE stay alive. When a budget is full, the least recently
+ * seen offscreen frame counting against it is dropped (and re-attaches on return); otherwise new
+ * frames wait. Preview nodes are cached per document version, so callers must keep them attached
  * while a card is re-rendered: detaching an <iframe> discards its document and reloads it.
  */
 import type { DocumentSummary } from "../contracts";
 
 /** Larger sources keep a compact card: parsing cost grows with the HTML, not the thumbnail. */
 export const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
-/** Concurrent frame navigations; the rest wait their turn in card order. */
-export const MAX_LOADING = 4;
+/** Frames whose load event has not fired (document or subresources still in flight). Released
+ * only by load or detach, never by a timer, so slow /raw responses cannot pile up requests. */
+export const MAX_PENDING = 6;
 /** Live frames kept per tab, roughly three desktop screens of cards. */
 export const MAX_LIVE = 36;
-/** A frame is revealed after its load event or this delay, whichever is first. The load event
- * waits for every subresource, so one stalled third-party image must not hide the page or hold a
- * loading slot forever. */
+/** A frame is shown after its load event or this delay, whichever is first. The load event waits
+ * for every subresource, so one stalled third-party image must not keep a painted page hidden.
+ * Showing is visual only: the frame keeps its pending slot until it loads or is dropped. */
 export const REVEAL_MS = 4_000;
 /** Attach a little before a card scrolls into view. */
 const ROOT_MARGIN = "400px 0px";
@@ -73,7 +81,8 @@ export function previewKey(doc: DocumentSummary): string {
   return `${doc.id}:${doc.version}`;
 }
 
-type SlotState = "idle" | "loading" | "ready";
+/** idle: no frame · loading: pending, hidden · revealed: pending, shown · ready: loaded, shown. */
+type SlotState = "idle" | "loading" | "revealed" | "ready";
 
 interface Slot {
   key: string;
@@ -96,7 +105,7 @@ export class CardPreviews {
   private readonly slots = new Map<string, Slot>();
   private readonly byElement = new WeakMap<Element, Slot>();
   private readonly observer: IntersectionObserver;
-  private loading = 0;
+  private pending = 0;
   private disabled = false;
   private clock = 0;
 
@@ -173,29 +182,41 @@ export class CardPreviews {
     this.pump();
   }
 
-  /** Attaches waiting visible frames in card order, within the loading and live budgets. */
+  /** Attaches waiting visible frames in card order, within the pending and live budgets. */
   private pump(): void {
     if (this.disabled) return;
-    const live = [...this.slots.values()].filter((slot) => slot.frame);
     for (const slot of this.ordered()) {
-      if (this.loading >= MAX_LOADING) return;
-      if (!slot.visible || slot.frame) continue;
-      if (live.length >= MAX_LIVE) {
-        // Evict the least recently seen offscreen frame; if every live frame is on screen, wait.
-        const victim = live.filter((other) => !other.visible).sort((a, b) => a.lastSeen - b.lastSeen)[0];
-        if (!victim) return;
-        this.detach(victim);
-        live.splice(live.indexOf(victim), 1);
-      }
+      if (slot.frame) continue;
+      if (this.pending >= MAX_PENDING && !this.evict((other) => other.state === "loading" || other.state === "revealed")) return;
+      if (this.liveCount() >= MAX_LIVE && !this.evict(() => true)) return;
       this.attach(slot);
-      live.push(slot);
     }
+  }
+
+  /** Drops the least recently seen offscreen frame matching `counts`; false if every one is on screen. */
+  private evict(counts: (slot: Slot) => boolean): boolean {
+    const victim = [...this.slots.values()].filter((slot) => slot.frame && !slot.visible && counts(slot))
+      .sort((a, b) => a.lastSeen - b.lastSeen)[0];
+    if (!victim) return false;
+    this.detach(victim);
+    return true;
+  }
+
+  private liveCount(): number {
+    let live = 0;
+    for (const slot of this.slots.values()) if (slot.frame) live++;
+    return live;
   }
 
   /** Visible slots in document order, so the top of the screen fills first. */
   private ordered(): Slot[] {
     return [...this.slots.values()].filter((slot) => slot.visible && slot.element.isConnected).sort((a, b) =>
       a.element.compareDocumentPosition(b.element) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+  }
+
+  private setState(slot: Slot, state: SlotState): void {
+    slot.state = state;
+    slot.element.dataset.state = state;
   }
 
   private attach(slot: Slot): void {
@@ -209,31 +230,32 @@ export class CardPreviews {
     frame.setAttribute("title", `Preview of ${slot.title}`);
     frame.src = slot.src;
     slot.frame = frame;
-    slot.state = "loading";
-    slot.element.dataset.state = "loading";
-    this.loading++;
-    const settle = () => {
-      if (slot.frame !== frame || slot.state !== "loading") return;
+    this.setState(slot, "loading");
+    this.pending++;
+    // `load` also fires for error pages and refused frames (see the module comment): it ends the
+    // pending period, not a success check.
+    frame.addEventListener("load", () => {
+      if (slot.frame !== frame || slot.state === "ready") return;
       if (slot.reveal) clearTimeout(slot.reveal);
       slot.reveal = null;
-      slot.state = "ready";
-      slot.element.dataset.state = "ready";
-      this.loading--;
+      this.setState(slot, "ready");
+      this.pending--;
       this.pump();
-    };
-    frame.addEventListener("load", settle, { once: true });
-    slot.reveal = setTimeout(settle, REVEAL_MS);
+    }, { once: true });
+    slot.reveal = setTimeout(() => {
+      slot.reveal = null;
+      if (slot.frame === frame && slot.state === "loading") this.setState(slot, "revealed");
+    }, REVEAL_MS);
     slot.element.appendChild(frame);
   }
 
   private detach(slot: Slot): void {
     if (slot.reveal) clearTimeout(slot.reveal);
     slot.reveal = null;
-    if (slot.state === "loading") this.loading--;
-    // Removing the element discards the framed document and cancels any pending navigation.
+    if (slot.state === "loading" || slot.state === "revealed") this.pending--;
+    // Removing the element discards the framed document and cancels its pending requests.
     slot.frame?.remove();
     slot.frame = null;
-    slot.state = "idle";
-    slot.element.dataset.state = "idle";
+    this.setState(slot, "idle");
   }
 }
