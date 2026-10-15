@@ -93,6 +93,16 @@ describe("createSearchIndex", () => {
     expect(index.query({ text: "(a+)+$", mode: "regex", ignoreCase: false }, all)).toEqual([]);
   });
 
+  it("stops repeated greedy suffix rescans with an explicit budget error", () => {
+    const index = createSearchIndex();
+    for (const body of ["a".repeat(100000), "a".repeat(255) + "c".repeat(524033)]) {
+      const fixture = document("Rescans1", body);
+      index.add(fixture.summary, fixture.text);
+      expect(() => index.query({ text: "a.*b|a", mode: "regex", ignoreCase: false }, all))
+        .toThrow(expect.objectContaining({ code: "search_budget_exceeded" }));
+    }
+  });
+
   it("applies kinds and strict upper/inclusive lower cutoffs before expensive matching", () => {
     const index = createSearchIndex();
     const fixture = document("Filter01", "x".repeat(500000), { kind: "html" });
@@ -151,7 +161,7 @@ it("uses the bundled worker protocol for generations, errors, FIFO additions and
     parentPort.on('message', data => self.onmessage({data}));
   `, { eval: true });
   const send = (request: SearchWorkerRequest | object) => new Promise<SearchWorkerResponse>((resolve, reject) => {
-    worker.once("message", resolve);
+    worker.once("message", (message: SearchWorkerResponse) => { worker.off("error", reject); resolve(message); });
     worker.once("error", reject);
     worker.postMessage(request);
   });

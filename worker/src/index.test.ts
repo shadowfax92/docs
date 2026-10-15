@@ -417,7 +417,7 @@ describe("Documents interface and unavailable modules", () => {
     expect(await documents.resolve(uploadId)).toBeNull();
   });
 
-  it("retains explicit extraction/search unavailability without consuming document bodies", async () => {
+  it("extracts legacy source and searches its content through the owned interfaces", async () => {
     const bucket = await fixture("notes.md", "# test");
     const documents = createDocuments(bucket as unknown as R2Bucket, "https://docs.example");
     const doc = (await documents.resolve(uploadId))!;

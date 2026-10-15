@@ -26,6 +26,8 @@ export async function extractText(doc: ResolvedDocument): Promise<TextRecord> {
   if (kind === "office" || /\.(?:docx?|xlsx?|pptx?|odt)$/i.test(filename)) {
     return { ...record, reason: "Office text extraction is not enabled: actual ZIP expansion and XML parser limits are not yet verified." };
   }
+  // Legacy uploads often label source files application/octet-stream. Recognize their names
+  // without changing the catalog's stored type or treating every unknown binary as source text.
   const sourceFile = /\.(?:txt|md|markdown|mdx|html?|jsonl?|ndjson|csv|tsv|xml|ya?ml|toml|ini|conf|cfg|properties|log|sh|bash|zsh|fish|py|rb|go|rs|c|h|cpp|hpp|cs|fsx?|java|[cm]?js|jsx|[cm]?ts|tsx|css|scss|less|sql|graphql|vue|svelte|lua|vim|el|clj|exs?|erl|hrl|hs|ml|mli|php|pl|pm|r|jl|swift|kts?|scala|dart|tex|rst)$/i.test(filename)
     || /^(?:makefile|dockerfile|gemfile|rakefile|\.(?:gitignore|gitattributes|editorconfig|env))$/i.test(filename);
   const textMime = /^(?:text\/|application\/(?:json|[\w.+-]+\+json|xml|[\w.+-]+\+xml|javascript|x-javascript|typescript|sql|yaml|x-yaml)(?:;|$))/i.test(mime);
@@ -103,13 +105,13 @@ async function htmlText(source: string): Promise<string> {
       if (excluded.has(element.tagName.toLowerCase())) {
         if (!suppressed) chunks.push(" ");
         suppressed++;
-        element.onEndTag(() => { suppressed--; if (!suppressed) chunks.push(" "); });
+        afterElement(element, () => { suppressed--; if (!suppressed) chunks.push(" "); });
         return;
       }
       // The parser owns nesting/end-tag correlation; no uploaded script executes. Separators at
       // both ends prevent adjacent elements from fusing words, without splitting streamed chunks.
       if (!suppressed) chunks.push(" ");
-      element.onEndTag(() => { if (!suppressed) chunks.push(" "); });
+      afterElement(element, () => { if (!suppressed) chunks.push(" "); });
     },
   }).onDocument({ text(chunk) { if (!suppressed) chunks.push(chunk.text); } });
   const transformed = rewriter.transform(new Response(source, { headers: { "Content-Type": "text/html; charset=utf-8" } }));
@@ -119,4 +121,15 @@ async function htmlText(source: string): Promise<string> {
   try { while (!(await reader.read()).done) { /* Drain without retaining serialized uploads. */ } }
   finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   return decodeHTML(chunks.join("")).replace(/\s+/gu, " ").trim();
+}
+
+/** Older workerd bindings have no canHaveContent flag and reject callbacks on HTML void/SVG
+ * self-closing elements. Their lifecycle ends immediately, including an excluded <script/>.
+ */
+function afterElement(element: Element, end: () => void): void {
+  try { element.onEndTag(end); }
+  catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("No end tag")) throw error;
+    end();
+  }
 }

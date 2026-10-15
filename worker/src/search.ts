@@ -47,7 +47,7 @@ const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATTERN_BYTES = 256;
 const MAX_PROGRAM = 4096;
 const MAX_QUERY_WORK = 128 * 1024 * 1024;
-const MAX_MATCHES = 1000000;
+const MAX_FINDS = 1000000;
 const SNIPPET_LENGTH = 240;
 const MAX_RANGES = 20;
 const kinds = new Set(["html", "markdown", "text", "data", "pdf", "image", "audio", "video", "archive", "office", "binary"]);
@@ -110,6 +110,8 @@ export function createSearchIndex(): SearchIndex {
       const before = cutoff(filter.uploadedBefore);
       const after = cutoff(filter.uploadedAfter);
       const pattern = compile(query);
+      const regex = query.mode === "regex";
+      const instructions = pattern?.programSize() ?? 0;
       const hits: SearchHit[] = [];
       let work = 0;
       let finds = 0;
@@ -123,18 +125,29 @@ export function createSearchIndex(): SearchIndex {
           let matchCount = 0;
           let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: record.title.slice(0, SNIPPET_LENGTH), ranges: [] };
           for (const field of [record.filename, record.title, record.body]) {
-            work += field.length * (pattern?.programSize() ?? 0);
+            if (!regex) work += field.length * instructions;
             if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
             if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
             const matcher = pattern.matcher(field);
             let window: SnippetWindow | undefined;
-            while (matcher.find()) {
-              // Zero-width results consume time too, even though they never contribute to counts.
-              if (++finds > MAX_MATCHES || ((finds & 255) === 0 && performance.now() > deadline)) queryBudget();
+            let searchedThrough = 0;
+            while (true) {
+              // Each regex find can rescan the entire remaining suffix (a.*b|a). Charge that
+              // conservative upper bound before entering RE2, including the final failing find.
+              // Quoted literal finds only advance, so their aggregate field scan is charged once.
+              if (regex) work += (field.length - searchedThrough + 1) * instructions;
+              if (work > MAX_QUERY_WORK || ++finds > MAX_FINDS || performance.now() > deadline) queryBudget();
+              const found = matcher.find();
+              if (performance.now() > deadline) queryBudget();
+              if (!found) break;
               const start = matcher.start();
               const end = matcher.end();
               // RE2JS advances zero-width finds by a code point; do not add phantom counts/ranges.
-              if (start === end) continue;
+              searchedThrough = end;
+              if (start === end) {
+                if (end < field.length) searchedThrough += field.codePointAt(end)! > 0xffff ? 2 : 1;
+                continue;
+              }
               matchCount++;
               if (!window) window = snippetWindow(field, start);
               if (window.ranges.length < MAX_RANGES && start < window.end) {
@@ -149,6 +162,7 @@ export function createSearchIndex(): SearchIndex {
         hits.sort((a, b) => b.matchCount - a.matchCount
           || records.get(b.id)!.uploadedAt - records.get(a.id)!.uploadedAt
           || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+        if (performance.now() > deadline) queryBudget();
         return hits;
       } finally {
         // RE2's per-pattern automata/cache have no purpose after this synchronous query finishes.

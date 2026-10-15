@@ -67,10 +67,15 @@ describe("extractText in native workerd", () => {
   });
 
   it("keeps a typical embedded vim runtime from exhausting the readable-text budget", async () => {
-    const source = `<style>${"a".repeat(700 * 1024)}</style><script>${"b".repeat(700 * 1024)}</script><main>Real searchable document tail</main>`;
+    const source = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>${"a".repeat(700 * 1024)}</style></head><body><script>${"b".repeat(700 * 1024)}</script><main>Real searchable document tail</main></body></html>`;
     const { record } = await extract(source, "kind=html&name=vim.html");
     expect(record).toMatchObject({ coverage: "full", text: "Real searchable document tail", reason: null });
     expect(record.sourceBytes).toBeGreaterThan(1024 * 1024);
+  });
+
+  it("handles native void and self-closing element lifecycles without losing following text", async () => {
+    const { record } = await extract('<meta charset="utf-8"><link rel="stylesheet" href="https://never.example/style"><p>one<br>two</p><hr><img src="https://never.example/image"><input value="attributeSecret"><svg><script/><circle/></svg><p>three</p>', "kind=html");
+    expect(record).toMatchObject({ coverage: "full", text: "one two three", reason: null });
   });
 
   it("handles malformed/nested excluded HTML and decodes entities once without treating text as markup", async () => {
