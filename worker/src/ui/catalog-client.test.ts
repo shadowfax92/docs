@@ -384,15 +384,33 @@ describe("catalog client: extraction and search generations", () => {
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable because this search stopped early" });
   });
 
-  it("stops indexing visibly at the in-tab text budget", async () => {
-    const { client, catalog } = setup([range(3)]);
-    catalog.texts.set("doc00002", { indexedBytes: 40 * 1024 * 1024 });
+  it("stops indexing visibly at the in-tab text budget and settles the queue as skipped", async () => {
+    const { client, catalog } = setup([range(6)]);
+    catalog.texts.set("doc00001", { indexedBytes: 40 * 1024 * 1024 });
     await client.start();
-    await until(() => client.contentProgress().settled >= 1 && client.scan.status === "complete");
-    await until(() => client.contentProgress().budgetExceeded);
+    await until(() => client.contentProgress().settled === 6, "every document settled");
     client.setFilters({ text: "invoice" });
 
+    // doc00001 trips the budget; 2 and 3 were already in flight; 4–6 never leave the queue.
+    expect(client.contentProgress()).toMatchObject({ searched: 2, skipped: 4, complete: true, budgetExceeded: true });
+    expect(catalog.requests("GET", "/all-docs/api/documents/doc").length).toBe(3);
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: the library exceeds this tab's search budget" });
+  });
+
+  it("settles queued documents as failed when the worker crashes instead of leaving them pending", async () => {
+    const { client, catalog, search } = setup([range(6)]);
+    const held: (() => void)[] = [];
+    catalog.textGate = () => new Promise<void>((resolve) => { held.push(resolve); });
+    await client.start();
+    await until(() => catalog.textInFlight === 3, "three text requests");
+    search.port.handlers.failure("Content search stopped working in this tab.");
+    for (const release of held) release();
+    await until(() => client.contentProgress().settled === 6, "every document settled");
+
+    expect(client.contentProgress()).toMatchObject({ failed: 6, complete: true });
+    client.setFilters({ text: "invoice" });
+    expect(client.search).toMatchObject({ status: "unavailable", message: "Content search stopped working in this tab." });
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable while content search is down" });
   });
 });
 

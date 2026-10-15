@@ -529,7 +529,7 @@ export class CatalogClient {
     this.textInFlight = 0;
     this.indexedBytes = 0;
     this.budgetExceeded = false;
-    this.search = { ...this.search, hits: null, hitsKey: null };
+    this.search = { status: this.filters.text ? "pending" : "idle", message: null, hits: null, hitsKey: null };
     this.startCorpus();
   }
 
@@ -615,7 +615,20 @@ export class CatalogClient {
 
   /** Starts queued text fetches up to TEXT_CONCURRENCY. Called after every arrival and settlement. */
   private pump(): void {
-    while (this.textInFlight < TEXT_CONCURRENCY && this.queue.length && !this.budgetExceeded && !this.searchBroken) {
+    if (this.budgetExceeded || this.searchBroken) {
+      // Nothing more can be indexed. Settle the rest visibly rather than leaving them "pending",
+      // which would keep coverage at "indexing…" forever.
+      const content: ContentState = this.searchBroken
+        ? { status: "failed", reason: this.searchBroken }
+        : { status: "skipped", reason: "Over this tab's search budget." };
+      for (const id of this.queue) {
+        const entry = this.docs.get(id);
+        if (entry?.content.status === "pending") entry.content = content;
+      }
+      this.queue = [];
+      return;
+    }
+    while (this.textInFlight < TEXT_CONCURRENCY && this.queue.length) {
       const id = this.queue.shift() as UploadId;
       const entry = this.docs.get(id);
       if (!entry || entry.content.status !== "pending") continue;
