@@ -417,23 +417,24 @@ describe("Documents interface and unavailable modules", () => {
     expect(await documents.resolve(uploadId)).toBeNull();
   });
 
-  it("retains explicit extraction/search unavailability without consuming document bodies", async () => {
+  it("extracts legacy source and searches its content through the owned interfaces", async () => {
     const bucket = await fixture("notes.md", "# test");
     const documents = createDocuments(bucket as unknown as R2Bucket, "https://docs.example");
     const doc = (await documents.resolve(uploadId))!;
     const text = await extractText(doc);
-    expect(text).toMatchObject({ coverage: "metadata-only", text: "", indexedBytes: 0 });
-    expect(text.reason).toContain("unavailable");
-    expect(await (await doc.openBody())?.text()).toBe("# test");
-    expect(() => createSearchIndex().query(
+    expect(text).toMatchObject({ coverage: "full", text: "# test", indexedBytes: 6 });
+    await expect(doc.openBody()).rejects.toThrow("already been opened");
+    const index = createSearchIndex();
+    index.add(doc.summary, text);
+    expect(index.query(
       { text: "test", mode: "literal", ignoreCase: true },
       { kinds: [], uploadedBefore: null, uploadedAfter: null },
-    )).toThrow("unavailable");
+    )).toMatchObject([{ id: uploadId, matchCount: 1 }]);
   });
 
   it("only exposes explicitly bundled trusted assets through the asset interface", async () => {
     expect(catalogAssets("/all-docs/assets/app.js")?.headers.get("Content-Type")).toBe("text/javascript; charset=utf-8");
-    expect(await catalogAssets("/all-docs/assets/search-worker.js")?.text()).toContain("search_unavailable");
+    expect(catalogAssets("/all-docs/assets/search-worker.js")?.headers.get("Content-Type")).toBe("text/javascript; charset=utf-8");
     for (const path of ["/all-docs/assets/../../raw", `/${uploadId}/raw`, "/toString", "/__proto__"]) {
       expect(catalogAssets(path)).toBeNull();
     }
