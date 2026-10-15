@@ -29,7 +29,7 @@ const authored = `<!doctype html><html><head><meta charset="utf-8"><title>Keymap
 <style>body{margin:0;background:rgb(248,245,239);color:rgb(24,49,68);font:18px Georgia}main{margin:40px auto;max-width:620px;padding:0 16px}
 input,textarea{border:6px solid rgb(200,0,0);padding:12px;font:inherit}div{margin:3px}span{letter-spacing:3px}mark{background:yellow}</style></head><body><main>
 <h1>Keymap fixture</h1><p>Alpha line for a comment.</p><p>Bravo line.</p>
-<div id="focus-target" tabindex="0">Focusable region</div>
+<div id="focus-target" tabindex="0">Focusable region</div><div id="aria-box" role="textbox" tabindex="0">ARIA text widget</div>
 <form><label>Notes <input id="notes"></label><label>Long notes <textarea id="long-notes"></textarea></label></form>
 <p contenteditable="true" id="editable">Editable</p>
 <dialog id="modal"><p>Authored modal</p><div id="modal-widget" tabindex="0">Widget</div></dialog>
@@ -258,12 +258,22 @@ try {
       }
       check(`${kind}: page input, textarea and contenteditable type Space s k as text`);
     }
-    if (kind === "enhanced") {
+    // The baked runtime's own dispatcher has no modal/widget guard (only the
+    // enhanced one does), so the picker must decline there by itself.
+    if (kind !== "generated") {
       await page.evaluate(() => { document.querySelector("#modal").showModal(); document.querySelector("#modal-widget").focus(); });
       await openKeys(page);
-      assert.equal((await state(page)).open, 0);
+      const inModal = await page.evaluate(() => ({ open: document.querySelectorAll(".docs-ks").length, mode: window.__VH.mode.get(),
+        focus: document.activeElement.id }));
+      assert.deepEqual(inModal, { open: 0, mode: "normal", focus: "modal-widget" });
       await page.evaluate(() => document.querySelector("#modal").close());
-      check("enhanced: an authored modal keeps Space s k");
+      await page.focus("#aria-box");
+      await openKeys(page);
+      const inWidget = await page.evaluate(() => ({ open: document.querySelectorAll(".docs-ks").length, focus: document.activeElement.id }));
+      assert.deepEqual(inWidget, { open: 0, focus: "aria-box" });
+      await page.evaluate(() => document.activeElement.blur());
+      if ((await page.evaluate(() => window.__VH.mode.get())) !== "normal") await page.keyboard.press("Escape");
+      check(`${kind}: an authored modal and an ARIA text widget keep Space s k`, { inModal, inWidget });
     }
 
     // Help and which-key list the key.

@@ -61,7 +61,8 @@
     if (window.__VH !== VH || VH.keys !== keys) return;
     // An authored Space s k (or an earlier copy of this module) keeps the key.
     if (taken()) return;
-    VH.keys.map('normal', '<leader>sk', function () { open(); },
+    // Returning false declines the key: core leaves it to the page untouched.
+    VH.keys.map('normal', '<leader>sk', function (count, e) { return open(e); },
       { desc: 'search keymaps', group: 'search' });
     VH.on('mode', function (e) {
       if (!picker || e.from !== 'command' || e.to === 'command') return;
@@ -89,8 +90,14 @@
     if (tok.length === 1 || tok.charAt(0) !== '<') return tok === ' ' ? 'Space' : tok;
     var parts = tok.slice(1, -1).split('-');
     var key = parts.pop() || '-';
-    var name = NAMED[key.toLowerCase()] || key;
-    return parts.map(function (m) { return MOD_NAMES[m.toUpperCase()] || m; }).concat(name).join('-');
+    var name = own(NAMED, key.toLowerCase()) || key;
+    return parts.map(function (m) { return own(MOD_NAMES, m.toUpperCase()) || m; }).concat(name).join('-');
+  }
+
+  // Authored display-only rows may carry any text ('<constructor>'); only the
+  // table's own names count, never what Object.prototype inherits.
+  function own(map, key) {
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
   }
 
   // A run of plain characters stays one chip ('gg', 'dC'); each bracketed key
@@ -256,8 +263,8 @@
    * HTML-looking description or query stays inert.
    */
 
-  function open() {
-    if (picker || VH.disabled || VH.mode.get() !== 'normal') return;
+  function open(e) {
+    if (picker || VH.disabled || VH.mode.get() !== 'normal' || pageOwns(e)) return false;
     var entries = [];
     try { entries = VH.keys.list(); } catch (err) { report(err); }
     var items = entries.map(toItem);
@@ -312,6 +319,26 @@
     VH.mode.set('command');
     input.focus({ preventScroll: true });
     refilter(p);
+  }
+
+  // The enhanced dispatcher (generate.py) already keeps every vim key from
+  // authored modals, ARIA text widgets and native controls; a baked page runs
+  // the verbatim upstream dispatcher, which does not. The same rule here, on
+  // both paths, keeps the picker from opening behind a top-layer modal (where
+  // it could never take focus) or pulling focus out of a page widget.
+  function pageOwns(e) {
+    var path = e && e.composedPath && e.composedPath();
+    var el = (path && path[0]) || (e && e.target) || activeElement();
+    if (el && el.nodeType !== 1) el = el.parentElement;
+    if (!el || !el.closest || ours(el)) return false;
+    if (Array.prototype.some.call(document.querySelectorAll('dialog[open], [aria-modal="true"]'),
+        function (d) { return !ours(d); })) return true;
+    return !!el.closest('[role="textbox"], [role="combobox"], [role="searchbox"], ' +
+      'button, a[href], input, select, summary, audio, video');
+  }
+
+  function ours(el) {
+    return !!el.closest('[data-vh-ui]');
   }
 
   function dismiss(restore) {

@@ -52,6 +52,10 @@ case-insensitive.
   interface it uses. At boot it checks that the live `window.__VH` is that same
   instance.
 
+It opens only where the enhanced dispatcher would deliver a vim key: never
+over an open authored modal, an ARIA text widget or a native control. A declined
+key returns `false`, so core leaves it to the page.
+
 It adds one keymap and one `mode` listener. Its DOM and its one style element
 live inside `VH.ui.layer`. It brings no second core, config, store, dispatcher
 or page listener. An authored `Space s k` keeps the key.
@@ -80,8 +84,9 @@ row stacks: key and modes on one line, description below.
   async runtimes, copies cached before deployment, and saved copies that already
   carry the hook. On the enhanced runtime, Vim off disables the key; baked pages
   have no off control.
-- In an enhanced page, a focused native control or an authored modal keeps
-  `Space s k`, as it keeps every vim key.
+- An open authored modal, a focused ARIA text widget or a native control keeps
+  `Space s k` on both paths. The picker declines there itself, because a baked
+  page's verbatim dispatcher, unlike the enhanced one, still delivers the key.
 
 ## Proof
 

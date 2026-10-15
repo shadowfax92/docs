@@ -49,6 +49,20 @@ class FakeEl {
   }
   focus() { this.doc.activeElement = this; this.doc.focusCalls.push(this); }
   setSelectionRange(start: number, end: number) { this.selectionStart = start; this.selectionEnd = end; }
+  get nodeType() { return this.tag === "#text" ? 3 : 1; }
+  get parentElement() { return this.parentNode; }
+  // Enough of Element.matches for the module's selectors: tag, [attr], [attr="v"], tag[attr].
+  matches(selector: string) {
+    return selector.split(",").some(part => {
+      const m = /^([a-z]*)(?:\[([\w-]+)(?:="([^"]*)")?\])?$/.exec(part.trim());
+      return !!m && (!m[1] || m[1] === this.tag) && (!m[2] || this.attrs.has(m[2])) &&
+        (m[3] === undefined || this.attrs.get(m[2]) === m[3]);
+    });
+  }
+  closest(selector: string): FakeEl | null {
+    for (let el: FakeEl | null = this; el; el = el.parentNode) if (el.matches(selector)) return el;
+    return null;
+  }
   find(cls: string): FakeEl[] {
     const own: FakeEl[] = (this.attrs.get("class") ?? "").split(" ").includes(cls) ? [this] : [];
     return own.concat(...this.children.map(c => c.find(cls)));
@@ -72,6 +86,8 @@ class FakeDocument {
   focusCalls: FakeEl[] = [];
   body = new FakeEl("body", this);
   activeElement: FakeEl = this.body;
+  modals: FakeEl[] = [];
+  querySelectorAll(selector: string) { return this.modals.filter(el => el.matches(selector)); }
   el(tag: string) { return new FakeEl(tag, this); }
   text(data: string) { const node = new FakeEl("#text", this); node.data = data; return node; }
 }
@@ -99,17 +115,18 @@ function boot(options: { version?: number; booted?: boolean; readyState?: string
   doc.readyState = options.readyState ?? "loading";
   const inits: Array<() => void> = [];
   const listeners: Record<string, Array<(e: { from: string; to: string }) => void>> = {};
-  const maps: Array<{ modes: string; seq: string; fn: () => unknown; desc: string; group: string }> = [];
+  const maps: Array<{ modes: string; seq: string; fn: (count: null, event?: Partial<FakeEvent>) => unknown; desc: string; group: string }> = [];
   const toasts: string[] = [];
   const ran: string[] = [];
   let mode = "normal";
   const layer = doc.el("div");
+  layer.setAttribute("data-vh-ui", "");
   const VH: Record<string, any> = {
     version: options.version ?? 1, booted: options.booted ?? false, disabled: false,
     init: (fn: () => void) => inits.push(fn),
     on: (evt: string, fn: (e: { from: string; to: string }) => void) => { (listeners[evt] ||= []).push(fn); },
     keys: {
-      map: (modes: string, seq: string, fn: () => unknown, opts: { desc: string; group: string }) =>
+      map: (modes: string, seq: string, fn: (count: null, event?: Partial<FakeEvent>) => unknown, opts: { desc: string; group: string }) =>
         maps.push({ modes, seq, fn, desc: opts.desc, group: opts.group }),
       list: () => (options.entries ?? ENTRIES).concat(maps.map(m => ({ modes: [m.modes], seq: m.seq, desc: m.desc, group: m.group }))),
     },
@@ -148,7 +165,7 @@ function boot(options: { version?: number; booted?: boolean; readyState?: string
   const root = () => layer.find("docs-ks")[0];
   const input = () => layer.find("docs-ks-input")[0];
   const rows = () => layer.find("docs-ks-row");
-  const open = () => maps.find(m => m.seq === "<leader>sk")!.fn();
+  const open = (event?: Partial<FakeEvent>) => maps.find(m => m.seq === "<leader>sk")!.fn(null, event);
   const type = (text: string) => { input().value = text; input().selectionEnd = text.length; input().fire("input"); };
   const press = (key: string, mods: Partial<FakeEvent> = {}) => input().fire("keydown", { key, ...mods });
   const selected = () => rows().findIndex(r => r.getAttribute("aria-selected") === "true");
@@ -280,6 +297,10 @@ describe("keymap search (Space s k)", () => {
     expect(row.find("docs-ks-group")[0].textContent).toBe("<i>group</i>");
     // Only elements the module itself names exist: no img, b or i was parsed.
     expect(t.doc.created.some(el => ["img", "b", "i"].includes(el.tag))).toBe(false);
+    // Authored display rows can name anything; inherited object keys are not labels.
+    const odd = boot({ entries: [{ modes: ["normal"], seq: "<constructor><toString>x", desc: "odd", group: "" }] });
+    odd.open();
+    expect(odd.keysOf()[0]).toBe("constructortoStringx");
   });
 
   it("moves with arrows, Ctrl-n/p/j/k, Tab and pages, and never runs the selected key", () => {
@@ -350,6 +371,40 @@ describe("keymap search (Space s k)", () => {
     expect([t.selected(), t.ran, t.root() !== undefined]).toEqual([3, [], true]);
   });
 
+  it("declines, leaving the key to the page, inside authored modals, ARIA text widgets and native controls", () => {
+    // The baked runtime dispatches here (only the enhanced dispatcher guards
+    // these), so the picker itself must decline rather than open behind a modal.
+    const t = boot();
+    const page = t.doc.el("main");
+    t.doc.body.appendChild(page);
+    const target = (tag: string, attrs: Record<string, string> = {}) => {
+      const el = t.doc.el(tag);
+      Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+      page.appendChild(el);
+      return el;
+    };
+    for (const el of [target("div", { role: "textbox" }), target("button"), target("a", { href: "#x" }), target("summary")]) {
+      expect([el.tag, t.open({ target: el })]).toEqual([el.tag, false]);
+      el.focus();
+      expect([el.tag, t.open()]).toEqual([el.tag, false]);
+    }
+    // A text node target resolves to its element.
+    const box = target("div", { role: "searchbox" });
+    box.appendChild(t.doc.text("query"));
+    expect(t.open({ target: box.children[0] })).toBe(false);
+    const modal = target("dialog", { open: "" });
+    t.doc.modals.push(modal);
+    expect(t.open({ target: target("div", { tabindex: "0" }) })).toBe(false);
+    expect([t.root(), t.mode()]).toEqual([undefined, "normal"]);
+    // Our own open runtime UI is not an authored modal; a plain focusable region opens.
+    modal.removeAttribute("open");
+    t.doc.modals = [t.doc.el("div")];
+    t.doc.modals[0].setAttribute("aria-modal", "true");
+    t.layer.appendChild(t.doc.modals[0]);
+    expect(t.open({ target: target("div", { tabindex: "0" }) })).toBeUndefined();
+    expect(t.root()).toBeDefined();
+  });
+
   it("closes without stealing focus when the reader leaves for a page field or turns Vim off", () => {
     const t = boot();
     const field = t.doc.el("input");
@@ -360,7 +415,7 @@ describe("keymap search (Space s k)", () => {
     t.VH.mode.set("normal");
     // Vim off: host.js sets VH.disabled and the key no longer opens anything.
     t.VH.disabled = true;
-    t.open();
+    expect(t.open()).toBe(false);
     expect(t.root()).toBeUndefined();
   });
 });
