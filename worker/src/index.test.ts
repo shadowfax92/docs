@@ -199,34 +199,60 @@ class MemoryBucket {
   failPut = false;
   private revision = 0;
 
-  async put(key: string, body: ReadableStream | string | null, options: R2PutOptions = {}): Promise<R2Object> {
+  async put(key: string, body: ReadableStream | string | null, options: R2PutOptions = {}): Promise<R2Object | null> {
     if (this.failPut) throw new Error("put failed");
     const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+    const etag = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+      .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    // Check after the async body read, at commit, so overlapping creates cannot both win.
+    if (!this.matches(this.records.get(key)?.object, options.onlyIf)) return null;
     const revision = String(++this.revision);
     const object: R2Object = {
-      key, version: revision, etag: revision, httpEtag: `"${revision}"`, size: bytes.length,
+      key, version: revision, etag, httpEtag: `"${etag}"`, size: bytes.length,
       uploaded: new Date("2026-10-14T12:00:00Z"), customMetadata: options.customMetadata,
+      httpMetadata: options.httpMetadata instanceof Headers ? undefined : options.httpMetadata,
       checksums: { toJSON: () => ({}) }, storageClass: "Standard", writeHttpMetadata() {},
     };
     this.records.set(key, { object, bytes });
     return object;
   }
 
-  async list(options: R2ListOptions = {}) {
-    return {
-      objects: [...this.records.values()].map((entry) => entry.object)
-        .filter((object) => object.key.startsWith(options.prefix || ""))
-        .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
-      truncated: false,
-    };
+  async list(options: R2ListOptions & { include?: ("customMetadata" | "httpMetadata")[] } = {}) {
+    const prefix = options.prefix ?? "";
+    const cursor = options.cursor ? JSON.parse(atob(options.cursor)) as { prefix: string; after: string } : null;
+    if (cursor && cursor.prefix !== prefix) throw new Error("wrong cursor scope");
+    const all = [...this.records.values()].map((entry) => entry.object)
+      .filter((object) => object.key.startsWith(prefix) && (!cursor || object.key > cursor.after))
+      .sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    const selected = all.slice(0, Math.min(options.limit ?? 1000, 1000));
+    const objects = selected.map((object) => ({
+      ...object, writeHttpMetadata() {},
+      customMetadata: options.include?.includes("customMetadata") ? object.customMetadata : undefined,
+      httpMetadata: options.include?.includes("httpMetadata") ? object.httpMetadata : undefined,
+    }));
+    return all.length > selected.length
+      ? { objects, truncated: true, cursor: btoa(JSON.stringify({ prefix, after: selected.at(-1)!.key })) }
+      : { objects, truncated: false };
+  }
+
+  async head(key: string): Promise<R2Object | null> {
+    if (this.failGet) throw new Error("head failed");
+    return this.records.get(key)?.object ?? null;
+  }
+
+  private matches(object: R2Object | undefined, condition?: R2Conditional | Headers): boolean {
+    if (!condition) return true;
+    const equal = (value: string) => value === "*" ? !!object : !!object && value.replace(/^"|"$/g, "") === object.etag;
+    const match = condition instanceof Headers ? condition.get("If-Match") : condition.etagMatches;
+    const none = condition instanceof Headers ? condition.get("If-None-Match") : condition.etagDoesNotMatch;
+    return (!match || equal(match)) && (!none || !equal(none));
   }
 
   async get(key: string, options: R2GetOptions = {}): Promise<R2Object | R2ObjectBody | null> {
     if (this.failGet) throw new Error("get failed");
     const entry = this.records.get(key);
     if (!entry) return null;
-    const condition = options.onlyIf;
-    if (condition && !(condition instanceof Headers) && condition.etagMatches !== entry.object.etag) return entry.object;
+    if (!this.matches(entry.object, options.onlyIf)) return entry.object;
     const range = options.range;
     let bytes = entry.bytes;
     if (range && !(range instanceof Headers)) {
@@ -244,7 +270,9 @@ class MemoryBucket {
   }
 
   async delete(keys: string | string[]) {
-    for (const key of Array.isArray(keys) ? keys : [keys]) this.records.delete(key);
+    const batch = Array.isArray(keys) ? keys : [keys];
+    if (batch.length > 1000) throw new Error("native R2 delete limit exceeded");
+    for (const key of batch) this.records.delete(key);
   }
 }
 
@@ -379,13 +407,20 @@ describe("Documents interface and unavailable modules", () => {
     await expect(changed.openBody()).rejects.toThrow("changed before body read");
   });
 
-  it("does not pretend discovery or reviewed deletion is implemented", async () => {
+  it("discovers complete metadata and removes the reviewed legacy version", async () => {
     const bucket = await fixture("notes.md", "# test");
     const documents = createDocuments(bucket as unknown as R2Bucket, "https://docs.example");
     const doc = (await documents.resolve(uploadId))!;
-    await expect(documents.page()).rejects.toThrow("unavailable");
-    await expect(documents.remove(uploadId, doc.summary.version)).rejects.toThrow("unavailable");
-    expect(await documents.resolve(uploadId)).not.toBeNull();
+    const page = await documents.page();
+    expect(page).toMatchObject({ items: [doc.summary], scanComplete: true, nextCursor: null });
+    expect(await documents.remove(uploadId, doc.summary.version)).toEqual({ status: "deleted", deletedObjectCount: 1 });
+    expect(await documents.resolve(uploadId)).toBeNull();
+  });
+
+  it("retains explicit extraction/search unavailability without consuming document bodies", async () => {
+    const bucket = await fixture("notes.md", "# test");
+    const documents = createDocuments(bucket as unknown as R2Bucket, "https://docs.example");
+    const doc = (await documents.resolve(uploadId))!;
     const text = await extractText(doc);
     expect(text).toMatchObject({ coverage: "metadata-only", text: "", indexedBytes: 0 });
     expect(text.reason).toContain("unavailable");
