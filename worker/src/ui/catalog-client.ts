@@ -784,7 +784,10 @@ export class CatalogClient {
       const { entry, phase } = added;
       if (this.docs.get(entry.summary.id) !== entry) return; // Superseded version/scan entry.
       if (reply.status !== "ready" && reply.status !== "error") return;
-      if (reply.status === "error" && reply.code === "search_budget_exceeded") this.budgetExceeded = true;
+      if (reply.status === "error" && reply.code === "search_budget_exceeded") {
+        this.budgetExceeded = true;
+        this.pump(); // Metadata rejection can arrive while all body slots are held: settle the queue now.
+      }
       if (phase === "metadata") {
         entry.metadata = reply.status === "ready" ? "indexed" : "failed";
       } else {
@@ -796,7 +799,10 @@ export class CatalogClient {
           ? { status: reply.code === "search_budget_exceeded" ? "skipped" : "failed", reason: reply.message || "The search index rejected this document." }
           : { status: "indexed", ...added.coverage };
       }
-      if (reply.status === "ready") {
+      // Metadata-budget rejection invalidates the worker's whole index. Invalidate query
+      // freshness too, so cached hits cannot stay "ready" after the hard admission failure.
+      // Body rejection leaves admitted names valid and does not change query freshness.
+      if (reply.status === "ready" || phase === "metadata") {
         this.corpusRevision++;
         this.scheduleRequery();
       }

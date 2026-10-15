@@ -801,7 +801,7 @@ class LibraryApp {
     } else if (client.search.status === "unavailable" && client.filters.text) {
       content = [`Content search is unavailable: ${client.search.message ?? "the search worker stopped"}. Filters, sorting and deletion still work.`];
     } else if (progress.budgetExceeded && client.filters.text) {
-      content = ["Content indexing stopped at this tab's 32 MB search budget. Search results are incomplete and Select all is disabled while searching."];
+      content = ["Search indexing stopped at this tab's memory or document limit. Search results are incomplete and Select all is disabled while searching."];
     }
     const key = content ? content.map((part) => typeof part === "string" ? part : "btn").join("|") : "";
     if (banner.dataset.key === key) return;

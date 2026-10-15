@@ -446,6 +446,30 @@ describe("catalog client: metadata with the real search engine", () => {
     } finally { await client.lock(); release?.(); }
   });
 
+
+  it("invalidates a successful query when metadata admission overflows", async () => {
+    const catalog = new FakeCatalog();
+    catalog.pages = [[...range(10000).map((doc, index) => index ? doc : { ...doc, title: "OverflowTitleSentinel" })], [summary(10001)]];
+    let releasePage!: () => void;
+    const gate = new Promise<void>((resolve) => { releasePage = resolve; });
+    const releaseBodies: (() => void)[] = [];
+    catalog.textGate = () => new Promise<void>((resolve) => { releaseBodies.push(resolve); });
+    const client = new CatalogClient({
+      fetch: async (input, init) => { if (input.includes("cursor=1")) await gate; return catalog.fetch(input, init); },
+      openSearch: realSearch, now: () => NOW,
+    }, new URLSearchParams("q=OverflowTitleSentinel"));
+    try {
+      await client.start();
+      await until(() => client.search.status === "ready" && client.results().matching.length === 1);
+      releasePage();
+      await until(() => client.contentProgress().metadataFailed === 1);
+      await until(() => client.search.status === "error", "metadata overflow invalidates active search");
+      expect(client.search.message).toMatch(/budget/);
+      expect(client.contentProgress()).toMatchObject({ names: 10000, metadataFailed: 1, skipped: 9998, budgetExceeded: true });
+      expect(client.selectAllMatching()).toBe(false);
+    } finally { releasePage(); await client.lock(); for (const release of releaseBodies) release(); }
+  });
+
 });
 
 function range(count: number, start = 1): DocumentSummary[] {
