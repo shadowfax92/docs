@@ -50,8 +50,14 @@ async function nativeHttp(migrate = true) {
     const handle = await runtime.getWorker("catalog");
     // Miniflare3 uses its own undici Request class. Cross the host/runtime seam with URL/bytes,
     // preserving known body length, rather than passing Node's incompatible Request instance.
-    const init = async (input: Request) => ({ method: input.method, headers: Object.fromEntries(input.headers),
-      ...(input.body === null ? {} : { body: new Uint8Array(await input.arrayBuffer()) }) });
+    const init = async (input: Request) => {
+      const body = input.body === null ? null : new Uint8Array(await input.arrayBuffer());
+      const headers = Object.fromEntries(input.headers);
+      // R2 requires a fixed-length native Request.body. The Miniflare dispatch bridge otherwise
+      // turns these buffered fixture bytes into a chunked stream, unlike the CLI's real upload.
+      if (body !== null) headers["Content-Length"] = String(body.byteLength);
+      return { method: input.method, headers, ...(body === null ? {} : { body }) };
+    };
     const catalog = { fetch: async (input: Request) => handle.fetch(input.url, await init(input)) as unknown as Promise<Response> };
     const fetchPublic = async (input: Request) => runtime.dispatchFetch(input.url, await init(input)) as unknown as Promise<Response>;
     const login = async () => {
