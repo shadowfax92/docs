@@ -88,6 +88,10 @@ describe("compiled native HTTP roles", () => {
       const deletion = await fixture.fetchPublic(new Request(publicOrigin + "/upload/Legacy01", { method: "DELETE", headers: { Authorization: "Bearer fixture-bearer" } }));
       expect(deletion.status).toBe(500); expect(deletion.headers.get("X-Docs-Delete-Result")).toBeNull();
       expect(await (await fixture.bucket.get("Legacy01/fixture.txt"))?.text()).toBe("original bytes");
+      const bulk = await fixture.catalog.fetch(request("/all-docs/api/delete", { version: 1, items: [{ id: "Legacy01", version: "reviewed" }], confirmCount: 1, confirmation: "DELETE 1 documents" }, credentials));
+      expect(bulk.status).toBe(200);
+      expect(await bulk.json()).toEqual({ version: 1, outcomes: [{ id: "Legacy01", status: "failed" }] });
+      expect(await (await fixture.bucket.get("Legacy01/fixture.txt"))?.text()).toBe("original bytes");
       for (const [path, method] of [["/all-docs/api/documents", "GET"], ["/all-docs/api/search", "POST"], ["/all-docs/api/snippets", "POST"], ["/all-docs/api/index/maintain", "POST"]]) {
         expect((await fixture.fetchPublic(new Request(publicOrigin + path, { method }))).status).toBe(404);
       }
@@ -187,4 +191,40 @@ it("gives only catalog cron a fresh bounded invocation and retains its deferred 
       expect([200, 302, 404]).toContain(response.status);
     }
   } finally { await fixture.dispose(); }
+}, 20_000);
+
+it("passes the decorated write and its exact deferred promise through one invocation ledger", async () => {
+  const fixture = await createLibraryFixture();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await fixture.bucket.put("Deferred/fixture.txt", "needle");
+    const summary = (await fixture.documents.resolve("Deferred"))!.summary;
+    let captured!: LibraryDependencies;
+    let deferred!: Promise<unknown>;
+    const handler = createWorker((deps) => {
+      captured = deps;
+      return { ...fixture.library, documents: { ...deps.documents,
+        async create() {
+          await deps.db.prepare("SELECT 1").first();
+          deferred = (async () => { await gate; await deps.db.prepare("SELECT 2").first(); })();
+          deps.defer(deferred);
+          return summary;
+        },
+        async remove() { return { status: "changed", deletedObjectCount: 0 }; },
+      } };
+    });
+    const pending: Promise<unknown>[] = [];
+    const context = { waitUntil(work: Promise<unknown>) { pending.push(work); } };
+    const env: PublicEnv = { DOCS_BUCKET: fixture.bucket, LIBRARY_DB: fixture.db, AUTH_TOKEN: "fixture-bearer", APP_ROLE: "public", PUBLIC_DOCS_ORIGIN: publicOrigin, CATALOG_ORIGIN: catalogOrigin };
+    const response = await handler.fetch(new Request(publicOrigin + "/upload", { method: "PUT", body: "payload", headers: { Authorization: "Bearer fixture-bearer" } }), env, context);
+    expect(response.status).toBe(200);
+    expect(pending).toEqual([deferred]);
+    expect(captured.budget).toMatchObject({ used: 1, remaining: 39 });
+    release(); await Promise.all(pending);
+    expect(captured.budget).toMatchObject({ used: 2, remaining: 38 });
+    const changed = await handler.fetch(new Request(publicOrigin + "/upload/Deferred", { method: "DELETE", headers: { Authorization: "Bearer fixture-bearer" } }), env, context);
+    expect(changed.status).toBe(500);
+    expect(changed.headers.get("X-Docs-Delete-Result")).toBeNull();
+  } finally { release(); await fixture.dispose(); }
 }, 20_000);

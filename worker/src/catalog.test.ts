@@ -499,8 +499,10 @@ describe("persistent library HTTP admission", () => {
         [{ Cookie: cookie, "X-CSRF-Token": session.csrfToken, "Sec-Fetch-Site": "same-site" }, 403],
         [{ Cookie: cookie, "X-CSRF-Token": session.csrfToken, "X-Docs-Catalog": "" }, 403],
       ] as const) {
-        const response = await app.catalog.fetch(jsonRequest(path, "POST", body(), headers));
+        const input = jsonRequest(path, "POST", body(), headers);
+        const response = await app.catalog.fetch(input);
         expect(response.status).toBe(status);
+        expect(input.bodyUsed).toBe(false);
         privateHeaders(response);
       }
     }
@@ -518,7 +520,9 @@ describe("persistent library HTTP admission", () => {
       app.search.mockRejectedValueOnce(new LibraryIndexError(code, "SELECT private storage key", !retryable));
       const response = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", searchRequest(), headers));
       expect(response.status).toBe(status);
-      expect(await response.json()).toMatchObject({ error: { code, retryable } });
+      const payload = await response.json();
+      expect(payload).toMatchObject({ error: { code, retryable } });
+      expect(JSON.stringify(payload)).not.toMatch(/SELECT|private storage key/);
       privateHeaders(response);
     }
     app.search.mockRejectedValueOnce(new Error("D1_ERROR SELECT private storage key"));
