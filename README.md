@@ -361,6 +361,7 @@ storage pause. The scale proof seeds 5,000 cached native D1/FTS rows once (48 ha
 native R2 sources), then drives the compiled UI/backend without HTTP data stubs:
 
 ```sh
+cd worker
 npm run integration:persistent
 # In a separate retained server terminal, choose unused loopback ports:
 DOCS_LOCAL_RUN=persistent-index-scale DOCS_FIXTURE_MODE=scale DOCS_PUBLIC_PORT=19177 DOCS_CATALOG_PORT=19178 npm run integration:serve

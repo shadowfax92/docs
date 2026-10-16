@@ -73,20 +73,58 @@ try {
   assert((await page.locator('article[data-id]').first().innerText()).includes('2 matches'));
   await page.locator('article[data-id] mark').first().waitFor();
   check('real bounded regex continuations, exact counts and snippet highlights');
-  // Pause one real response to exercise the browser's async handoff with newer input.
-  let release, arrived;
+  // Both replies stay real/authenticated. Hold the latest one after releasing an obsolete
+  // successful reply, so a transient overwrite cannot hide behind the eventual correct result.
+  let release, arrived, releaseLatest, arrivedLatest, delayedSuccess, latestSuccess, gateFailure;
   const gate = new Promise(r => release = r), reached = new Promise(r => arrived = r);
+  const latestGate = new Promise(r => releaseLatest = r), latestReached = new Promise(r => arrivedLatest = r);
+  const waitForGate = async (promise, label) => {
+    let timer;
+    try { await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 30_000); })]); }
+    finally { clearTimeout(timer); }
+    if (gateFailure) throw gateFailure;
+  };
   await page.route('**/all-docs/api/search', async route => {
-    const payload = route.request().postDataJSON();
-    if (payload.query.text === 'Database' && !payload.cursor) {
-      const response = await route.fetch(); arrived(); await gate;
-      try { await route.fulfill({ response }); } catch { /* A replaced request may already be aborted. */ }
-    } else await route.continue();
+    try {
+      const payload = route.request().postDataJSON();
+      if (['Database', 'policy-handbook-2345'].includes(payload.query.text) && !payload.cursor) {
+        // APIRequestContext does not synthesize browser Fetch Metadata. Preserve every original
+        // header, including Cookie/Origin/Sec-Fetch-Site/CSRF, without printing or persisting them.
+        const forwarded = await route.request().allHeaders();
+        assert(forwarded.cookie && forwarded['x-csrf-token'], 'gated request must retain browser session and CSRF');
+        // The intercepted protocol request can omit browser-generated Fetch Metadata. Supply
+        // its known same-origin context explicitly for this Node-side HTTP adapter.
+        const response = await route.fetch({ headers: { ...forwarded, origin: cat, 'sec-fetch-site': 'same-origin', 'x-docs-catalog': '1' } });
+        assert.equal(response.status(), 200, 'delayed real search must authenticate');
+        const body = await response.json();
+        if (payload.query.text === 'Database') {
+          assert(body.hits.length > 0, 'obsolete success must contain actual cached hits');
+          delayedSuccess = { status: response.status(), hits: body.hits.length, complete: body.complete, generation: body.generation };
+          arrived(); await gate;
+        } else {
+          latestSuccess = { status: response.status(), hits: body.hits.length, complete: body.complete, generation: body.generation };
+          arrivedLatest(); await latestGate;
+        }
+        await route.fulfill({ response });
+      } else await route.continue();
+    } catch (error) {
+      gateFailure = error; arrived(); arrivedLatest();
+      await route.abort().catch(() => {});
+    }
   });
-  await search.fill('Database'); await reached; await search.fill('policy-handbook-2345'); release();
-  await query('policy-handbook-2345', 1); await page.unroute('**/all-docs/api/search');
-  assert.equal(await page.locator('article[data-id]').getAttribute('data-id'), 'C0002345');
-  check('latest-only typing discards delayed obsolete real response');
+  try {
+    await search.fill('Database'); await waitForGate(reached, 'obsolete authenticated search'); await search.fill('policy-handbook-2345');
+    await page.waitForFunction(() => document.querySelector('#search').value === 'policy-handbook-2345' && document.querySelector('.grid').classList.contains('stale'));
+    const cards = () => page.locator('article[data-id]').evaluateAll(es => es.map(e => ({ id: e.dataset.id, text: e.innerText })));
+    const beforeObsolete = await cards();
+    release(); await waitForGate(latestReached, 'held latest search');
+    await page.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
+    assert.deepEqual(await cards(), beforeObsolete, 'obsolete successful hits must never replace held cards');
+    releaseLatest();
+    await query('policy-handbook-2345', 1);
+    assert.equal(await page.locator('article[data-id]').getAttribute('data-id'), 'C0002345');
+    check('latest-only typing discards delayed obsolete real response', { delayedSuccess, latestSuccess, visibleCardsUnchangedWhileLatestHeld: true });
+  } finally { release(); releaseLatest(); await page.unroute('**/all-docs/api/search'); }
   let cut = false;
   await page.route('**/all-docs/api/search', async route => {
     const input = route.request().postDataJSON();
