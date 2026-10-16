@@ -2,7 +2,7 @@
  * Library view for the private catalog at /all-docs (catalog origin only).
  *
  * Renders `CatalogClient` state into the trusted shell and turns user intent into client calls;
- * HTTP, worker messaging, selection and review rules all live in catalog-client.ts. This file is
+ * HTTP, search coordination, selection and review rules all live in catalog-client.ts. This file is
  * loaded as a classic blocking script from <head>: the theme is applied before first paint, and
  * everything else waits for DOMContentLoaded. The bundle must therefore stay free of exports.
  *
@@ -18,12 +18,12 @@
 import {
   AGE_PRESETS, CatalogClient, FILE_KINDS, KIND_LABEL, RENDER_STEP, SORT_LABEL, describeWindow, displayTitle,
   filtersFromParams, filtersToParams, formatBytes, formatDate, formatDateTime, formatRelative,
-  type AgePreset, type ContentProgress, type DeleteOutcome, type Filters, type ReviewState, type SearchPort, type SortKey,
+  type AgePreset, type DeleteOutcome, type Filters, type ReviewState, type ScopeCoverage, type SortKey,
 } from "./catalog-client";
 import { CardPreviews, previewKey } from "./card-preview";
 import { coverageNote } from "./coverage-note";
+import type { Snippet } from "./persistent-search";
 import type { DocumentSummary, FileKind } from "../contracts";
-import type { SearchHit, SearchWorkerResponse } from "../search";
 
 // ---------------------------------------------------------------------------------------------
 // Theme: runs synchronously in <head>. Light by default; one moon/sun toggle, saved per origin.
@@ -52,7 +52,6 @@ function boot(): void {
   try {
     const client = new CatalogClient({
       fetch: (input, init) => fetch(input, init),
-      openSearch: openSearchWorker,
       now: () => Date.now(),
     }, new URLSearchParams(location.hash.slice(1)));
     new LibraryApp(client).mount();
@@ -65,18 +64,6 @@ function boot(): void {
     if (message) message.textContent = "The library couldn't start in this browser.";
     console.error(error);
   }
-}
-
-/** Browser adapter for the search seam: one dedicated worker per session, terminated on lock. */
-function openSearchWorker(handlers: { message(reply: SearchWorkerResponse): void; failure(reason: string): void }): SearchPort {
-  const worker = new Worker("/all-docs/assets/search-worker.js", { type: "module", name: "docs-search" });
-  worker.onmessage = (event: MessageEvent<SearchWorkerResponse>) => handlers.message(event.data);
-  worker.onerror = (event) => {
-    event.preventDefault();
-    handlers.failure("Content search stopped working in this tab.");
-  };
-  worker.onmessageerror = () => handlers.failure("Content search sent an unreadable reply.");
-  return { post: (message) => worker.postMessage(message), terminate: () => worker.terminate() };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -509,7 +496,8 @@ class LibraryApp {
     this.countTimer = setTimeout(() => {
       this.countTimer = null;
       if (this.client.view !== "library") return;
-      if (this.client.filters.text && this.client.search.status === "pending") return this.announceCountSoon();
+      const search = this.client.searchState();
+      if (this.client.filters.text && !search.complete && !search.failure) return this.announceCountSoon();
       const count = this.client.results().matching.length;
       this.announce(this.client.filters.text ? `${plural(count, "document")} ${count === 1 ? "matches" : "match"}` : plural(count, "document"));
     }, 500);
@@ -670,15 +658,14 @@ class LibraryApp {
   private renderLibrary(): void {
     const client = this.client;
     const results = client.results();
-    const progress = client.contentProgress();
     this.renderHeader();
     this.renderToolbar(results.olderThan90);
     this.renderKinds(results.kindCounts);
-    this.renderBanner(progress);
+    this.renderBanner();
     this.renderResultsHead(results.matching.length, results.visible.length);
-    this.renderCoverage(progress);
+    this.renderCoverage(results.scope, results.provisional);
     this.renderGrid();
-    this.renderMoreAndEmpty(results.visible.length, progress);
+    this.renderMoreAndEmpty(results.visible.length, results.scope);
     this.renderBar(results.hiddenSelected);
     this.renderReview();
   }
@@ -689,8 +676,9 @@ class LibraryApp {
     const scan = client.scan;
     const refs = this.refs;
     if (scan.status === "running" || scan.status === "idle") {
-      refs.subtitle.textContent = `Scanning storage… ${plural(docs.length, "found", "found")}`;
-      replace(refs.scanLine, "Documents appear as they are found.");
+      refs.subtitle.textContent = `Loading the library… ${plural(docs.length, "found", "found")}`;
+      replace(refs.scanLine, "Documents appear as they load.");
+      delete refs.scanLine.dataset.key;
       return;
     }
     const bytes = docs.reduce((sum, doc) => sum + doc.sizeBytes, 0);
@@ -701,12 +689,16 @@ class LibraryApp {
     const refresh = h("button", { type: "button", class: "text-button" }, "Refresh");
     refresh.addEventListener("click", () => client.refresh());
     const finished = scan.finishedAt
-      ? h("time", { datetime: new Date(scan.finishedAt).toISOString() }, `scanned ${new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(scan.finishedAt)}`)
+      ? h("time", { datetime: new Date(scan.finishedAt).toISOString() }, `loaded ${new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(scan.finishedAt)}`)
       : null;
-    const key = `${scan.finishedAt}|${scan.status}`;
+    // Background indexing is a library fact from the index status, not something each query does.
+    const status = client.libraryStatus();
+    const indexing = status?.storage.paused ? "content indexing paused"
+      : status?.counts.pending ? `${plural(status.counts.pending, "document")} awaiting content indexing` : null;
+    const key = `${scan.finishedAt}|${scan.status}|${indexing}`;
     if (refs.scanLine.dataset.key !== key) {
       refs.scanLine.dataset.key = key;
-      replace(refs.scanLine, finished, finished ? " · " : null, refresh);
+      replace(refs.scanLine, finished, finished ? " · " : null, indexing, indexing ? " · " : null, refresh);
     }
   }
 
@@ -741,15 +733,16 @@ class LibraryApp {
     refs.cutoffText.textContent = line ?? "";
     (refs.cutoff.lastElementChild as HTMLElement).hidden = filters.age === "range";
 
-    const search = client.search;
+    const search = client.searchState();
     let error = "";
-    if (search.status === "error") {
-      error = search.message ?? "This pattern can't be searched.";
-      if (search.hits && search.hitsKey) error += " Showing results for the last valid pattern.";
+    if (search.failure?.kind === "pattern") {
+      error = search.failure.message;
+      if (search.held && !search.current) error += " Showing results for the last valid pattern.";
     }
     if (refs.searchError.textContent !== error) refs.searchError.textContent = error;
-    refs.search.setAttribute("aria-invalid", String(search.status === "error"));
-    refs.grid.classList.toggle("stale", search.status === "error" && !!search.hits);
+    refs.search.setAttribute("aria-invalid", String(search.failure?.kind === "pattern"));
+    // An earlier input's results stay on screen, dimmed, until the latest input's first reply.
+    refs.grid.classList.toggle("stale", search.held && !search.current);
   }
 
   private renderKinds(counts: Map<FileKind, number>): void {
@@ -780,34 +773,49 @@ class LibraryApp {
     if (railFocus) this.refs.railList.querySelector<HTMLElement>(`[data-kind="${railFocus}"]`)?.focus();
   }
 
-  private renderBanner(progress: ContentProgress): void {
+  private renderBanner(): void {
     const client = this.client;
     const banner = this.refs.banner;
     const scan = client.scan;
+    const search = client.searchState();
+    const refreshButton = (primary: boolean) => {
+      const refresh = h("button", { type: "button", class: primary ? "pill secondary" : "text-button" }, "Refresh");
+      refresh.addEventListener("click", () => client.refresh());
+      return refresh;
+    };
     let content: Child[] | null = null;
-    if (scan.status === "error") {
+    let danger = false;
+    if (scan.status === "error" && scan.stale) {
+      // Its cursor is bound to the old generation, so only a fresh listing can continue.
+      content = [`${scan.error ?? "The library changed while it loaded."} Refresh to load it again.`, refreshButton(true)];
+      danger = true;
+    } else if (scan.status === "error") {
       const retry = h("button", { type: "button", class: "pill secondary" }, "Retry");
       retry.addEventListener("click", () => client.retryScan());
-      // Listing cursors are signed and expire, so a stale one needs a fresh scan rather than a retry.
-      const refresh = h("button", { type: "button", class: "text-button" }, "Refresh");
-      refresh.addEventListener("click", () => client.refresh());
-      content = [`${scan.error ?? "Couldn't reach storage."} The documents found so far stay listed.`, retry, refresh];
+      content = [`${scan.error ?? "Couldn't reach the library."} The documents loaded so far stay listed.`, retry, refreshButton(false)];
+      danger = true;
     } else if (scan.status === "incomplete") {
-      const refresh = h("button", { type: "button", class: "pill secondary" }, "Refresh");
-      refresh.addEventListener("click", () => client.refresh());
-      content = [`${scan.error ?? "The storage listing is incomplete."} Select all is disabled until a complete scan.`, refresh];
-    } else if (client.search.status === "timeout" && client.filters.text) {
-      content = ["Search stopped early (2-second limit). Results are incomplete — narrow the pattern or add filters. The content index is being rebuilt."];
-    } else if (client.search.status === "unavailable" && client.filters.text) {
-      content = [`Content search is unavailable: ${client.search.message ?? "the search worker stopped"}. Filters, sorting and deletion still work.`];
-    } else if (progress.budgetExceeded && client.filters.text) {
-      content = ["Search indexing stopped at this tab's memory or document limit. Search results are incomplete and Select all is disabled while searching."];
+      content = [`${scan.error ?? "The library listing is incomplete."} Select all is disabled until a complete listing.`, refreshButton(true)];
+      danger = true;
+    } else if (client.filters.text && search.failure?.kind === "unavailable") {
+      // A retryable backend failure is shown as such, never as an empty result list.
+      const retry = h("button", { type: "button", class: "pill secondary" }, "Retry");
+      retry.addEventListener("click", () => client.retrySearch());
+      content = [`${search.failure.message} Filters, sorting and deletion still work.`, retry];
+      danger = true;
+    } else if (client.filters.text && search.failure?.kind === "changing") {
+      content = [search.failure.message, refreshButton(true)];
+      danger = true;
+    } else if (client.filters.text && search.failure?.kind === "budget") {
+      content = [search.failure.message];
+    } else if (client.libraryChanged()) {
+      content = ["The library changed since it loaded. Refresh to see the latest documents.", refreshButton(false)];
     }
     const key = content ? content.map((part) => typeof part === "string" ? part : "btn").join("|") : "";
     if (banner.dataset.key === key) return;
     banner.dataset.key = key;
     banner.hidden = !content;
-    banner.classList.toggle("danger", scan.status === "error" || scan.status === "incomplete");
+    banner.classList.toggle("danger", danger);
     replace(banner, content ?? []);
   }
 
@@ -817,11 +825,13 @@ class LibraryApp {
     const total = client.observed().length;
     const filtered = client.filters.text !== "" || client.filters.kinds.length > 0 || client.filters.age !== "any";
     let label: string;
+    const search = client.searchState();
     if (client.selectedOnly) label = `${plural(visible, "selected document")}`;
-    else if (client.filters.text && client.search.hitsKey === null && client.search.status === "pending") label = "Searching…";
+    else if (client.filters.text && !search.current && !search.failure) label = "Searching…";
     else if (client.filters.text) {
       const matches = client.results().matching.reduce((sum, doc) => sum + (client.hitFor(doc)?.matchCount ?? 0), 0);
-      label = `${plural(matching, "document")} · ${plural(matches, "match", "matches")}`;
+      const partial = search.current && !search.complete;
+      label = `${plural(matching, "document")}${partial ? " so far" : ""} · ${plural(matches, "match", "matches")}`;
     } else label = filtered ? `${matching.toLocaleString("en-US")} of ${plural(total, "document")}` : plural(total, "document");
     refs.resultsLabel.textContent = label;
 
@@ -871,48 +881,65 @@ class LibraryApp {
     replace(refs.selectGroup, parts);
   }
 
-  private renderCoverage(progress: ContentProgress): void {
+  /**
+   * One line of truthful coverage under the results label while searching: whether the search is
+   * still running or final, how much of the filtered scope has indexed text, and which documents
+   * were matched by name only (no extractable text, unreadable, not indexed yet, failed or paused).
+   */
+  private renderCoverage(scope: ScopeCoverage, provisional: boolean): void {
     const client = this.client;
     const coverage = this.refs.coverage;
     if (!client.filters.text) {
       coverage.hidden = true;
       return;
     }
+    const search = client.searchState();
+    const count = (value: number) => value.toLocaleString("en-US");
     const parts: string[] = [];
-    if (progress.complete) {
-      const finished = progress.failed || progress.skipped ? "Indexing finished" : "Complete";
-      parts.push(`${finished} · content searched in ${plural(progress.searched, "document")}`);
-    } else {
-      parts.push(`Content searched in ${progress.searched.toLocaleString("en-US")} of ${plural(progress.total, "document")}`);
+    if (search.phase === "scanning" && search.current) {
+      // Regex and some case-insensitive Unicode queries scan stored text in bounded slices.
+      parts.push(`Searching cached content… ${plural(client.results().matching.length, "document")} matched so far`);
+    } else if (!search.current && !search.failure) {
+      parts.push("Searching…");
+    } else if (search.complete) {
+      parts.push(scope.pending || scope.failed
+        ? `Search finished · content searched in ${count(scope.searchable)} of ${plural(scope.total, "document")}`
+        : `Complete · content searched in ${plural(scope.searchable, "document")}`);
     }
-    if (progress.nameOnly) {
-      const kinds = progress.nameOnlyKinds.map((kind) => KIND_LABEL[kind]).join(", ");
-      parts.push(`${progress.nameOnly.toLocaleString("en-US")} by name only${kinds ? ` (${kinds})` : ""}`);
+    if (scope.nameOnly) {
+      const kinds = scope.nameOnlyKinds.map((kind) => KIND_LABEL[kind]).join(", ");
+      parts.push(`${count(scope.nameOnly)} by name only${kinds ? ` (${kinds})` : ""}`);
     }
-    if (progress.truncated) parts.push(`${progress.truncated.toLocaleString("en-US")} searched partially`);
-    if (progress.unreadable) parts.push(`${progress.unreadable.toLocaleString("en-US")} unreadable (searched by name)`);
-    parts.push(`Titles and filenames searched in ${plural(progress.names, "document")}`);
-    if (progress.metadataFailed) parts.push(`${progress.metadataFailed.toLocaleString("en-US")} names unavailable`);
-    if (progress.failed) parts.push(`${progress.failed.toLocaleString("en-US")} content unavailable`);
-    if (progress.skipped) parts.push(`${progress.skipped.toLocaleString("en-US")} content over the search budget`);
-    if (!progress.complete) parts.push(client.scan.status === "running" ? "scanning…" : "indexing…");
+    if (scope.truncated) parts.push(`${count(scope.truncated)} searched partially`);
+    if (scope.unreadable) parts.push(`${count(scope.unreadable)} unreadable (searched by name)`);
+    if (scope.pending) parts.push(`${count(scope.pending)} not indexed yet (searched by name)`);
+    if (scope.failed) parts.push(`${count(scope.failed)} couldn't be indexed (searched by name)`);
+    if (client.libraryStatus()?.storage.paused) parts.push("content indexing paused by the index size budget");
+    if (provisional && search.current && !search.failure) parts.push("newest first until the search finishes");
+    if (search.snippetFailure) parts.push(search.snippetFailure);
+    if (client.retry.status === "running") parts.push("retrying indexing…");
+    else if (client.retry.message) parts.push(client.retry.message);
     const text = parts.join(" · ");
-    const key = `${text}|${progress.settled}|${progress.budgetExceeded}|${client.search.status}`;
+    const retryIndexing = scope.failed > 0 && client.retry.status !== "running";
+    const retrySnippets = !!search.snippetFailure;
+    const scanning = search.phase === "scanning" && search.current;
+    const key = `${text}|${retryIndexing}|${retrySnippets}|${scanning}`;
     coverage.hidden = false;
     if (coverage.dataset.key === key) return;
     coverage.dataset.key = key;
     const children: Child[] = [h("span", null, text)];
-    if (progress.failed && !progress.budgetExceeded && client.search.status !== "unavailable") {
-      const retry = h("button", { type: "button", class: "text-button" }, "Retry");
-      retry.addEventListener("click", () => client.retryContent());
+    if (retryIndexing) {
+      const retry = h("button", { type: "button", class: "text-button" }, "Retry indexing");
+      retry.addEventListener("click", () => void client.retryIndexing());
       children.push(" ", retry);
     }
-    if (!progress.complete) {
-      children.push(h("progress", {
-        max: Math.max(1, progress.total), value: progress.settled,
-        "aria-label": `${progress.settled} of ${progress.total} documents indexed`,
-      }));
+    if (retrySnippets) {
+      const retry = h("button", { type: "button", class: "text-button" }, "Retry previews");
+      retry.addEventListener("click", () => client.retrySearch());
+      children.push(" ", retry);
     }
+    // Slice count isn't known in advance, so the bar is indeterminate rather than a guess.
+    if (scanning) children.push(h("progress", { "aria-label": "Searching cached content" }));
     replace(coverage, children);
   }
 
@@ -921,14 +948,14 @@ class LibraryApp {
     const rendered = client.rendered();
     const searching = !!client.filters.text;
     const key = [
-      this.minute, searching, client.search.hitsKey,
+      this.minute, searching, client.searchState().resultsKey,
       ...rendered.map((doc) => {
-        // Content state settles asynchronously after the card first renders. The key carries the
-        // exact coverage note the card shows, not just the status, so new coverage or reason text
-        // from the extractor always rebuilds the card.
-        const content = searching ? client.contentOf(doc.id) : null;
-        const note = content ? `${content.status}:${JSON.stringify(coverageNote(content))}` : "";
-        return `${doc.id}:${doc.version}:${client.isSelected(doc.id) ? 1 : 0}:${client.hitFor(doc)?.matchCount ?? ""}:${note}`;
+        // Snippets arrive after the counts. The key carries the exact coverage note and preview
+        // state the card shows, so a new snippet, coverage or reason always rebuilds the card.
+        const index = searching ? client.indexOf(doc.id) : null;
+        const note = index ? JSON.stringify(coverageNote(index)) : "";
+        const preview = searching ? client.snippetFor(doc)?.status ?? "" : "";
+        return `${doc.id}:${doc.version}:${client.isSelected(doc.id) ? 1 : 0}:${client.hitFor(doc)?.matchCount ?? ""}:${preview}:${note}`;
       }),
     ].join("|");
     if (key === this.gridKey) return;
@@ -1009,17 +1036,20 @@ class LibraryApp {
   }
 
   /**
-   * Match count, highlighted snippet and an honest coverage note. Partial, name-only and unreadable
-   * cards add the extractor's own reason (capped, text node only) under a neutral label; see
-   * coverage-note.ts. Full coverage and not-yet-indexed cards show no note.
+   * Match count, highlighted snippet and an honest coverage note. Snippets arrive after the counts,
+   * for rendered cards only; one the index could no longer produce says so instead of guessing.
+   * Partial, name-only, unreadable, pending and failed cards add the index's own reason (capped,
+   * text node only) under a neutral label; see coverage-note.ts. Fully indexed cards show no note.
    */
   private searchDetails(doc: DocumentSummary): Child[] {
     const hit = this.client.hitFor(doc);
-    const note = coverageNote(this.client.contentOf(doc.id));
+    const preview = this.client.snippetFor(doc);
+    const note = coverageNote(this.client.indexOf(doc.id));
     const parts: Child[] = [];
     if (hit) {
       parts.push(h("p", { class: "matches" }, plural(hit.matchCount, "match", "matches")));
-      if (hit.snippet) parts.push(h("p", { class: "snippet" }, snippet(hit)));
+      if (preview?.status === "ready" && preview.snippet) parts.push(h("p", { class: "snippet" }, snippet(preview)));
+      if (preview?.status === "unavailable") parts.push(h("p", { class: "note", "data-snippet": "unavailable" }, "Match preview unavailable"));
     }
     if (note) {
       parts.push(h("p", { class: "note", "data-coverage": "label" }, note.label));
@@ -1028,7 +1058,7 @@ class LibraryApp {
     return parts;
   }
 
-  private renderMoreAndEmpty(visible: number, progress: ContentProgress): void {
+  private renderMoreAndEmpty(visible: number, scope: ScopeCoverage): void {
     const client = this.client;
     const refs = this.refs;
     const remaining = visible - client.rendered().length;
@@ -1050,31 +1080,40 @@ class LibraryApp {
     let empty: Child[] | null = null;
     const total = client.observed().length;
     const scanning = client.scan.status === "running";
+    const search = client.searchState();
     if (visible === 0) {
       const clear = h("button", { type: "button", class: "pill secondary" }, "Clear filters");
       clear.addEventListener("click", () => {
         client.clearFilters();
         this.syncUrl(true);
       });
-      if (total === 0 && scanning) empty = [h("p", { class: "title" }, "Scanning storage…")];
+      if (total === 0 && scanning) empty = [h("p", { class: "title" }, "Loading the library…")];
       else if (total === 0 && client.scan.status === "complete") {
         empty = [h("p", { class: "title" }, "No documents yet."), h("p", { class: "mono" }, "docs upload <file>")];
       } else if (client.filters.text) {
-        if (client.search.status === "pending" && !client.search.hits) empty = [h("p", { class: "title" }, "Searching…")];
-        else if (client.search.status === "error" || client.search.status === "unavailable") {
+        const failure = search.failure;
+        if (!search.current && !failure) empty = [h("p", { class: "title" }, "Searching…")];
+        else if (failure?.kind === "pattern") {
           empty = [h("p", { class: "title" }, "The search couldn't run, so nothing is listed."),
             h("p", { class: "muted" }, "Change the pattern or clear the search to browse with filters."), clear];
+        } else if (failure) {
+          // Unavailable, too broad or a changing library: say why nothing is listed (the banner offers the remedy).
+          empty = [h("p", { class: "title" }, "The search didn't finish, so nothing is listed."), h("p", { class: "muted" }, failure.message), clear];
         } else {
-          empty = [h("p", { class: "title" }, `Nothing matches “${client.filters.text}”${progress.complete ? "." : " yet."}`)];
-          if (progress.nameOnly) {
-            empty.push(h("p", { class: "muted" }, `${plural(progress.nameOnly, "document was", "documents were")} searched by name only — PDFs, images, media and archives may have no extracted text.`));
+          empty = [h("p", { class: "title" }, `Nothing matches “${client.filters.text}”${search.complete ? "." : " yet."}`)];
+          if (scope.nameOnly) {
+            empty.push(h("p", { class: "muted" }, `${plural(scope.nameOnly, "document was", "documents were")} searched by name only — PDFs, images, media and archives may have no extracted text.`));
           }
-          if (!progress.complete) empty.push(h("p", { class: "muted" }, "Indexing is still running; more matches may appear."));
+          if (scope.pending || scope.failed) {
+            empty.push(h("p", { class: "muted" }, `${plural(scope.pending + scope.failed, "document hasn't", "documents haven't")} been indexed and ${scope.pending + scope.failed === 1 ? "was" : "were"} searched by name only.`));
+          }
+          if (!search.complete) empty.push(h("p", { class: "muted" }, "Still searching cached content; more matches may appear."));
           empty.push(clear);
         }
       } else if (total > 0) empty = [h("p", { class: "title" }, "No documents match these filters."), clear];
     }
-    const key = empty ? `${visible}|${total}|${scanning}|${client.filters.text}|${client.search.status}|${progress.complete}|${progress.nameOnly}` : "";
+    const key = empty ? [visible, total, scanning, client.filters.text, search.phase, search.current, search.failure?.message,
+      scope.nameOnly, scope.pending, scope.failed].join("|") : "";
     refs.empty.hidden = !empty;
     if (refs.empty.dataset.key !== key) {
       refs.empty.dataset.key = key;
@@ -1297,7 +1336,7 @@ function tally(review: ReviewState) {
 }
 
 /** Builds snippet text with <mark> around validated UTF-16 ranges; never parses markup. */
-function snippet(hit: SearchHit): Child[] {
+function snippet(hit: Extract<Snippet, { status: "ready" }>): Child[] {
   const text = hit.snippet;
   const ranges = (Array.isArray(hit.ranges) ? hit.ranges : [])
     .filter((range) => Array.isArray(range) && Number.isInteger(range[0]) && Number.isInteger(range[1])
