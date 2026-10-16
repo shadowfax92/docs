@@ -638,10 +638,10 @@ class LibraryApp {
     const refs = this.refs;
     if (!this.gridKey && !refs.grid.childElementCount && !refs.subtitle.textContent) return;
     if (refs.review.open) refs.review.close();
-    for (const region of [refs.grid, refs.railList, refs.chipRow, refs.review, refs.bar, refs.empty, refs.coverage, refs.banner, refs.selectGroup]) {
+    for (const region of [refs.grid, refs.railList, refs.chipRow, refs.review, refs.bar, refs.empty, refs.coverage, refs.banner, refs.selectGroup, refs.searchError]) {
       region.replaceChildren();
     }
-    for (const keyed of [refs.railList, refs.selectGroup, refs.banner, refs.coverage, refs.more, refs.empty, refs.bar, refs.scanLine]) {
+    for (const keyed of [refs.railList, refs.selectGroup, refs.banner, refs.coverage, refs.more, refs.empty, refs.bar, refs.scanLine, refs.searchError]) {
       delete keyed.dataset.key;
     }
     refs.search.value = "";
@@ -734,14 +734,22 @@ class LibraryApp {
     refs.cutoffText.textContent = line ?? "";
     (refs.cutoff.lastElementChild as HTMLElement).hidden = filters.age === "range";
 
+    // Every search failure is told under the search field (its aria-describedby), with the remedy:
+    // edit the pattern, Retry a retryable failure (a scan resumes from its cursor), or Refresh.
     const search = client.searchState();
-    let error = "";
-    if (search.failure?.kind === "pattern") {
-      error = search.failure.message;
-      if (search.held && !search.current) error += " Showing results for the last valid pattern.";
+    const failure = filters.text ? search.failure : null;
+    let error = failure?.message ?? "";
+    if (failure?.kind === "pattern" && search.held && !search.current) error += " Showing results for the last valid pattern.";
+    if (failure?.kind === "unavailable") error += " Filters, sorting and deletion still work.";
+    const action = failure?.kind === "unavailable" ? "Retry" : failure?.kind === "changing" ? "Refresh" : null;
+    const errorKey = `${error}|${action}`;
+    if (refs.searchError.dataset.key !== errorKey) {
+      refs.searchError.dataset.key = errorKey;
+      const button = action ? h("button", { type: "button", class: "text-button" }, action) : null;
+      button?.addEventListener("click", () => action === "Retry" ? client.retrySearch() : client.refresh());
+      replace(refs.searchError, error, button ? " " : null, button);
     }
-    if (refs.searchError.textContent !== error) refs.searchError.textContent = error;
-    refs.search.setAttribute("aria-invalid", String(search.failure?.kind === "pattern"));
+    refs.search.setAttribute("aria-invalid", String(failure?.kind === "pattern"));
     // An earlier input's results stay on screen, dimmed, until the latest input's first reply.
     refs.grid.classList.toggle("stale", search.held && !search.current);
   }
@@ -804,18 +812,8 @@ class LibraryApp {
     } else if (scan.status === "incomplete") {
       content = [`${scan.error ?? "The library listing is incomplete."} Select all is disabled until a complete listing.`, refreshButton(true)];
       danger = true;
-    } else if (client.filters.text && search.failure?.kind === "unavailable") {
-      // A retryable backend failure is shown as such, never as an empty result list.
-      const retry = h("button", { type: "button", class: "pill secondary" }, "Retry");
-      retry.addEventListener("click", () => client.retrySearch());
-      content = [`${search.failure.message} Filters, sorting and deletion still work.`, retry];
-      danger = true;
-    } else if (client.filters.text && search.failure?.kind === "changing") {
-      content = [search.failure.message, refreshButton(true)];
-      danger = true;
-    } else if (client.filters.text && search.failure?.kind === "budget") {
-      content = [search.failure.message];
-    } else if (client.libraryChanged()) {
+    } else if (client.libraryChanged() && !(client.filters.text && search.failure)) {
+      // Search failures, a changing library included, are told under the search field instead.
       content = ["The library changed since it loaded. Refresh to see the latest documents.", refreshButton(false)];
     }
     const key = content ? content.map((part) => typeof part === "string" ? part : "btn").join("|") : "";

@@ -949,18 +949,17 @@ export class CatalogClient {
       }
       // Hits and snapshot must describe the same library state, or "all matching" could miss changes.
       if (held.generation !== scan.generation) return { ok: false, reason: "The library changed since it loaded — Refresh to select all matching" };
-      // A pending or failed row may hold body matches the index can't see yet.
-      const scope = this.results().scope;
-      if (scope.pending) {
-        return { ok: false, reason: `Unavailable: ${noun(scope.pending, "document in these filters isn't", "documents in these filters aren't")} indexed yet` };
-      }
-      if (scope.failed) {
-        return { ok: false, reason: `Unavailable: ${noun(scope.failed, "document", "documents")} couldn't be indexed — retry ${scope.failed === 1 ? "it" : "them"} first` };
-      }
     }
-    // Without query text every snapshot document in the filters matches, whatever its index state,
-    // so pending or failed rows don't make the set incomplete (and a paused size budget must not
-    // block age-based cleanup).
+    // Frozen contract: no pending or failed row inside the type/age filters, with or without query
+    // text (a pending row may hold body matches the index can't see yet). Rows outside the filters
+    // don't count, and explicit refs or page selection stay available meanwhile.
+    const scope = this.results().scope;
+    if (scope.pending) {
+      return { ok: false, reason: `Unavailable: ${noun(scope.pending, "document in these filters isn't", "documents in these filters aren't")} indexed yet` };
+    }
+    if (scope.failed) {
+      return { ok: false, reason: `Unavailable: ${noun(scope.failed, "document", "documents")} couldn't be indexed — retry ${scope.failed === 1 ? "it" : "them"} first` };
+    }
     const count = this.results().matching.length;
     if (count === 0) return { ok: false, reason: "Nothing matches" };
     return { ok: true, count };

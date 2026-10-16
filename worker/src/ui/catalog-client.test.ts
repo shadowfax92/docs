@@ -949,14 +949,6 @@ describe("catalog client: coverage and select all", () => {
     client.setFilters({ kinds: ["markdown"] }); // The pending PDF leaves the scope.
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: 1 document couldn't be indexed — retry it first" });
 
-    // Without a query every document in the filters matches whatever its index state, so pending
-    // and failed rows don't block it (age cleanup must keep working under a paused size budget).
-    client.setFilters({ text: "", kinds: [] });
-    expect(client.selectAllGate()).toEqual({ ok: true, count: 5 });
-    await type(client, "Document");
-    await searched(client);
-    client.setFilters({ kinds: ["markdown"] });
-
     await client.retryIndexing();
     const retry = catalog.requests("POST", "/all-docs/api/index/retry")[0];
     expect(retry.body).toEqual({ version: 1, refs: [{ id: "doc00003", version: "v1-doc00003" }] });
@@ -967,6 +959,35 @@ describe("catalog client: coverage and select all", () => {
     // A known change makes the snapshot stale for the empty query too.
     await type(client, "");
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "The library changed since it loaded — Refresh to select all matching" });
+  });
+
+  it("refuses select all for the empty query while pending or failed rows are in the filtered scope", async () => {
+    const docs = [
+      doc(1, { kind: "pdf" }, { state: "pending", coverage: null, indexedBytes: 0 }),
+      doc(2, { kind: "office" }, { state: "failed", coverage: null, reason: "Extraction failed." }),
+      doc(3), doc(4, { uploadedAt: new Date(NOW - 120 * DAY).toISOString() }),
+    ];
+    const { client } = setup([docs]);
+    await ready(client);
+
+    // Frozen contract: the guard holds without query text too.
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: 1 document in these filters isn't indexed yet" });
+    client.setFilters({ kinds: ["office", "markdown"] });
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: 1 document couldn't be indexed — retry it first" });
+    // Rows outside the type or age filters don't block it.
+    client.setFilters({ kinds: ["markdown"] });
+    expect(client.selectAllGate()).toEqual({ ok: true, count: 2 });
+    client.setFilters({ kinds: [], age: "gt90" });
+    expect(client.selectAllGate()).toEqual({ ok: true, count: 1 });
+    expect(client.selectAllMatching()).toBe(true);
+
+    // Explicit refs and page selection stay available while the gate refuses.
+    client.clearSelection();
+    client.setFilters({ age: "any" });
+    expect(client.selectAllMatching()).toBe(false);
+    client.selectPage();
+    expect(client.selectedIds().size).toBe(4);
+    expect(client.openReview()?.items).toHaveLength(4);
   });
 
   it("keeps page selection usable while a progressive search is still running", async () => {

@@ -408,6 +408,30 @@ try {
   assert.deepEqual(searchBodies.map((body) => body.cursor ?? null), [null, `g${generation}s1000`, `g${generation}s2000`, `g${generation}s3000`, `g${generation}s4000`]);
   check('progressive regex: "Searching cached content…" with partial counts, select all waits, continuations carry the cursor', { scanning, slices });
 
+  // 6b. A transport failure mid-scan is told under the search field; Retry resumes from the cursor.
+  let cut = false;
+  await page.route('**/all-docs/api/search', async (route) => {
+    const input = route.request().postDataJSON();
+    if (input.query.text === 'pa[iy]d ' && input.cursor && !cut) { cut = true; await route.abort('failed'); }
+    else await route.continue();
+  });
+  searchBodies.length = 0;
+  await page.locator('#search').fill('pa[iy]d ');
+  await page.waitForFunction(() => /Couldn't reach the library to continue this search/.test(document.querySelector('#search-error')?.textContent ?? ''), null, { timeout: 15000 });
+  const failed = await page.evaluate(() => ({
+    error: document.querySelector('#search-error')?.textContent, invalid: document.querySelector('#search')?.getAttribute('aria-invalid'),
+    listed: document.querySelectorAll('article[data-id]').length,
+    selectAll: [...document.querySelectorAll('.select-group button')].find((b) => b.textContent.startsWith('Select all'))?.disabled,
+  }));
+  assert(cut && failed.listed > 0 && failed.selectAll === true && failed.invalid === 'false');
+  await page.locator('#search-error button', { hasText: 'Retry' }).click();
+  await page.waitForFunction(() => /^Search finished/.test(document.querySelector('.coverage span')?.textContent ?? '') && !document.querySelector('#search-error').textContent, null, { timeout: 20000 });
+  await page.unroute('**/all-docs/api/search');
+  assert.equal(searchBodies.filter((body) => body.cursor === `g${generation}s1000`).length, 2, 'Retry resends the failed continuation');
+  check('transport failure mid-scan shows under the search field with Retry; partial results stay; Retry resumes the cursor', { failed });
+  await page.locator('#search').fill('pa[iy]d');
+  await page.waitForFunction(() => /^Search finished/.test(document.querySelector('.coverage span')?.textContent ?? ''), null, { timeout: 20000 });
+
   // 7. Select all requires a clean scope; the frozen review sends exact refs in ≤100 batches.
   await page.locator('.rail input[data-kind="text"]').check();
   await page.waitForFunction(() => [...document.querySelectorAll('.select-group button')].some((b) => /^Select all [\d,]+ matching$/.test(b.textContent) && !b.disabled), null, { timeout: 10000 });
