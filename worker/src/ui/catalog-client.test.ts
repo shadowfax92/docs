@@ -813,7 +813,8 @@ describe("catalog client: snippets", () => {
     catalog.release(); // Snippets: stale_generation.
     await flush();
 
-    expect(client.searchState()).toMatchObject({ held: true, current: true, complete: true });
+    expect(client.searchState()).toMatchObject({ held: true, current: true, complete: true, phase: "pending" });
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "Available when the search finishes" });
     expect(catalog.searches()).toHaveLength(2);
     catalog.release(); // Fresh search at generation 8.
     await flush();

@@ -907,7 +907,10 @@ export class CatalogClient {
       const search = this.search;
       const held = search?.results ?? null;
       if (search?.failure) return { ok: false, reason: "Unavailable while the search reports an error" };
-      if (!held || held.key !== key || !held.complete) return { ok: false, reason: "Available when the search finishes" };
+      // phase covers a restart still running behind complete results that stay on screen.
+      if (!held || held.key !== key || !held.complete || search?.phase !== "complete") {
+        return { ok: false, reason: "Available when the search finishes" };
+      }
       // Hits and snapshot must describe the same library state, or "all matching" could miss changes.
       if (held.generation !== scan.generation) return { ok: false, reason: "The library changed since it loaded — Refresh to select all matching" };
       // A pending or failed row may hold body matches the index can't see yet.
