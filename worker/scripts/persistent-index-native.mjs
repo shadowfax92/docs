@@ -11,7 +11,7 @@ import { createHash } from 'node:crypto';
 process.env.DOCS_LOCAL_RUN ||= `persistent-index-operator-${Date.now()}`;
 process.env.DOCS_PUBLIC_PORT ||= '19077'; process.env.DOCS_CATALOG_PORT ||= '19078';
 process.env.DOCS_FIXTURE_MODE = 'operator';
-const { runtime, seed, state, catalogOrigin: cat, password } = await import('./integration-server.mjs');
+const { runtime, seed, state, catalogOrigin: cat, publicOrigin: pub, password, bearer } = await import('./integration-server.mjs');
 await mkdir(state, { recursive: true });
 const envFile = resolve(state, 'operator.env');
 await writeFile(envFile, `ALL_DOCS_PASSWORD=${password}\n`, { mode: 0o600 });
@@ -58,6 +58,26 @@ try {
   assert.equal(response.status, 200); assert.equal((await response.json()).hits.length, 32);
   assert.equal(await textHash(), cached);
   check('compiled backend query uses persistent stored index without text writes');
+  const badBytes = Buffer.from('not a ZIP package');
+  response = await fetch(pub + '/upload', { method: 'PUT', headers: { Authorization: `Bearer ${bearer}`,
+    'X-Filename': 'broken.docx', 'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'Content-Length': String(badBytes.length) }, body: badBytes });
+  assert.equal(response.status, 200); const bad = await response.json();
+  let failed;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    failed = await db.prepare('SELECT state,attempts,version FROM documents WHERE id=?').bind(bad.id).first();
+    if (failed?.state === 'failed') break;
+    assert(attempt < 99, 'real deferred malformed DOCX did not fail');
+    await new Promise(r => setTimeout(r, 25));
+  }
+  const failure = await operator([]); assert.equal(failure.code, 4, failure.stderr);
+  assert(!failure.stdout.includes('Complete:'));
+  assert.equal((await db.prepare('SELECT attempts FROM documents WHERE id=?').bind(bad.id).first()).attempts, failed.attempts);
+  response = await fetch(cat + '/all-docs/api/index/retry', { method: 'POST', headers,
+    body: JSON.stringify({ version: 1, refs: [{ id: bad.id, version: '0'.repeat(64) }] }) });
+  assert.equal(response.status, 200);
+  assert.equal((await db.prepare('SELECT attempts FROM documents WHERE id=?').bind(bad.id).first()).attempts, failed.attempts);
+  check('real failed extraction stops CLI; no automatic or mismatched-version retry reset');
   // Explicit fixture state exercises the real storage-pause response without changing production
   // policy or automatically raising a budget. Tombstones/retries are never reset by this CLI.
   await db.prepare("INSERT INTO index_meta(key,value) VALUES('storage',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
