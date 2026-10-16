@@ -95,15 +95,16 @@ async function main() {
     return;
   }
   let password = await passwordFrom(options.envFile);
-  const started = Date.now(), end = started + options.deadlineSeconds * 1000;
+  // A monotonic deadline stays bounded even if the machine wall clock changes mid-run.
+  const started = performance.now(), end = started + options.deadlineSeconds * 1000;
   let cookie = '', csrf = '';
   const cancellation = new AbortController();
   const cancel = () => cancellation.abort();
   process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
   async function request(path, payload) {
-    if (Date.now() >= end || cancellation.signal.aborted) fail('Stopped: deadline or cancellation; server checkpoints are retained.', 6);
+    if (performance.now() >= end || cancellation.signal.aborted) fail('Stopped: deadline or cancellation; server checkpoints are retained.', 6);
     const response = await fetch(options.origin + path, { method: payload === undefined ? 'GET' : 'POST',
-      redirect: 'error', signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(Math.max(1, end - Date.now()))]),
+      redirect: 'error', signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(Math.max(1, end - performance.now()))]),
       headers: { Origin: options.origin, 'Sec-Fetch-Site': 'same-origin', 'X-Docs-Catalog': '1',
         ...(cookie && { Cookie: cookie }), ...(csrf && { 'X-CSRF-Token': csrf }),
         ...(payload !== undefined && { 'Content-Type': 'application/json' }) },
@@ -136,10 +137,10 @@ async function main() {
     if (initial.version !== 1 || !(priorReconcile === null || typeof priorReconcile === 'string')) fail('Stopped: invalid library status.', 4);
     let previous = '', stalled = 0;
     for (let batch = 1; batch <= options.maxBatches; batch++) {
-      const remaining = end - Date.now();
+      const remaining = end - performance.now();
       if (remaining < 1000) fail('Stopped: deadline cap; server checkpoints are retained.', 6);
       const { body: report } = await request('/all-docs/api/index/maintain', { version: 1,
-        options: { ...defaults, deadlineMs: Math.min(defaults.deadlineMs, remaining - 500), reconcile: batch === 1 } });
+        options: { ...defaults, deadlineMs: Math.floor(Math.min(defaults.deadlineMs, remaining - 500)), reconcile: batch === 1 } });
       const counts = report.status?.counts;
       if (report.version !== 1 || !['complete', 'partial', 'busy', 'paused'].includes(report.outcome) || !counts
         || !['documents', 'pending', 'failed', 'indexed'].every(k => Number.isSafeInteger(counts[k]) && counts[k] >= 0)
@@ -151,7 +152,7 @@ async function main() {
       }
       const reconciled = report.status.lastReconciledAt !== priorReconcile && report.status.lastReconciledAt !== null;
       console.log(JSON.stringify({ batch, outcome: report.outcome, processed: report.processed, indexed: report.indexed,
-        pending: counts.pending, failed: counts.failed, documents: counts.documents, reconciled, elapsedMs: Date.now() - started }));
+        pending: counts.pending, failed: counts.failed, documents: counts.documents, reconciled, elapsedMs: Math.round(performance.now() - started) }));
       if (report.outcome === 'busy') fail('Stopped: busy lease; resume in a later invocation.', 2);
       if (report.outcome === 'paused' || report.status.storage.paused) fail('Stopped: storage paused; owner review required. Budget was not changed.', 3);
       if (counts.failed > 0) fail('Stopped: failed documents remain; inspect exact versions before explicit manual retry.', 4);
