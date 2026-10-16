@@ -64,7 +64,7 @@ export function createInvocationResources(database: () => D1Database, bucket: R2
   function databaseHandle<T extends D1Database | D1DatabaseSession>(native: T): T {
     return new Proxy(native, {
       get(target, property) {
-        if (property === "prepare") return (sql: string) => statement(target.prepare(sql));
+        if (property === "prepare") return (sql: string) => { singleStatement(sql); return statement(target.prepare(sql)); };
         if (property === "batch") return async (batch: D1PreparedStatement[]) => {
           const raw = batch.map((entry) => {
             const original = statements.get(entry);
@@ -106,4 +106,47 @@ export function createInvocationResources(database: () => D1Database, bucket: R2
     },
   });
   return { budget, bucket: wrappedBucket, get db() { return db ??= databaseHandle(database()); } };
+}
+
+/** D1 accepts several SQL statements in one prepared object. The ledger charges statements, so
+ * preparation rejects a second statement before even creating a native handle. This is a lexical
+ * single-statement gate, not a SQL parser: quoted strings/identifiers and comments may contain ';',
+ * but a terminator permits only whitespace/comments afterwards. Compound trigger bodies fail closed.
+ */
+function singleStatement(sql: string): void {
+  const invalid = () => { throw new Error("Budgeted D1 requires one complete SQL statement."); };
+  if (typeof sql !== "string" || sql.includes("\0")) invalid();
+  let ended = false;
+  let content = false;
+  for (let index = 0; index < sql.length; index++) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (/\s/.test(char)) continue;
+    if (char === "-" && next === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index++;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      const close = sql.indexOf("*/", index + 2);
+      if (close === -1) invalid();
+      index = close + 1;
+      continue;
+    }
+    if (ended) invalid();
+    if (char === ";") { if (!content) invalid(); ended = true; continue; }
+    content = true;
+    if (char === "'" || char === '"' || char === "`" || char === "[") {
+      const quote = char === "[" ? "]" : char;
+      let closed = false;
+      while (++index < sql.length) {
+        if (sql[index] !== quote) continue;
+        if (quote !== "]" && sql[index + 1] === quote) { index++; continue; }
+        closed = true;
+        break;
+      }
+      if (!closed) invalid();
+    }
+  }
+  if (!content) invalid();
 }

@@ -94,6 +94,27 @@ describe("one invocation's combined D1/R2 budget", () => {
     expect(scope.budget.used).toBe(2);
   });
 
+  it("rejects multi-statement prepared objects before I/O at both caps", async () => {
+    await fixture.db.prepare("CREATE TABLE budget_multi (value INTEGER)").run();
+    const scope = resources();
+    await scope.db.batch(Array.from({ length: 39 }, () => scope.db.prepare("SELECT 1")));
+    const multi = "INSERT INTO budget_multi VALUES (1); " + "INSERT INTO budget_multi VALUES (2); ".repeat(11);
+    expect(() => scope.db.prepare(multi)).toThrow(/one complete SQL statement/);
+    expect(scope.budget.used).toBe(39);
+    expect(await fixture.db.prepare("SELECT COUNT(*) AS count FROM budget_multi").first("count")).toBe(0);
+    // Quoted/commented semicolons are data, including doubled quotes and bound values.
+    expect(await scope.db.prepare("SELECT 'literal;''quote' AS value /* ; */").first("value")).toBe("literal;'quote");
+    await scope.budget.finalize(async () => {
+      await scope.db.batch(Array.from({ length: 10 }, () => scope.db.prepare("SELECT 1")));
+      expect(() => scope.db.prepare(multi)).toThrow(/one complete SQL statement/);
+      expect(scope.budget.used).toBe(50);
+    });
+    for (const sql of ["SELECT 1; SELECT 2", "SELECT 1; /* comment */ SELECT 2", "SELECT 'unterminated", "SELECT 1 /* unfinished", "SELECT 1\0; SELECT 2"]) {
+      expect(() => scope.db.prepare(sql)).toThrow(/one complete SQL statement/);
+    }
+    expect(await fixture.db.prepare("SELECT COUNT(*) AS count FROM budget_multi").first("count")).toBe(0);
+  });
+
   it("does not resolve the D1 binding for auth/public R2-only work", async () => {
     const scope = createInvocationResources(() => { throw new Error("DB binding must remain lazy"); }, fixture.bucket);
     await scope.bucket.head("Budget01/missing");
