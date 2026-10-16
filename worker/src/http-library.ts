@@ -45,7 +45,7 @@ export function httpSnippetsRequest(value: unknown): LibrarySnippetsRequest {
 }
 export function httpRetryRequest(value: unknown): SelectionRef[] {
   if (!record(value) || !fields(value, ["version", "refs"]) || value.version !== 1) return invalid();
-  return httpRefs(value.refs);
+  return httpRetryRefs(value.refs);
 }
 export function httpMaintainRequest(value: unknown, config: Readonly<LibraryConfig>): MaintainOptions {
   if (!record(value) || !fields(value, ["version", "options"]) || value.version !== 1 || !record(value.options)
@@ -60,7 +60,7 @@ export function httpMaintainRequest(value: unknown, config: Readonly<LibraryConf
     if (typeof options.reconcile !== "boolean") return invalid();
     caps.reconcile = options.reconcile;
   }
-  if (options.retry !== undefined) caps.retry = httpRefs(options.retry);
+  if (options.retry !== undefined) caps.retry = httpRetryRefs(options.retry);
   return caps;
 }
 function httpRefs(value: unknown): SelectionRef[] {
@@ -69,10 +69,18 @@ function httpRefs(value: unknown): SelectionRef[] {
   for (const ref of value) {
     // IDs, not ID/version pairs, are unique: a request cannot ask for conflicting versions.
     if (!record(ref) || !fields(ref, ["id", "version"]) || typeof ref.id !== "string" || !/^[A-Za-z0-9]{8}$/.test(ref.id)
-      || typeof ref.version !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(ref.version) || seen.has(ref.id)) return invalid();
+      || typeof ref.version !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(ref.version) || seen.has(ref.id)) return invalid();
     seen.add(ref.id);
   }
   return value as SelectionRef[];
+}
+function httpRetryRefs(value: unknown): SelectionRef[] {
+  const refs = httpRefs(value);
+  // Retry mutates stored failed versions; maintenance accepts only authoritative R2 digests.
+  // Snippet lookup may report unavailable for an opaque older ref. Legacy deletion admission
+  // stays with its existing contract; none of these checks resolve R2 or touch the database.
+  if (refs.some((ref) => !/^[a-f0-9]{64}$/.test(ref.version))) return invalid();
+  return refs;
 }
 function validQuery(value: unknown): value is SearchQuery {
   return record(value) && fields(value, ["text", "mode", "ignoreCase"]) && typeof value.text === "string"

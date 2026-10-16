@@ -481,7 +481,7 @@ function searchPage(nextCursor: string | null = null): LibrarySearchResponse {
   return { version: 1, generation: 1, hits: [], complete: nextCursor === null, nextCursor, scope: { documents: 0, pending: 0, failed: 0 }, status: libraryStatus() };
 }
 const searchRequest = () => ({ version: 1, query: { text: "needle", mode: "literal", ignoreCase: true }, filter: { kinds: [], uploadedBefore: null, uploadedAfter: null } });
-const snippetRequest = () => ({ version: 1, generation: 1, query: searchRequest().query, refs: [{ id: "Ab12Cd34", version: "v1" }] });
+const snippetRequest = () => ({ version: 1, generation: 1, query: searchRequest().query, refs: [{ id: "Ab12Cd34", version: "a".repeat(64) }] });
 const maintainRequest = () => ({ version: 1, options: { documents: 100, textBytes: 99999999, listPages: 100, deadlineMs: 99999 } });
 const newPosts = [
   ["/all-docs/api/search", searchRequest], ["/all-docs/api/snippets", snippetRequest],
@@ -562,7 +562,10 @@ describe("bounded library requests and operation-owned cursors", () => {
       ["/all-docs/api/snippets", { ...snippetRequest(), refs: [{ id: "Ab12Cd34", version: "" }] }],
       ["/all-docs/api/snippets", { ...snippetRequest(), refs: [snippetRequest().refs[0], { id: "Ab12Cd34", version: "v2" }] }],
       ["/all-docs/api/snippets", { ...snippetRequest(), refs: Array.from({ length: 49 }, (_, i) => ({ id: String(i).padStart(8, "0"), version: "v1" })) }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: [{ id: "Ab12Cd34", version: "a".repeat(129) }] }],
       ["/all-docs/api/index/retry", { version: 2, refs: [] }],
+      ["/all-docs/api/index/retry", { version: 1, refs: [{ id: "Ab12Cd34", version: "v1" }] }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, retry: [{ id: "Ab12Cd34", version: "v1" }] } }],
       ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, documents: -1 } }],
       ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, deadlineMs: 0.5 } }],
       ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, reconcile: "yes" } }],

@@ -6,6 +6,7 @@ import worker, { createWorker } from "./index";
 import type { CatalogEnv, PublicEnv, SessionResponse } from "./contracts";
 import type { LibraryPage, LibrarySearchResponse, LibrarySnippetsResponse, MaintenanceReport } from "./library-contracts";
 import { createLibraryFixture } from "./library-index.test-support";
+import { createDocuments } from "./documents";
 import type { LibraryDependencies, LibraryIndex } from "./library-index";
 
 const publicOrigin = "https://docs.example";
@@ -157,10 +158,13 @@ describe("compiled native HTTP roles", () => {
     const fixture = await nativeHttp();
     try {
       const credentials = await fixture.login();
+      await fixture.bucket.put("Retry001/fixture.txt", "retry target");
+      const document = (await createDocuments(fixture.bucket as unknown as R2Bucket, publicOrigin).resolve("Retry001"))!;
+      const ref = { id: document.summary.id, version: document.summary.version };
       await fixture.db.prepare("INSERT INTO index_meta(key,value,token,expires_at) VALUES ('maintenance-lease','',?,?)").bind("another-runner", Date.now() + 60000).run();
       for (const [path, payload] of [
-        ["/all-docs/api/index/maintain", { version: 1, options: { documents: 0, textBytes: 0, listPages: 0, deadlineMs: 0 } }],
-        ["/all-docs/api/index/retry", { version: 1, refs: [{ id: "Absent01", version: "reviewed" }] }],
+        ["/all-docs/api/index/maintain", { version: 1, options: { documents: 0, textBytes: 0, listPages: 0, deadlineMs: 20000 } }],
+        ["/all-docs/api/index/retry", { version: 1, refs: [ref] }],
       ] as const) {
         const response = await fixture.catalog.fetch(request(path, payload, credentials));
         expect(response.status).toBe(200); privateResponse(response);
