@@ -10,7 +10,7 @@ import type { LibraryErrorCode } from "../library-contracts";
 export interface LibraryConfig {
   extractorVersion: TextRecord["extractorVersion"];
   sizeBudgetBytes: number;
-  drainDocuments: number; // 12 conservative Free default; 100 maximum for an admitted Paid run.
+  drainDocuments: number; // Admission ceiling (default 12), clamped to verified combined SQL/R2 budget.
   drainTextBytes: number;
   maintenanceMs: number;
   reconcilePages: number;
@@ -52,7 +52,10 @@ export interface DeletionClaim {
   restoreVersion: string | null;
 }
 export type RecordWrite = "written" | "unchanged" | "tombstoned" | "stale";
-export interface IndexRecordResult { outcome: "indexed" | "failed" | "stale"; textBytes: number }
+/** Every text write, including upload waitUntil, checks the shared size gate. paused retains
+ * pending state and visible storage pause, without consuming failure attempts or retry spinning.
+ */
+export interface IndexRecordResult { outcome: "indexed" | "failed" | "stale" | "paused"; textBytes: number }
 
 /** records.ts owns every guarded metadata/text/FTS/tombstone/generation mutation, extraction
  * claim finalization and the Documents decorator. Maintenance selects work itself using db,

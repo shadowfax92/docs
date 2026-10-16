@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { createLibraryFixture } from "./library-index.test-support";
 
 describe("migrated local library schema", () => {
+  it("uses native workerd HTML extraction for the default fixture dependency", async () => {
+    const fixture = await createLibraryFixture();
+    try {
+      await fixture.bucket.put("Native01/page.html", "<p>Hello 😀 &amp; body</p><script>private script</script>", {
+        customMetadata: { filename: "page.html", contentType: "text/html", docName: "Native extraction" },
+      });
+      const doc = (await fixture.documents.resolve("Native01"))!;
+      expect(await fixture.deps.extract(doc)).toMatchObject({
+        id: "Native01", documentVersion: doc.summary.version,
+        coverage: "full", reason: null, text: "Hello 😀 & body",
+      });
+      await fixture.bucket.put("Native01/page.html", "<p>replacement</p>");
+      await expect(fixture.deps.extract(doc)).rejects.toThrow(/changed/);
+    } finally { await fixture.dispose(); }
+  }, 20_000);
+
   it("stores metadata/text with a stable FTS rowid and supports contentless trigram deletion", async () => {
     const fixture = await createLibraryFixture();
     try {
