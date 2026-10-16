@@ -193,9 +193,16 @@ async function catalogProof(context,shot,check) {
   const deletionBatches=batches.slice(batchStart);assert.equal(deletionBatches.length,103);assert(deletionBatches.every(b=>b.items.length===1));
   const deleted=deletionBatches.flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
   assert.deepEqual(deletionBatches.flatMap(b=>b.items).sort((a,b)=>a.id.localeCompare(b.id)),frozenRefs.sort((a,b)=>a.id.localeCompare(b.id)));
+  for(let start=0;start<deleted.length;start+=4) await Promise.all(deleted.slice(start,start+4).map(async id=>{
+    assert.equal((await fetch(pub+'/'+id+'/raw')).status,404,`deleted native source ${id}`);
+  }));
   for(const b of deletionBatches){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
   await p.getByRole('button',{name:'Done',exact:true}).click();
   check('page selection vs all 103 matching, wrong-count refusal and real 103 sequential single-ref native deletes');
+  // Successful deletes advanced persistent generation. A fresh global selection must refresh
+  // its metadata snapshot before freezing another set; explicit retained refs remain independent.
+  await p.locator('.scan-line').getByRole('button',{name:'Refresh',exact:true}).click();
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh'));
   await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('Failure cohort|Stale cohort',2);
   await p.getByRole('button',{name:'Select all 2 matching',exact:true}).click();await p.getByRole('button',{name:'Review deletion',exact:true}).click();
   const beforeStale=await(await fetch(pub+'/StaleDel/raw')).text();
