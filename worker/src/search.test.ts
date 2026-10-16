@@ -4,7 +4,7 @@ import { build } from "esbuild";
 // @ts-expect-error Node-only test adapter; the production Worker/browser targets omit Node types.
 import { Worker } from "node:worker_threads";
 import type { DocumentFilter, DocumentSummary, TextRecord } from "./contracts";
-import { createSearchIndex, type SearchQuery, type SearchWorkerRequest, type SearchWorkerResponse } from "./search";
+import { compileSearchMatcher, createSearchIndex, type SearchQuery, type SearchWorkerRequest, type SearchWorkerResponse } from "./search";
 
 const all: DocumentFilter = { kinds: [], uploadedBefore: null, uploadedAfter: null };
 const literal = (text: string, ignoreCase = true): SearchQuery => ({ text, mode: "literal", ignoreCase });
@@ -20,6 +20,45 @@ function document(id: string, body: string, changes: Partial<DocumentSummary> = 
   };
   return { summary, text };
 }
+
+describe("compiled matcher shared by browser search and server slices", () => {
+  it("preserves RE2 branch priority, field counts, Unicode folds and original UTF-16 ranges", () => {
+    const cases: [SearchQuery, number, [number, number][]][] = [
+      [literal("k"), 2, [[3, 4]]], [literal("s"), 2, [[5, 6]]],
+      [literal("д"), 2, [[7, 8]]], [literal("😀", false), 1, [[0, 2]]],
+      [{ text: "a|ab", mode: "regex", ignoreCase: false }, 4, [[9, 10], [11, 12], [13, 14]]],
+    ];
+    for (const [query, matchCount, ranges] of cases) {
+      const fields = { filename: "ab k", title: "s д", body: "😀 K ſ ᲁ ababa" };
+      const fixture = document("Seam0001", fields.body, fields);
+      const browser = createSearchIndex();
+      browser.add(fixture.summary, fixture.text);
+      const matcher = compileSearchMatcher(query);
+      try {
+        const expected = { matchCount, snippet: fields.body, ranges };
+        expect(matcher.match(fields)).toEqual(expected);
+        expect(browser.query(query, all)).toEqual([{ id: fixture.summary.id, version: fixture.summary.version, ...expected }]);
+      } finally { matcher.dispose(); }
+    }
+    const matcher = compileSearchMatcher({ text: "a|ab", mode: "regex", ignoreCase: false });
+    try {
+      expect(matcher.match({ filename: "ab", title: "aba", body: "😀ababa" }))
+        .toEqual({ matchCount: 6, snippet: "😀ababa", ranges: [[2, 3], [4, 5], [6, 7]] });
+      expect(matcher.match({ filename: "", title: "", body: "xyz" })).toBeNull();
+    } finally { matcher.dispose(); }
+  });
+
+  it("shares aggregate work across records and rejects unsupported RE2 before matching", () => {
+    expect(() => compileSearchMatcher({ text: "(?=a)", mode: "regex", ignoreCase: false })).toThrow(/RE2/);
+    const matcher = compileSearchMatcher(literal("z"));
+    const fields = { filename: "", title: "", body: "x".repeat(1024 * 1024) };
+    try {
+      for (let n = 0; n < 128; n++) expect(matcher.match(fields)).toBeNull();
+      expect(() => matcher.match(fields)).toThrow(/budget/);
+    } finally { matcher.dispose(); }
+    expect(() => matcher.match(fields)).toThrow(/disposed/);
+  });
+});
 
 describe("createSearchIndex", () => {
   it("counts nonoverlapping matches across independent fields and ranks count, newest date, then ID", () => {
