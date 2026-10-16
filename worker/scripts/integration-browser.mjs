@@ -177,13 +177,14 @@ async function catalogProof(context,shot,check) {
   assert.equal(await p.locator('dialog[open] .review-list li').count(),103);
   const confirm=p.getByRole('button',{name:'Delete 103 documents',exact:true});assert(await confirm.isDisabled());
   await p.locator('#confirm-count').fill('102');assert(await confirm.isDisabled());
+  const batchStart=batches.length;
   await p.locator('#confirm-count').fill('103');await shot(p,'catalog-exact-count-delete');await confirm.click();
   await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents');
-  assert.deepEqual(batches.slice(-2).map(b=>b.items.length),[100,3]);
-  const deleted=batches.slice(-2).flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
-  for(const b of batches.slice(-2)){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
+  const deletionBatches=batches.slice(batchStart);assert.equal(deletionBatches.length,103);assert(deletionBatches.every(b=>b.items.length===1));
+  const deleted=deletionBatches.flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
+  for(const b of deletionBatches){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
   await p.getByRole('button',{name:'Done',exact:true}).click();
-  check('page selection vs all 103 matching, wrong-count refusal and real 100+3 bounded native deletion');
+  check('page selection vs all 103 matching, wrong-count refusal and real 103 sequential single-ref native deletes');
   await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('Failure cohort|Stale cohort',2);
   await p.getByRole('button',{name:'Select all 2 matching',exact:true}).click();await p.getByRole('button',{name:'Review deletion',exact:true}).click();
   const beforeStale=await(await fetch(pub+'/StaleDel/raw')).text();
