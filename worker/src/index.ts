@@ -4,34 +4,57 @@ import { createDocuments, isUploadId, type Documents } from "./documents";
 import { extractText } from "./extract";
 import { renderDocument } from "./preview";
 import { catalogAssets } from "./ui";
+import { createLibraryIndex, type LibraryDependencies } from "./library-index";
+import { createInvocationResources } from "./invocation-budget";
+import { httpLibraryConfig, httpMaintenanceOptions } from "./http-library";
 
 /** Deployment role is selected before routing: a catalog request can never fall through to active
  * uploaded HTML. Only the public adapter sees the bearer credential; only Catalog receives secrets.
  */
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    if (!validOrigins(env) || (env.APP_ROLE !== "public" && env.APP_ROLE !== "catalog")) {
-      return unavailable();
-    }
-    const url = new URL(request.url);
-    const expectedOrigin = env.APP_ROLE === "catalog" ? env.CATALOG_ORIGIN : env.PUBLIC_DOCS_ORIGIN;
-    if (url.origin !== expectedOrigin) return unavailable();
-    const documents = createDocuments(env.DOCS_BUCKET, env.PUBLIC_DOCS_ORIGIN);
-    if (env.APP_ROLE === "catalog") {
-      return createCatalog({
-        documents, bucket: env.DOCS_BUCKET,
-        security: {
-          catalogOrigin: env.CATALOG_ORIGIN, publicOrigin: env.PUBLIC_DOCS_ORIGIN,
-          password: env.ALL_DOCS_PASSWORD, sessionKey: env.CATALOG_SESSION_KEY,
-        },
-        extract: extractText, assets: catalogAssets,
-      }).fetch(request);
-    }
-    return publicFetch(request, env, documents);
-  },
-} satisfies ExportedHandler<Env>;
+export function createWorker(libraryFactory = createLibraryIndex) {
+  function invocation(env: Env, context: Pick<ExecutionContext, "waitUntil">) {
+    // Fetch, throttle and deferred extraction share these exact resources. A fresh handler call
+    // gets a fresh ledger; waitUntil retains this invocation's ledger instead of resetting quota.
+    const resources = createInvocationResources(() => env.LIBRARY_DB, env.DOCS_BUCKET);
+    const documents = createDocuments(resources.bucket, env.PUBLIC_DOCS_ORIGIN);
+    const config = httpLibraryConfig(env.LIBRARY_SIZE_BUDGET_BYTES);
+    let library: ReturnType<typeof createLibraryIndex> | undefined;
+    return { documents, resources, config, library: () => library ??= libraryFactory({
+      get db() { return resources.db; }, documents, config, budget: resources.budget,
+      publicOrigin: env.PUBLIC_DOCS_ORIGIN, extract: extractText,
+      defer: (work) => context.waitUntil(work), now: Date.now, nonce: () => crypto.randomUUID(),
+    } satisfies LibraryDependencies) };
+  }
+  return {
+    async fetch(request: Request, env: Env, context: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
+      if (!validOrigins(env) || (env.APP_ROLE !== "public" && env.APP_ROLE !== "catalog")) return unavailable();
+      const url = new URL(request.url);
+      const expectedOrigin = env.APP_ROLE === "catalog" ? env.CATALOG_ORIGIN : env.PUBLIC_DOCS_ORIGIN;
+      if (url.origin !== expectedOrigin) return unavailable();
+      const scope = invocation(env, context);
+      if (env.APP_ROLE === "catalog") {
+        return createCatalog({
+          library: scope.library, config: scope.config, bucket: scope.resources.bucket,
+          security: {
+            catalogOrigin: env.CATALOG_ORIGIN, publicOrigin: env.PUBLIC_DOCS_ORIGIN,
+            password: env.ALL_DOCS_PASSWORD, sessionKey: env.CATALOG_SESSION_KEY,
+          }, assets: catalogAssets,
+        }).fetch(request);
+      }
+      return publicFetch(request, env, scope.documents, () => scope.library().documents);
+    },
+    scheduled(_controller: ScheduledController, env: Env, context: Pick<ExecutionContext, "waitUntil">): void {
+      // Only the catalog deployment owns maintenance. The public binding supports authenticated
+      // write upkeep, never scheduled scans or a route for index reads.
+      if (env.APP_ROLE !== "catalog" || !validOrigins(env)) return;
+      const scope = invocation(env, context);
+      context.waitUntil(scope.library().maintain(httpMaintenanceOptions(scope.config)));
+    },
+  };
+}
+export default createWorker() satisfies ExportedHandler<Env>;
 
-async function publicFetch(request: Request, env: PublicEnv, documents: Documents): Promise<Response> {
+async function publicFetch(request: Request, env: PublicEnv, documents: Documents, writes: () => Documents): Promise<Response> {
   const path = new URL(request.url).pathname.slice(1);
   if (request.method === "GET" && (path === "all-docs" || path === "all-docs/")) {
     return new Response(null, {
@@ -50,13 +73,16 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
     if (!(await isAuthorized(request, env.AUTH_TOKEN))) return new Response("Unauthorized", { status: 401 });
     try {
       if (upload) {
-        const doc = await documents.create({
+        const doc = await writes().create({
           body: request.body, filename: request.headers.get("X-Filename") || "file",
           mime: request.headers.get("Content-Type") || "", title: request.headers.get("X-Doc-Name") || "",
         });
         return Response.json({ url: doc.publicUrl, id: doc.id });
       }
-      const result = await documents.remove(id);
+      const result = await writes().remove(id);
+      // A decorator may refuse an overlapping delete as changed. The CLI must retain history
+      // until this invocation proves absence/success, rather than marking a refusal deleted.
+      if (result.status === "changed") throw new Error("Deletion did not establish absence");
       return new Response(result.status === "not-found" ? "Not found" : null, {
         status: result.status === "not-found" ? 404 : 204,
         headers: { "X-Docs-Delete-Result": result.status === "not-found" ? "not-found" : "deleted" },

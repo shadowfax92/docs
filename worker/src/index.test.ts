@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import worker from "./index";
+import { createWorker } from "./index";
+import type { Env } from "./contracts";
+// These public routing/R2 baselines isolate HTTP at the approved LibraryIndex seam. Real D1
+// decorated-write acceptance lives in http-handlers.test.ts, never in a pretend SQL adapter.
+const baseline = createWorker(({ documents }) => ({ documents,
+  async page() { throw new Error("unexpected index read"); },
+  async search() { throw new Error("unexpected index read"); },
+  async snippets() { throw new Error("unexpected index read"); },
+  async maintain() { throw new Error("unexpected maintenance"); },
+}));
+const worker = { fetch: (request: Request, env: Env) => baseline.fetch(request, env, { waitUntil(work) { void work.catch(() => {}); } }) };
 import type { PublicEnv } from "./contracts";
 import { createDocuments } from "./documents";
 import { extractText } from "./extract";
@@ -43,7 +53,8 @@ function request(path = `/upload/${uploadId}`, token = "secret"): Request {
 
 function environment(bucket: FakeBucket): PublicEnv {
   return {
-    DOCS_BUCKET: bucket as unknown as R2Bucket, AUTH_TOKEN: "secret", APP_ROLE: "public",
+    DOCS_BUCKET: bucket as unknown as R2Bucket,
+    LIBRARY_DB: new Proxy({} as D1Database, { get() { throw new Error("unexpected DB operation"); } }), AUTH_TOKEN: "secret", APP_ROLE: "public",
     PUBLIC_DOCS_ORIGIN: "https://docs.example", CATALOG_ORIGIN: "https://library.example",
   };
 }
@@ -157,6 +168,7 @@ describe("role isolation", () => {
       const bucket = new FakeBucket({});
       const response = await worker.fetch(new Request(`https://library.example${path}`), {
         DOCS_BUCKET: bucket as unknown as R2Bucket,
+    LIBRARY_DB: new Proxy({} as D1Database, { get() { throw new Error("unexpected DB operation"); } }),
         APP_ROLE: "catalog",
         PUBLIC_DOCS_ORIGIN: "https://docs.example",
         CATALOG_ORIGIN: "https://library.example",
@@ -172,7 +184,8 @@ describe("role isolation", () => {
     }
     const bucket = new FakeBucket({});
     const response = await worker.fetch(new Request("https://library.example/all-docs"), {
-      DOCS_BUCKET: bucket as unknown as R2Bucket, APP_ROLE: "catalog",
+      DOCS_BUCKET: bucket as unknown as R2Bucket,
+    LIBRARY_DB: new Proxy({} as D1Database, { get() { throw new Error("unexpected DB operation"); } }), APP_ROLE: "catalog",
       PUBLIC_DOCS_ORIGIN: "https://docs.example", CATALOG_ORIGIN: "https://library.example",
       ALL_DOCS_PASSWORD: "", CATALOG_SESSION_KEY: "",
     });
