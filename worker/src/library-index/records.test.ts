@@ -454,8 +454,8 @@ describe("LibraryRecords stale metadata observations", () => {
   }, 20_000);
 });
 
-function invocation(f: Fixture, overrides: Partial<import("./contracts").LibraryDependencies> = {}) {
-  const resources = createInvocationResources(() => f.db, f.bucket);
+function invocation(f: Fixture, overrides: Partial<import("./contracts").LibraryDependencies> = {}, database = f.db) {
+  const resources = createInvocationResources(() => database, f.bucket);
   const documents = createDocuments(resources.bucket, f.deps.publicOrigin);
   const records = createLibraryRecords({ ...f.deps, ...resources, documents, ...overrides });
   return { ...resources, records };
@@ -534,9 +534,9 @@ describe("LibraryRecords shared invocation accounting", () => {
 
 describe("LibraryRecords reviewed storage guards", () => {
   it("fences concurrent actual-size samples so four bodies cannot spend the same capacity", async () => {
-    const body = "x".repeat(524_288);
+    const body = highEntropyText();
     const extract = vi.fn(async (doc: ResolvedDocument) => text(doc.summary.id, doc.summary.version, body));
-    const f = await setup({ now: () => 1000, extract, config: { sizeBudgetBytes: 2_000_000 } });
+    const f = await setup({ now: () => 1000, extract, config: { sizeBudgetBytes: 9_000_000 } });
     const refs = [];
     for (let i = 0; i < 4; i++) {
       const summary = await seed(f, `Budget0${i}`); refs.push(summary);
@@ -546,7 +546,8 @@ describe("LibraryRecords reviewed storage guards", () => {
     for (const ref of refs) claims.push((await f.records.claim(ref))!);
     const allReady = barrier<void>(); let admitted = 0;
     // Hold every final transaction until all four have sampled the same actual size. This
-    // reproduced the review failure (4,308,992 bytes under a 2,000,000-byte budget) before the fix.
+    // originally reproduced stale sample spending under 2 MB. The 16x policy admits a first
+    // maximum body under 9 MB, then the other writers must remeasure and pause after it commits.
     const concurrent = withDb(f, async (statements) => {
       if (++admitted === 4) allReady.resolve();
       await allReady.promise; return f.db.batch(statements);
@@ -558,7 +559,7 @@ describe("LibraryRecords reviewed storage guards", () => {
     expect(extract).toHaveBeenCalledTimes(4);
     const actual = await f.db.prepare("SELECT count(*) AS n FROM document_text").all();
     expect(actual.results).toEqual([{ n: 1 }]);
-    expect(actual.meta.size_after).toBeLessThan(2_000_000);
+    expect(actual.meta.size_after).toBeLessThan(9_000_000);
     const storage = JSON.parse((await f.db.prepare("SELECT value FROM index_meta WHERE key='storage'").first<string>("value"))!);
     expect(storage).toMatchObject({ paused: true, reason: "paused: index size budget" });
     expect(await generation(f)).toBe(5);
@@ -596,5 +597,116 @@ describe("LibraryRecords paused retry state", () => {
     expect(await f.records.index((await f.records.claim(summary))!)).toEqual({ outcome: "paused", textBytes: 0 });
     expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 1, claim_token: null });
     expect(await generation(f)).toBe(g + 1);
+  }, 20_000);
+});
+
+/** Match maintenance's retained xorshift fixture: 512 KiB with many distinct trigrams, unlike
+ * repeated-character bodies whose tiny posting vocabulary understates native FTS growth.
+ */
+function highEntropyText(): string {
+  let random = 0x12345678;
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const bytes = new Uint8Array(524_288);
+  for (let i = 0; i < bytes.length; i++) {
+    random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+    bytes[i] = alphabet.charCodeAt((random >>> 0) % alphabet.length);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+describe("LibraryRecords conservative capacity admission", () => {
+  it.each(["public waitUntil", "maintenance claim"])("pauses high-entropy text before a 2 MB physical overshoot through %s", async (path) => {
+    const body = highEntropyText();
+    const f = await setup({ now: () => 1000, config: { sizeBudgetBytes: 2_000_000 } });
+    const extract = vi.fn(f.deps.extract);
+    const run = invocation(f, { extract });
+    let summary; let result;
+    if (path === "public waitUntil") {
+      summary = await run.records.documents.create({ body: new TextEncoder().encode(body) as unknown as ReadableStream,
+        filename: "note.txt", title: "Title searchable", mime: "text/plain" });
+      await f.flush();
+    } else {
+      summary = await seed(f, "Entropy1", body);
+      await run.records.ingest(summary, 1000);
+      const held = await lease(f);
+      result = await run.records.index((await run.records.claim(summary, held))!);
+    }
+    const actual = await f.db.prepare("SELECT count(*) AS n FROM document_text").all();
+    console.info("records-capacity-entropy", { path, budget: 2_000_000, actualBytes: actual.meta.size_after,
+      state: (await row(f, summary.id))!.state, extracted: extract.mock.calls.length, operations: run.budget.used });
+    expect(actual.meta.size_after).toBeLessThan(2_000_000);
+    expect(actual.results).toEqual([{ n: 0 }]);
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 0, retry_at: null, claim_token: null });
+    expect(await generation(f)).toBe(1);
+    expect(extract).not.toHaveBeenCalled();
+    expect(await matches(f, "searchable")).toHaveLength(1);
+    expect(await (await f.bucket.get(`${summary.id}/note.txt`))!.text()).toBe(body);
+    const storage = JSON.parse((await f.db.prepare("SELECT value FROM index_meta WHERE key='storage'").first<string>("value"))!);
+    expect(storage).toMatchObject({ paused: true, reason: "paused: index size budget" });
+    expect(run.budget.used).toBeLessThanOrEqual(40);
+    if (path === "maintenance claim") expect(result).toEqual({ outcome: "paused", textBytes: 0 });
+  }, 20_000);
+
+  it("reserves the expanded text bound even when source bytes are tiny", async () => {
+    const extract = vi.fn(async (doc: ResolvedDocument) => ({ ...text(doc.summary.id, doc.summary.version, highEntropyText()), sourceBytes: 1 }));
+    const f = await setup({ now: () => 1000, extract, config: { sizeBudgetBytes: 2_000_000 } });
+    const summary = await seed(f, "Expand01", "x");
+    const run = invocation(f); await run.records.ingest(summary, 1000);
+    expect(summary.sizeBytes).toBe(1);
+    const result = await run.records.index((await run.records.claim(summary, await lease(f)))!);
+    const actual = await f.db.prepare("SELECT 1").all();
+    expect(actual.meta.size_after).toBeLessThan(2_000_000);
+    expect(result).toEqual({ outcome: "paused", textBytes: 0 });
+    expect(extract).not.toHaveBeenCalled();
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 0, claim_token: null });
+    expect(run.budget.used).toBeLessThanOrEqual(40);
+  }, 20_000);
+});
+
+describe("LibraryRecords concurrent public and maintenance capacity", () => {
+  it.each([9_000_000, 100_000_000])("remeasures one stale sample without re-extraction at budget %s", async (budgetBytes) => {
+    const body = highEntropyText();
+    const f = await setup({ now: () => 1000, config: { sizeBudgetBytes: budgetBytes } });
+    const extract = vi.fn(async (doc: ResolvedDocument) => text(doc.summary.id, doc.summary.version, body));
+    const summary = await seed(f, "Mixed001", body); await f.records.ingest(summary, 1000);
+    const held = await lease(f);
+    const bothReady = barrier<void>(); let gateEnabled = false; let writes = 0;
+    const database = new Proxy(f.db, { get(target, key) {
+      if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+        // Public metadata has committed before defer enables this gate. The two six-statement
+        // body batches therefore sampled the same generation at the same injected millisecond.
+        if (gateEnabled && statements.length === 6) {
+          if (++writes === 2) bothReady.resolve();
+          await bothReady.promise;
+        }
+        return target.batch(statements);
+      };
+      const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const publicRun = invocation(f, { extract, defer(work) { gateEnabled = true; f.deps.defer(work); } }, database);
+    const uploaded = await publicRun.records.documents.create({ body: new TextEncoder().encode(body) as unknown as ReadableStream,
+      filename: "note.txt", title: "Title searchable", mime: "text/plain" });
+    const maintenanceRun = invocation(f, { extract }, database);
+    const work = maintenanceRun.records.index((await maintenanceRun.records.claim(summary, held))!);
+    await f.flush(); const result = await work;
+    const publicRow = (await row(f, uploaded.id))!; const maintenanceRow = (await row(f, summary.id))!;
+    const indexed = [publicRow, maintenanceRow].filter((record) => record.state === "indexed").length;
+    expect(indexed).toBe(budgetBytes === 9_000_000 ? 1 : 2);
+    expect(writes).toBe(budgetBytes === 9_000_000 ? 2 : 3);
+    expect(result.textBytes).toBe(524_288);
+    expect(extract.mock.calls.filter(([doc]) => doc.summary.id === uploaded.id)).toHaveLength(1);
+    expect(extract.mock.calls.filter(([doc]) => doc.summary.id === summary.id)).toHaveLength(1);
+    for (const record of [publicRow, maintenanceRow]) expect(record).toMatchObject({ attempts: 0, retry_at: null, claim_token: null });
+    expect(await matches(f, "searchable")).toHaveLength(2);
+    expect(await (await f.bucket.get(`${uploaded.id}/note.txt`))!.text()).toBe(body);
+    expect(await (await f.bucket.get(`${summary.id}/note.txt`))!.text()).toBe(body);
+    const actual = await f.db.prepare("SELECT count(*) AS n FROM document_text").all();
+    expect(actual.meta.size_after).toBeLessThan(budgetBytes);
+    expect(actual.results).toEqual([{ n: indexed }]);
+    expect(await generation(f)).toBe(2 + indexed);
+    expect(publicRun.budget.used).toBeLessThanOrEqual(40);
+    expect(maintenanceRun.budget.used).toBeLessThanOrEqual(40);
+    console.info("records-capacity-concurrent", { budgetBytes, actualBytes: actual.meta.size_after, indexed, writes,
+      publicOperations: publicRun.budget.used, maintenanceOperations: maintenanceRun.budget.used, extractions: extract.mock.calls.length });
   }, 20_000);
 });
