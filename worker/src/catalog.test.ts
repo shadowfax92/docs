@@ -626,6 +626,7 @@ describe("bounded library requests and operation-owned cursors", () => {
     expect(first.status).toBe(200);
     const metadata = await first.json() as LibraryPage;
     const path = "/all-docs/api/documents?cursor=" + encodeURIComponent(metadata.nextCursor!);
+    expect(new TextEncoder().encode(origin + path).length).toBeLessThanOrEqual(16 * 1024);
     expect((await app.catalog.fetch(jsonRequest(path, "GET", undefined, headers))).status).toBe(200);
     expect(app.page).toHaveBeenLastCalledWith(raw);
     app.search.mockResolvedValueOnce(searchPage(raw));
@@ -643,4 +644,16 @@ describe("bounded library requests and operation-owned cursors", () => {
     expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { ...searchRequest(), cursor: result.nextCursor }, headers))).status).toBe(400);
     expect(app.page).not.toHaveBeenCalled(); expect(app.search).not.toHaveBeenCalled();
   });
+});
+
+it("preserves opaque UTF8 cursor bytes including a leading BOM", async () => {
+  const app = setup();
+  const { cookie } = await login(app);
+  const raw = "\uFEFF😀\\\"\0";
+  app.page.mockResolvedValueOnce(libraryPage(raw));
+  const first = await app.catalog.fetch(jsonRequest("/all-docs/api/documents", "GET", undefined, { Cookie: cookie }));
+  const { nextCursor } = await first.json() as LibraryPage;
+  const resumed = await app.catalog.fetch(jsonRequest("/all-docs/api/documents?cursor=" + nextCursor, "GET", undefined, { Cookie: cookie }));
+  expect(resumed.status).toBe(200);
+  expect(app.page).toHaveBeenLastCalledWith(raw);
 });

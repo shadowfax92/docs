@@ -2,7 +2,7 @@ import { MAX_DELETE_BATCH_ITEMS, type CatalogError, type DeleteBatchRequest, typ
 import { isUploadId } from "./documents";
 import { LibraryIndexError, type LibraryConfig, type LibraryIndex } from "./library-index";
 import { LIBRARY_ENDPOINTS, type LibraryErrorCode } from "./library-contracts";
-import { HTTP_CURSOR_BYTES, HTTP_CURSOR_TOKEN_BYTES, HTTP_LIBRARY_BODY_BYTES, HTTP_SEARCH_BYTES,
+import { HTTP_CURSOR_BYTES, HTTP_CURSOR_ENCODED_BYTES, HTTP_CURSOR_TOKEN_BYTES, HTTP_LIBRARY_BODY_BYTES, HTTP_SEARCH_BYTES,
   httpJson, httpMaintainRequest, httpMaintenanceOptions, httpRetryRequest, httpSearchRequest, httpSnippetsRequest } from "./http-library";
 
 export interface CatalogSecurity {
@@ -27,6 +27,7 @@ const encoder = new TextEncoder();
  * rotating password/key revokes copied cookies too. Session and cursor MACs use separate domains.
  */
 interface Session { v: 1; sid: string; iat: number; exp: number; csrf: string }
+// Cursor.cursor is transport-base64url; LibraryIndex sees only the decoded original string.
 interface Cursor { v: 1; op: "metadata" | "search"; sid: string; exp: number; cursor: string }
 
 class HttpError extends Error {
@@ -141,10 +142,15 @@ export function createCatalog(deps: {
     const state = await verify(`library-${op}-cursor-v1`, token, HTTP_CURSOR_TOKEN_BYTES);
     if (!isRecord(state) || state.v !== 1 || state.op !== op || state.sid !== session.sid
       || !Number.isSafeInteger(state.exp) || (state.exp as number) <= now() || (state.exp as number) > session.exp
-      || typeof state.cursor !== "string" || !state.cursor || encoder.encode(state.cursor).length > HTTP_CURSOR_BYTES) {
+      || typeof state.cursor !== "string" || !/^[A-Za-z0-9_-]+$/.test(state.cursor) || state.cursor.length > HTTP_CURSOR_ENCODED_BYTES) {
       throw new HttpError(400, "invalid_cursor", "Refresh the library to restart discovery.");
     }
-    return state.cursor;
+    try {
+      const bytes = unbase64(state.cursor);
+      if (bytes.length > HTTP_CURSOR_BYTES) throw new Error("Invalid cursor size");
+      // A leading BOM is part of an opaque cursor, rather than a JSON transport prefix.
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch { throw new HttpError(400, "invalid_cursor", "Refresh the library to restart discovery."); }
   }
   async function writeCursor(cursor: string | null, session: Session, op: Cursor["op"]): Promise<string | null> {
     if (cursor === null) return null;
@@ -152,7 +158,7 @@ export function createCatalog(deps: {
     // HTTP authenticates ownership/operation/expiry. LibraryIndex alone validates query and visible
     // generation inside this opaque payload, so clients cannot forge a traversal or scan identity.
     return sign(`library-${op}-cursor-v1`, {
-      v: 1, op, sid: session.sid, exp: Math.min(session.exp, now() + 30 * 60), cursor,
+      v: 1, op, sid: session.sid, exp: Math.min(session.exp, now() + 30 * 60), cursor: base64(encoder.encode(cursor)),
     } satisfies Cursor);
   }
 
@@ -160,7 +166,7 @@ export function createCatalog(deps: {
     if (!configured(security) || new URL(request.url).origin !== security.catalogOrigin) {
       throw new HttpError(503, "catalog_unavailable", "The private library is not configured.");
     }
-    if (request.url.length > HTTP_CURSOR_TOKEN_BYTES + 1024) throw new HttpError(414, "url_too_long", "The request URL is too long.");
+    if (encoder.encode(request.url).length > 16 * 1024) throw new HttpError(414, "url_too_long", "The request URL is too long.");
     const url = new URL(request.url);
     const path = url.pathname;
     if (request.method === "GET" && ASSETS.has(path)) {

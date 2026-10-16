@@ -7,9 +7,10 @@ import type { SearchQuery } from "./search";
  * generation and internal continuation validation remain owned by that deep module.
  */
 export const HTTP_CURSOR_BYTES = 8192;
-// JSON can expand a control character to six bytes, then base64 expands the entire envelope.
-// Budget the worst valid internal cursor, rather than assuming its contents are base64 already.
-export const HTTP_CURSOR_TOKEN_BYTES = Math.ceil((HTTP_CURSOR_BYTES * 6 + 1024) / 3) * 4 + 44;
+// Encode the opaque UTF-8 bytes before JSON, avoiding sixfold control-character escaping.
+// The outer base64/HMAC envelope and metadata URL then fit Cloudflare's 16 KiB URL ceiling.
+export const HTTP_CURSOR_ENCODED_BYTES = Math.ceil(HTTP_CURSOR_BYTES / 3) * 4;
+export const HTTP_CURSOR_TOKEN_BYTES = Math.ceil((HTTP_CURSOR_ENCODED_BYTES + 1024) / 3) * 4 + 44;
 export const HTTP_SEARCH_BYTES = HTTP_CURSOR_TOKEN_BYTES + 8192;
 export const HTTP_LIBRARY_BODY_BYTES = 32 * 1024;
 
