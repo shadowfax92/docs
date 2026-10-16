@@ -68,8 +68,8 @@ export async function seed(mf) {
     for (let i = 0; i < 32; i++) await put(`Op${String(i).padStart(6,'0')}`, 'source.txt', `Native bounded backfill ${i} BodySentinel`, `Operator source ${i}`, 'text/plain');
     return fixtures;
   }
-  await put('TextHi01', 'rank.txt', 'BodySentinel BodySentinel BodySentinel CaseNeedle literal.a+b', 'High body rank');
-  await put('TextLo01', 'rank.txt', 'BodySentinel caseneedle literalXaab', 'Low body rank');
+  await put('TextHi01', 'rank.txt', 'BodySentinel BodySentinel BodySentinel CaseNeedle literal.a+b', 'High body rank', 'text/plain');
+  await put('TextLo01', 'rank.txt', 'BodySentinel caseneedle literalXaab', 'Low body rank', 'text/plain');
   await put('PlainHt1', 'authored.html', `<!doctype html><html><head><title>Authored page</title><style>body{background:rgb(240,230,220);font:18px sans-serif}p{margin:32px}</style></head><body><main><h1>Authored title</h1><p>First searchable paragraph</p><p>Second paragraph</p><form id="authored-form"><input aria-label="Authored input"><button>Submit</button><output></output></form>${Array.from({length:20},(_,i)=>`<p>Paragraph ${i + 3}</p>`).join('')}</main><script>window.authored=true;document.querySelector('form').onsubmit=e=>{e.preventDefault();document.querySelector('output').textContent=document.querySelector('input').value}</script></body></html>`, 'Authored page', 'text/html');
   const baked=execFileSync('python3',['-B','-c',"import sys;sys.path.insert(0,sys.argv[1]);import build;print(build.build(sys.stdin.read(),theme='none',source='/synthetic/original.html',key='integration-baked')[0])",resolve(root,'src/vendor/vim-html/upstream/scripts')],{input:'<!doctype html><title>Baked fixture</title><main><h1>Baked fixture</h1><p>First baked point</p><p>Second baked point</p></main>',encoding:'utf8'});
   await put('BuiltVim','baked.html',baked,'Baked fixture','text/html');
@@ -96,13 +96,13 @@ export async function seed(mf) {
   await put('Legacy01', 'legacy.txt', 'LegacyBodySentinel', '', 'text/plain', true);
   await put('Group001', 'a.txt', 'primary body');
   await bucket.put('Group001/b.txt', 'secondary body');
-  for (let i=0;i<205;i++) await put(`Scan${String(i).padStart(4,'0')}`, 'page.txt', `page fixture ${i}`, `Pagination fixture ${i}`);
-  for (let i=0;i<103;i++) await put(`Del${String(i).padStart(5,'0')}`, 'delete.txt', `disposable ${i}`, 'Delete cohort');
+  for (let i=0;i<205;i++) await put(`Scan${String(i).padStart(4,'0')}`, 'page.txt', `page fixture ${i}`, `Pagination fixture ${i}`, 'text/plain');
+  for (let i=0;i<103;i++) await put(`Del${String(i).padStart(5,'0')}`, 'delete.txt', `disposable ${i}`, 'Delete cohort', 'text/plain');
   await put('AgeOld01', 'old.txt', 'Boundary older fixture', 'Age boundary older', 'text/plain');
   await put('AgeNew01', 'new.txt', 'Boundary newer fixture', 'Age boundary newer', 'text/plain');
-  await put('FailHttp', 'failed.txt', 'Native SQLite failure fixture', 'HTTP failure cohort');
-  await put('FailDel1', 'failed.txt', 'Native SQLite failure fixture', 'Failure cohort');
-  await put('StaleDel', 'stale.txt', 'Original version', 'Stale cohort');
+  await put('FailHttp', 'failed.txt', 'Native SQLite failure fixture', 'HTTP failure cohort', 'text/plain');
+  await put('FailDel1', 'failed.txt', 'Native SQLite failure fixture', 'Failure cohort', 'text/plain');
+  await put('StaleDel', 'stale.txt', 'Original version', 'Stale cohort', 'text/plain');
   // Real media is generated locally; no conversion service or outbound fetch is used.
   execFileSync('ffmpeg', ['-loglevel','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1',resolve(state,'tone.wav')]);
   execFileSync('ffmpeg', ['-loglevel','error','-y','-f','lavfi','-i','color=c=blue:s=160x90:d=1','-c:v','libvpx-vp9',resolve(state,'video.webm')]);

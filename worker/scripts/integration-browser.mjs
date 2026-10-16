@@ -147,7 +147,7 @@ async function catalogProof(context,shot,check) {
   await shot(p,'catalog-docx-body-search');
   await query('Text PDF',1);assert((await p.locator('article[data-id="PdfText1"]').innerText()).includes('name match only'));
   assert.match(await p.locator('article[data-id="PdfText1"] [data-coverage=reason]').innerText(),/PDF text extraction is not enabled.*No OCR/);
-  await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes('content unreadable'));
+  await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes("content couldn't be indexed · name searched"));
   assert.match(await p.locator('article[data-id="DocxBad1"] [data-coverage=reason]').innerText(),/bounded ZIP\/XML limits/);
   check('real persistent backend literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
   assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
