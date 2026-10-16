@@ -311,8 +311,10 @@ reconcile rather than an unreviewed source rollback.
 Uploaded dates come from R2 storage time, never a legacy client creation date.
 Discovery follows every cursor and keeps multi-object IDs together. It observes
 concurrent storage rather than an atomic snapshot. Selection/review freezes
-explicit ID/version refs and the age cutoff; deletion commits at most 100 IDs per
-batch and preserves changed/failed/unprocessed selections. Coordinated immutable
+explicit ID/version refs and the age cutoff. The server admits at most 100 refs
+per request; the catalog sends one frozen ref per sequential POST so each request
+gets its own bounded SQL/R2 allowance. A single review/global confirmation still
+controls the whole selection; changed/failed/unprocessed selections are preserved. Coordinated immutable
 writers and permanent claims are prerequisites described above.
 
 Public raw/download bytes stay exact and support single byte ranges, ETag/If-Range

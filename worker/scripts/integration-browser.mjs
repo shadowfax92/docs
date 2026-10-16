@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { createHmac, createHash } from 'node:crypto';
 import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, state } from './integration-server.mjs';
 
-/** Physical browser interactions against actual built Worker roles/native R2. Headless Chromium
+/** Physical browser interactions against actual built Worker roles/native D1 and R2. Headless Chromium
  * has an isolated profile; no owner browser/window/clipboard/storage is attached or activated.
  */
 await mkdir(resolve(state,'screenshots'),{recursive:true});
@@ -63,16 +63,21 @@ try {
   await shot(page,'public-video');
   await page.goto(pub+'/BadMedia');await page.locator('[data-media-error]').waitFor({state:'visible'});
   check('browser decodes PNG, plays PCM WAV and VP9 WebM; invalid MP4 displays media error fallback');
-  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');
-  await page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
+  // Subscribe before navigating: Chromium's independent PDF guest can commit before the parent
+  // load finishes, and waiting afterwards would mistake a missed event for a renderer failure.
+  const pdfGuest=page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
+  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');await pdfGuest;
   // Chromium's PDF guest paints asynchronously after its extension frame navigates.
   await page.waitForTimeout(1200);await shot(page,'public-pdf');
   await page.goto(pub+'/DocxOk01');assert((await page.locator('main').innerText()).includes('DocxBodySentinel & 😀'));await shot(page,'public-docx-light');
   await page.getByRole('button',{name:'Switch to dark theme'}).click();await shot(page,'public-docx-dark');
+  await page.goto(pub+'/JsonDat1');const json=await page.locator('main').innerText();
+  for(const token of ['9007199254740993','1e400','-0'])assert(json.includes(token));
+  await page.goto(pub+'/SafeMark');assert.equal(await page.evaluate(()=>window.markdownPwn),undefined);
   const mobile=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,deviceScaleFactor:1});const mp=await mobile.newPage();
   await mp.goto(pub+'/CsvData1');await shot(mp,'public-csv-mobile');
   assert(await mp.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await mobile.close();
-  check('real text-PDF native wrapper, actual DOCX text and public light/dark/mobile screenshots');
+  check('real text-PDF/DOCX, exact JSON numbers, inert Markdown and public light/dark/mobile screenshots');
   // Authenticate in this browser, then open hostile uploaded markup without even relying on
   // noopener. COOP/cookie host isolation/CORS/frame denial must protect the trusted catalog.
   const trusted=await context.newPage();await trusted.goto(cat+'/all-docs');
@@ -178,10 +183,16 @@ async function catalogProof(context,shot,check) {
   const confirm=p.getByRole('button',{name:'Delete 103 documents',exact:true});assert(await confirm.isDisabled());
   await p.locator('#confirm-count').fill('102');assert(await confirm.isDisabled());
   const batchStart=batches.length;
+  const frozenRefs=await p.evaluate(async()=>{
+    const response=await fetch('/all-docs/api/documents',{headers:{'X-Docs-Catalog':'1'}});
+    return (await response.json()).items.filter(d=>/^Del\d{5}$/.test(d.id)).map(({id,version})=>({id,version}));
+  });
+  assert.equal(frozenRefs.length,103);
   await p.locator('#confirm-count').fill('103');await shot(p,'catalog-exact-count-delete');await confirm.click();
-  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents');
+  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents',null,{timeout:120000});
   const deletionBatches=batches.slice(batchStart);assert.equal(deletionBatches.length,103);assert(deletionBatches.every(b=>b.items.length===1));
   const deleted=deletionBatches.flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
+  assert.deepEqual(deletionBatches.flatMap(b=>b.items).sort((a,b)=>a.id.localeCompare(b.id)),frozenRefs.sort((a,b)=>a.id.localeCompare(b.id)));
   for(const b of deletionBatches){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
   await p.getByRole('button',{name:'Done',exact:true}).click();
   check('page selection vs all 103 matching, wrong-count refusal and real 103 sequential single-ref native deletes');

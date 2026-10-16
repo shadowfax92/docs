@@ -143,5 +143,5 @@ try {
   check('logout clears cookie and anonymous bootstrap fails');
   complete=true;
 } finally {
-  await writeFile(resolve(state,'http-results.json'),JSON.stringify({complete,checks,limitations:'Local workerd/R2 only; no deployed-tier CPU, device, production or OCR proof.'},null,2));
+  await writeFile(resolve(state,'http-results.json'),JSON.stringify({complete,checks,limitations:'Local workerd/native D1+R2 only; no deployed-tier CPU, device, production or OCR proof.'},null,2));
 }
