@@ -444,13 +444,18 @@ try {
   // 9. Keyboard: Esc clears then moves to the cards, arrows move focus, x selects, / returns.
   await page.locator('#search').click();
   await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.querySelector('#search').value === '' && !document.querySelector('.coverage:not([hidden])'));
   await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.activeElement?.closest('article'));
   const focusFirst = await page.evaluate(() => document.activeElement?.closest('article')?.dataset.id ?? null);
   await page.keyboard.press('ArrowRight');
   const focusSecond = await page.evaluate(() => document.activeElement?.closest('article')?.dataset.id ?? null);
   await page.keyboard.press('x');
+  // Renders are batched per animation frame: wait for the painted state, not the keypress.
+  await page.waitForFunction(() => document.querySelectorAll('article.card.selected').length === 1, null, { timeout: 5000 });
   const selected = await page.evaluate(() => document.querySelectorAll('article.card.selected').length);
   await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.querySelectorAll('article.card.selected').length === 0, null, { timeout: 5000 });
   await page.keyboard.press('/');
   const focusSearch = await page.evaluate(() => document.activeElement?.id);
   assert(focusFirst && focusSecond && focusFirst !== focusSecond);

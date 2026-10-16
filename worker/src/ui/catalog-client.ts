@@ -31,7 +31,7 @@ import {
   type MaintenanceReport, type SearchQuery,
 } from "../library-contracts";
 import {
-  LibrarySearch, isGeneration, isLibraryStatus, libraryError, searchKey,
+  LibrarySearch, isCount, isLibraryStatus, libraryError, scopeKey, searchKey,
   type SearchFailure, type SearchPhase, type Snippet,
 } from "./persistent-search";
 
@@ -264,7 +264,9 @@ export interface SearchState {
   current: boolean;
   /** The results on screen are final for the current input. */
   complete: boolean;
-  /** Identity of the results on screen (input key and generation), for render memoization. */
+  /** The query was too broad for the whole library, so it is searched within the active filter. */
+  scoped: boolean;
+  /** Identity of the results on screen (input, scope and generation), for render memoization. */
   resultsKey: string | null;
 }
 
@@ -318,7 +320,9 @@ export interface Results {
   /** What the grid shows: `matching`, or the selection while "Show selected" is on. */
   visible: DocumentSummary[];
   kindCounts: Map<FileKind, number>; // Every filter except type.
-  olderThan90: number;               // Every filter except age.
+  /** Kinds in the snapshot whose match count a scoped search can't know (outside its type scope). */
+  unknownKinds: FileKind[];
+  olderThan90: number | null;        // Every filter except age; null when a scoped search can't know.
   hiddenSelected: number;
   sort: SortKey;
   /** "Most matches" waits for a complete search; until then cards stay newest first. */
@@ -472,6 +476,7 @@ export class CatalogClient {
     this.search = new LibrarySearch({
       post: (path, body, signal) => this.post(path, body, signal),
       visible: () => this.snippetDemand(),
+      filter: () => this.activeFilter(),
       unauthorized: () => this.expire(),
       changed: () => this.changed(),
     });
@@ -701,18 +706,33 @@ export class CatalogClient {
     return query ? searchKey(query) : null;
   }
 
+  /** The type/age filter as a DocumentFilter, with the frozen cutoff instant. */
+  private activeFilter(): DocumentFilter {
+    return toDocumentFilter(this.window(), this.filters.kinds);
+  }
+
+  /** Held results answer the current query, and a scoped search's scope is the active filter. */
+  private heldIsCurrent(): boolean {
+    const held = this.search?.results;
+    const key = this.currentKey();
+    return key !== null && !!held && held.queryKey === key
+      && (held.scope === null || scopeKey(held.scope) === scopeKey(this.activeFilter()));
+  }
+
   searchState(): SearchState {
     const search = this.search;
     const held = search?.results ?? null;
     const key = this.currentKey();
+    const current = this.heldIsCurrent();
     return {
       phase: search?.phase ?? "idle",
       failure: search?.failure ?? null,
       snippetFailure: search?.snippetFailure ?? null,
       held: key !== null && held !== null,
-      current: key !== null && held?.key === key,
-      complete: key !== null && held?.key === key && held.complete,
-      resultsKey: key !== null && held ? `${held.key}@${held.generation}` : null,
+      current,
+      complete: current && !!held?.complete,
+      scoped: key !== null && !!held?.scope,
+      resultsKey: key !== null && held ? `${held.queryKey}|${scopeKey(held.scope)}@${held.generation}` : null,
     };
   }
 
@@ -752,6 +772,9 @@ export class CatalogClient {
     if (next.text !== before.text || next.regex !== before.regex || next.matchCase !== before.matchCase) {
       this.search?.setQuery(this.currentQuery());
     }
+    if (next.age !== before.age || next.from !== before.from || next.to !== before.to || next.kinds.join() !== before.kinds.join()) {
+      this.search?.filtersChanged();
+    }
     this.changed();
   }
 
@@ -770,6 +793,7 @@ export class CatalogClient {
     this.frozenNow = this.deps.now();
     this.renderLimit = RENDER_STEP;
     if (this.selection.scope === "matching") this.clearSelection("Selection cleared because the cutoff changed.");
+    this.search?.filtersChanged();
     this.changed();
   }
 
@@ -823,11 +847,13 @@ export class CatalogClient {
       total: 0, searchable: 0, truncated: 0, nameOnly: 0, nameOnlyKinds: [], unreadable: 0, pending: 0, failed: 0,
     };
     const nameOnlyKinds = new Set<FileKind>();
+    const presentKinds = new Set<FileKind>();
     let olderThan90 = 0;
     const matching: DocumentSummary[] = [];
     for (const doc of this.docs.values()) {
       const uploaded = Date.parse(doc.uploadedAt);
       const inAge = inWindow(uploaded, window);
+      if (inAge) presentKinds.add(doc.kind);
       if (inAge && ofKind(doc)) {
         scope.total++;
         const index = doc.index;
@@ -848,9 +874,15 @@ export class CatalogClient {
       if (inAge && ofKind(doc)) matching.push(doc);
     }
     scope.nameOnlyKinds = FILE_KINDS.filter((kind) => nameOnlyKinds.has(kind));
+    // A scoped search has no hits outside its scope, so those alternatives' counts are unknown.
+    const searched = held?.scope ?? null;
+    const unknownKinds = searched?.kinds.length
+      ? FILE_KINDS.filter((kind) => presentKinds.has(kind) && !searched.kinds.includes(kind)) : [];
+    const olderKnown = !searched || (searched.uploadedAfter === null
+      && (searched.uploadedBefore === null || Date.parse(searched.uploadedBefore) >= olderBound));
     const sort = this.effectiveSort();
     // Counts of a partial scan still grow, so "Most matches" order would reshuffle under the user.
-    const provisional = sort === "matches" && !(held?.key === key && held.complete);
+    const provisional = sort === "matches" && !(this.heldIsCurrent() && held?.complete);
     const compare = comparator(provisional ? "newest" : sort, hits);
     matching.sort(compare);
     const selected = this.selectedIds();
@@ -862,7 +894,9 @@ export class CatalogClient {
       const shown = new Set(matching.map((doc) => doc.id));
       for (const id of selected) if (!shown.has(id)) hiddenSelected++;
     }
-    const value: Results = { matching, visible, kindCounts, olderThan90, hiddenSelected, sort, provisional, scope };
+    const value: Results = {
+      matching, visible, kindCounts, unknownKinds, olderThan90: olderKnown ? olderThan90 : null, hiddenSelected, sort, provisional, scope,
+    };
     this.resultsCache = { revision: this.revision, value };
     return value;
   }
@@ -902,13 +936,15 @@ export class CatalogClient {
     if (scan.status === "running") return { ok: false, reason: `Available when the library finishes loading (${this.docs.size} found so far)` };
     if (scan.status !== "complete") return { ok: false, reason: "Unavailable because the library listing is incomplete" };
     if (this.selectedOnly) return { ok: false, reason: "Turn off “Show selected” to select by filter" };
+    // A known newer generation means the snapshot is stale, with or without query text.
+    if (this.libraryChanged()) return { ok: false, reason: "The library changed since it loaded — Refresh to select all matching" };
     const key = this.currentKey();
     if (key !== null) {
       const search = this.search;
       const held = search?.results ?? null;
       if (search?.failure) return { ok: false, reason: "Unavailable while the search reports an error" };
       // phase covers a restart still running behind complete results that stay on screen.
-      if (!held || held.key !== key || !held.complete || search?.phase !== "complete") {
+      if (!held || !this.heldIsCurrent() || !held.complete || search?.phase !== "complete") {
         return { ok: false, reason: "Available when the search finishes" };
       }
       // Hits and snapshot must describe the same library state, or "all matching" could miss changes.
@@ -922,6 +958,9 @@ export class CatalogClient {
         return { ok: false, reason: `Unavailable: ${noun(scope.failed, "document", "documents")} couldn't be indexed — retry ${scope.failed === 1 ? "it" : "them"} first` };
       }
     }
+    // Without query text every snapshot document in the filters matches, whatever its index state,
+    // so pending or failed rows don't make the set incomplete (and a paused size budget must not
+    // block age-based cleanup).
     const count = this.results().matching.length;
     if (count === 0) return { ok: false, reason: "Nothing matches" };
     return { ok: true, count };
@@ -1339,13 +1378,13 @@ function isLibraryDocument(value: unknown): value is LibraryDocument {
   return isRecord(index) && ["pending", "indexed", "failed"].includes(index.state as string)
     && (index.coverage === null || COVERAGES.includes(index.coverage))
     && (index.reason === null || typeof index.reason === "string")
-    && isGeneration(index.indexedBytes) && isGeneration(index.extractorVersion);
+    && isCount(index.indexedBytes) && isCount(index.extractorVersion);
 }
 
 interface PageReply { generation: number; items: unknown[]; nextCursor: string | null; status: LibraryStatus }
 
 function parseLibraryPage(value: unknown): PageReply | null {
-  if (!isRecord(value) || value.version !== 1 || !isGeneration(value.generation) || !Array.isArray(value.items)
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation) || !Array.isArray(value.items)
     || value.items.length > LIBRARY_LIMITS.metadataRows || !isLibraryStatus(value.status)) return null;
   const { nextCursor } = value;
   if (nextCursor !== null && (typeof nextCursor !== "string" || nextCursor === "")) return null;
@@ -1355,9 +1394,9 @@ function parseLibraryPage(value: unknown): PageReply | null {
 }
 
 function parseReport(value: unknown): MaintenanceReport | null {
-  if (!isRecord(value) || value.version !== 1 || !isGeneration(value.generation)
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation)
     || !["complete", "partial", "busy", "paused"].includes(value.outcome as string)
-    || !isGeneration(value.indexed) || !isGeneration(value.failed) || !isLibraryStatus(value.status)) return null;
+    || !isCount(value.indexed) || !isCount(value.failed) || !isLibraryStatus(value.status)) return null;
   return value as unknown as MaintenanceReport;
 }
 

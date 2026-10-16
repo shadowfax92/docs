@@ -660,7 +660,7 @@ class LibraryApp {
     const results = client.results();
     this.renderHeader();
     this.renderToolbar(results.olderThan90);
-    this.renderKinds(results.kindCounts);
+    this.renderKinds(results.kindCounts, results.unknownKinds);
     this.renderBanner();
     this.renderResultsHead(results.matching.length, results.visible.length);
     this.renderCoverage(results.scope, results.provisional);
@@ -702,7 +702,7 @@ class LibraryApp {
     }
   }
 
-  private renderToolbar(olderThan90: number): void {
+  private renderToolbar(olderThan90: number | null): void {
     const client = this.client;
     const refs = this.refs;
     const filters = client.filters;
@@ -718,7 +718,8 @@ class LibraryApp {
       refs.rangeError.textContent = "";
     }
     refs.olderChip.setAttribute("aria-pressed", String(filters.age === "gt90"));
-    refs.olderChip.textContent = `Older than 90 days · ${olderThan90.toLocaleString("en-US")}`;
+    // A search scoped to a narrower age window can't count older matches, so the count is omitted.
+    refs.olderChip.textContent = olderThan90 === null ? "Older than 90 days" : `Older than 90 days · ${olderThan90.toLocaleString("en-US")}`;
 
     const sortKeys: SortKey[] = filters.text ? ["matches", "newest", "oldest", "largest", "name"] : ["newest", "oldest", "largest", "name"];
     const sortSignature = sortKeys.join();
@@ -745,12 +746,18 @@ class LibraryApp {
     refs.grid.classList.toggle("stale", search.held && !search.current);
   }
 
-  private renderKinds(counts: Map<FileKind, number>): void {
+  /**
+   * Type rail and chips. A search scoped to some types (too broad for the whole library) can't
+   * count the others; they stay listed, without a count, so they can still be added.
+   */
+  private renderKinds(counts: Map<FileKind, number>, unknownKinds: FileKind[]): void {
     const client = this.client;
     const selected = new Set(client.filters.kinds);
-    const kinds = FILE_KINDS.filter((kind) => (counts.get(kind) ?? 0) > 0 || selected.has(kind))
+    const unknown = new Set(unknownKinds);
+    const kinds = FILE_KINDS.filter((kind) => (counts.get(kind) ?? 0) > 0 || selected.has(kind) || unknown.has(kind))
       .sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0) || FILE_KINDS.indexOf(a) - FILE_KINDS.indexOf(b));
-    const key = kinds.map((kind) => `${kind}:${counts.get(kind) ?? 0}:${selected.has(kind)}`).join();
+    const count = (kind: FileKind) => unknown.has(kind) ? null : h("span", { class: "count" }, (counts.get(kind) ?? 0).toLocaleString("en-US"));
+    const key = kinds.map((kind) => `${kind}:${unknown.has(kind) ? "?" : counts.get(kind) ?? 0}:${selected.has(kind)}`).join();
     if (this.refs.railList.dataset.key === key) return;
     this.refs.railList.dataset.key = key;
     const toggle = (kind: FileKind) => {
@@ -762,11 +769,11 @@ class LibraryApp {
     replace(this.refs.railList, kinds.length ? kinds.map((kind) => {
       const box = h("input", { type: "checkbox", "data-kind": kind, checked: selected.has(kind) });
       box.addEventListener("change", () => toggle(kind));
-      return h("li", null, h("label", null, box, KIND_LABEL[kind], h("span", { class: "count" }, (counts.get(kind) ?? 0).toLocaleString("en-US"))));
+      return h("li", null, h("label", null, box, KIND_LABEL[kind], count(kind)));
     }) : h("li", { class: "empty-kinds" }, client.observed().length ? "No matching types" : "No types yet"));
     replace(this.refs.chipRow, kinds.map((kind) => {
       const chip = h("button", { type: "button", class: "chip", "aria-pressed": String(selected.has(kind)), "data-kind": kind },
-        KIND_LABEL[kind], h("span", { class: "count" }, (counts.get(kind) ?? 0).toLocaleString("en-US")));
+        KIND_LABEL[kind], count(kind));
       chip.addEventListener("click", () => toggle(kind));
       return chip;
     }));
@@ -914,6 +921,7 @@ class LibraryApp {
     if (scope.unreadable) parts.push(`${count(scope.unreadable)} unreadable (searched by name)`);
     if (scope.pending) parts.push(`${count(scope.pending)} not indexed yet (searched by name)`);
     if (scope.failed) parts.push(`${count(scope.failed)} couldn't be indexed (searched by name)`);
+    if (search.scoped && search.current) parts.push("searched within the selected filters (too many matches across the whole library)");
     if (client.libraryStatus()?.storage.paused) parts.push("content indexing paused by the index size budget");
     if (provisional && search.current && !search.failure) parts.push("newest first until the search finishes");
     if (search.snippetFailure) parts.push(search.snippetFailure);

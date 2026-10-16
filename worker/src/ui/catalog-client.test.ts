@@ -81,6 +81,8 @@ class FakeCatalog {
   unavailable = new Set<string>();
   /** Hits appended to the first search slice, e.g. IDs or versions the snapshot doesn't know. */
   extraHits: LibraryHit[] = [];
+  /** More matches than this fail the search with search_budget_exceeded, like the 10,000-hit cap. */
+  hitCap = Number.POSITIVE_INFINITY;
   /** Search-plane replies wait for release() while true; aborts reject unless ignoreAbort. */
   hold = false;
   ignoreAbort = false;
@@ -205,7 +207,10 @@ class FakeCatalog {
       if (Number(parsed[1]) !== this.generation) return libraryError(409, "stale_generation", "The library changed.", true);
       start = Number(parsed[2]);
     }
-    const docs = this.docs();
+    const { kinds, uploadedAfter, uploadedBefore } = body.filter;
+    const docs = this.docs().filter((document) => (!kinds.length || kinds.includes(document.kind))
+      && (uploadedAfter === null || Date.parse(document.uploadedAt) >= Date.parse(uploadedAfter))
+      && (uploadedBefore === null || Date.parse(document.uploadedAt) < Date.parse(uploadedBefore)));
     const end = Math.min(docs.length, start + (body.query.mode === "regex" ? this.regexSlice : docs.length));
     let hits: LibraryHit[];
     try {
@@ -223,6 +228,7 @@ class FakeCatalog {
       throw failure;
     }
     if (start === 0) hits.push(...this.extraHits);
+    if (hits.length > this.hitCap) return libraryError(422, "search_budget_exceeded", "Search exceeds 10,000 hits. Narrow the filters.");
     const complete = end >= docs.length;
     return Response.json({
       version: 1, generation: this.generation, hits, complete, nextCursor: complete ? null : `g${this.generation}s${end}`,
@@ -462,6 +468,21 @@ describe("catalog client: session teardown", () => {
     expect(ids(client.results().matching)).toEqual(["doc00002"]);
   });
 
+  it("ends the session on a 401 even when the reply belongs to a superseded query", async () => {
+    const { client, catalog } = setup([range(2)]);
+    await ready(client);
+    catalog.hold = true;
+    catalog.searchReply = () => error(401);
+    await type(client, "invoice");
+    client.setFilters({ text: "" }); // Nothing newer will be sent.
+    catalog.release();
+    await flush();
+
+    expect(client.view).toBe("login");
+    expect(client.login.problem).toBe("expired");
+    expect(client.observed()).toEqual([]);
+  });
+
   it("returns to login with the query kept when the session expires during a search", async () => {
     const { client, catalog } = setup([range(2)]);
     await ready(client);
@@ -693,13 +714,76 @@ describe("catalog client: search lane", () => {
     await ready(client);
     await type(client, "e");
     await searched(client);
-    // Type and age never reach the server, so the copy can't suggest narrowing filters.
-    expect(client.searchState().failure).toEqual({ kind: "budget", message: "This search matches too many documents to finish. Make it more specific." });
+    expect(client.searchState().failure).toEqual({
+      kind: "budget", message: "This search matches too many documents to finish. Make it more specific, or filter by type or date.",
+    });
     expect(client.results().matching).toEqual([]);
 
     await type(client, "é".repeat(129)); // 258 UTF-8 bytes.
     expect(catalog.searches()).toHaveLength(1);
     expect(client.searchState().failure).toEqual({ kind: "pattern", message: "Search text is limited to 256 bytes." });
+  });
+
+  it("re-runs a query too broad for the whole library within the active filter, and follows it", async () => {
+    const docs = [1, 2, 3, 4, 5, 6].map((n) => doc(n, { kind: n % 2 ? "pdf" : "markdown" }));
+    const { client, catalog } = setup([docs]);
+    catalog.hitCap = 4;
+    await ready(client);
+    await type(client, "Document");
+    await searched(client);
+    // No filter can narrow it: the failure says how to proceed, after one request.
+    expect(client.searchState().failure?.kind).toBe("budget");
+    expect(catalog.searches()).toHaveLength(1);
+
+    await type(client, "Document"); // Unchanged input sends nothing.
+    client.setFilters({ kinds: ["pdf"] });
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    await searched(client);
+    const scoped = catalog.searches().at(-1)!;
+    expect(scoped.body.filter).toEqual({ kinds: ["pdf"], uploadedAfter: null, uploadedBefore: null });
+    expect(client.searchState()).toMatchObject({ complete: true, scoped: true, failure: null });
+    expect(ids(client.results().matching)).toEqual(["doc00001", "doc00003", "doc00005"]);
+    // Counts outside the scope are unknown, not zero: the other type stays listed without one.
+    expect(Object.fromEntries(client.results().kindCounts)).toEqual({ pdf: 3 });
+    expect(client.results().unknownKinds).toEqual(["markdown"]);
+    expect(client.results().olderThan90).toBe(0);
+    expect(client.selectAllGate()).toEqual({ ok: true, count: 3 });
+
+    // An age window narrower than "older than 90 days" makes that chip's count unknowable.
+    client.setFilters({ age: "lt7" });
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    await searched(client);
+    expect(catalog.searches().at(-1)!.body.filter).toMatchObject({ kinds: ["pdf"], uploadedBefore: null });
+    expect(catalog.searches().at(-1)!.body.filter.uploadedAfter).not.toBeNull();
+    expect(client.results().olderThan90).toBeNull();
+    client.setFilters({ age: "any" });
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    await searched(client);
+
+    // Broadening past the budget fails within the filter; clearing it fails without a request.
+    client.setFilters({ kinds: ["pdf", "markdown"] });
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    await searched(client);
+    expect(client.searchState().failure?.message).toMatch(/even within these filters/);
+    const sent = catalog.searches().length;
+    client.setFilters({ kinds: [] });
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    await flush();
+    expect(catalog.searches()).toHaveLength(sent);
+    expect(client.searchState().failure?.message).toMatch(/filter by type or date/);
+    expect(catalog.maxInFlight).toBe(1);
+  });
+
+  it("scopes automatically when the over-budget query arrives with a filter already active", async () => {
+    const docs = [1, 2, 3, 4, 5, 6].map((n) => doc(n, { kind: n % 2 ? "pdf" : "markdown" }));
+    const { client, catalog } = setup([docs], { params: "kind=markdown" });
+    catalog.hitCap = 4;
+    await ready(client);
+    await type(client, "Document");
+    await searched(client);
+
+    expect(catalog.searches().map((request) => request.body.filter.kinds)).toEqual([[], ["markdown"]]);
+    expect(ids(client.results().matching)).toEqual(["doc00002", "doc00004", "doc00006"]);
   });
 
   it("abandons a hung request after the timeout and waits for an explicit retry", async () => {
@@ -865,6 +949,14 @@ describe("catalog client: coverage and select all", () => {
     client.setFilters({ kinds: ["markdown"] }); // The pending PDF leaves the scope.
     expect(client.selectAllGate()).toEqual({ ok: false, reason: "Unavailable: 1 document couldn't be indexed — retry it first" });
 
+    // Without a query every document in the filters matches whatever its index state, so pending
+    // and failed rows don't block it (age cleanup must keep working under a paused size budget).
+    client.setFilters({ text: "", kinds: [] });
+    expect(client.selectAllGate()).toEqual({ ok: true, count: 5 });
+    await type(client, "Document");
+    await searched(client);
+    client.setFilters({ kinds: ["markdown"] });
+
     await client.retryIndexing();
     const retry = catalog.requests("POST", "/all-docs/api/index/retry")[0];
     expect(retry.body).toEqual({ version: 1, refs: [{ id: "doc00003", version: "v1-doc00003" }] });
@@ -872,9 +964,9 @@ describe("catalog client: coverage and select all", () => {
     expect(client.retry).toEqual({ status: "done", message: "Retried 1 document: 1 indexed, 0 still failing. Refresh to update coverage." });
     expect(client.libraryChanged()).toBe(true); // The retry's newer generation asks for Refresh.
 
-    // Without a query, the matching set is metadata only: pending rows don't block it.
+    // A known change makes the snapshot stale for the empty query too.
     await type(client, "");
-    expect(client.selectAllGate()).toEqual({ ok: true, count: 3 });
+    expect(client.selectAllGate()).toEqual({ ok: false, reason: "The library changed since it loaded — Refresh to select all matching" });
   });
 
   it("keeps page selection usable while a progressive search is still running", async () => {

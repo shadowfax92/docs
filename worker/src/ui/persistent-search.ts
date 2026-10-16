@@ -37,20 +37,33 @@ export const SEARCH_DEBOUNCE_MS = 200;
 export const REQUEST_TIMEOUT_MS = 20_000;
 /** Fresh restarts allowed after a stale generation, per input. Past this the failure is shown. */
 export const MAX_STALE_RESTARTS = 2;
-const TOO_BROAD = "This search matches too many documents to finish. Make it more specific.";
+const TOO_BROAD = "This search matches too many documents to finish. Make it more specific, or filter by type or date.";
+const TOO_BROAD_FILTERED = "This search matches too many documents even within these filters. Make it more specific or narrow the filters.";
 /** Snippet replies in a row that process nothing before the lane stops asking for this run. */
 const MAX_SNIPPET_STALLS = 2;
 const ID_PATTERN = /^[A-Za-z0-9]{8}$/;
 const encoder = new TextEncoder();
 
 /**
- * Search requests always cover every kind and upload date. Type and age filtering happens in the
- * client over the metadata snapshot, so filter toggles never cost a D1 query and the type rail and
- * age chip can keep counting the alternatives. Matching more than LIBRARY_LIMITS.hits documents
- * is reported as a budget error rather than truncated.
+ * Scope of a search request. By default a query covers every kind and upload date and the client
+ * filters type and age over the metadata snapshot, so filter toggles cost no D1 query and the type
+ * rail and age chip keep counting the alternatives. The server refuses more than
+ * LIBRARY_LIMITS.hits matches rather than truncating; only then is the query re-run scoped to the
+ * active filter (the deps' `filter()`), and it follows that filter until the query changes. A
+ * scoped run's request, key and cursor all carry its scope, so slices of two scopes never mix.
  */
 function allDocuments(): DocumentFilter {
   return { kinds: [], uploadedBefore: null, uploadedAfter: null };
+}
+
+/** The filter if it narrows anything, else null (it would scope nothing). */
+function narrowing(filter: DocumentFilter): DocumentFilter | null {
+  return filter.kinds.length || filter.uploadedAfter !== null || filter.uploadedBefore !== null
+    ? { kinds: [...filter.kinds], uploadedAfter: filter.uploadedAfter, uploadedBefore: filter.uploadedBefore } : null;
+}
+
+export function scopeKey(filter: DocumentFilter | null): string {
+  return filter ? JSON.stringify([filter.kinds, filter.uploadedAfter, filter.uploadedBefore]) : "*";
 }
 
 export interface LibrarySearchDeps {
@@ -58,6 +71,8 @@ export interface LibrarySearchDeps {
   post(path: string, body: unknown, signal: AbortSignal): Promise<{ status: number; body: unknown }>;
   /** Refs of rendered result cards in display order, or [] while snippets should wait. */
   visible(): SelectionRef[];
+  /** The active type and age filter, read only for a query too broad to search unscoped. */
+  filter(): DocumentFilter;
   /** A 401 reply: the owner ends the session, which disposes this instance. */
   unauthorized(): void;
   changed(): void;
@@ -75,7 +90,9 @@ export type Snippet =
 
 /** Results of one input as rendered: partial while `complete` is false. */
 export interface HeldResults {
-  readonly key: string;
+  readonly queryKey: string;
+  /** null: every document; otherwise hits exist only inside this type/age filter. */
+  readonly scope: DocumentFilter | null;
   readonly query: SearchQuery;
   readonly hits: ReadonlyMap<string, LibraryHit>;
   readonly complete: boolean;
@@ -91,7 +108,8 @@ export interface HeldResults {
 export type SearchPhase = "idle" | "pending" | "scanning" | "complete" | "error";
 
 interface Run {
-  readonly key: string;
+  readonly queryKey: string;
+  readonly scope: DocumentFilter | null;
   readonly query: SearchQuery;
   readonly hits: Map<string, LibraryHit>;
   readonly snippets: Map<string, Snippet>;
@@ -125,6 +143,8 @@ export class LibrarySearch {
   private inflight: Flight | null = null;
   private debounce: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  /** Query key the server refused unscoped (hit budget): its runs follow the active filter. */
+  private scoped: string | null = null;
 
   constructor(private readonly deps: LibrarySearchDeps) {}
 
@@ -170,17 +190,28 @@ export class LibrarySearch {
       this.held = null; // Nothing to show without a query; drop hits and snippets.
       return this.deps.changed();
     }
-    this.run = newRun(key, { text: query.text, mode: query.mode, ignoreCase: query.ignoreCase });
+    this.run = this.runFor(key, { text: query.text, mode: query.mode, ignoreCase: query.ignoreCase });
     if (encoder.encode(query.text).length > LIBRARY_LIMITS.queryBytes) {
       this.run.failure = { kind: "pattern", message: `Search text is limited to ${LIBRARY_LIMITS.queryBytes} bytes.` };
       return this.deps.changed();
     }
     if (immediate) this.pump();
-    else this.debounce = setTimeout(() => {
-      this.debounce = null;
-      this.pump();
-      this.deps.changed();
-    }, SEARCH_DEBOUNCE_MS);
+    else this.schedule();
+    this.deps.changed();
+  }
+
+  /**
+   * The type or age filter changed. Unscoped results are filtered locally, so nothing is sent; a
+   * query that had to be scoped is searched again within the new filter (debounced like typing).
+   */
+  filtersChanged(): void {
+    const run = this.run;
+    if (this.disposed || !run || this.scoped !== run.queryKey) return;
+    const next = this.runFor(run.queryKey, run.query);
+    if (scopeKey(next.scope) === scopeKey(run.scope) && !run.failure) return;
+    this.clearDebounce();
+    this.run = next;
+    if (!next.failure) this.schedule();
     this.deps.changed();
   }
 
@@ -190,7 +221,7 @@ export class LibrarySearch {
     this.held = null;
     this.latestGeneration = null;
     this.status = null;
-    if (this.run) this.run = newRun(this.run.key, this.run.query);
+    if (this.run) this.run = this.runFor(this.run.queryKey, this.run.query);
     this.pump();
     this.deps.changed();
   }
@@ -201,7 +232,7 @@ export class LibrarySearch {
     if (this.disposed || !run) return;
     if (run.failure?.kind === "changing") {
       if (this.held === run) this.held = null;
-      this.run = newRun(run.key, run.query);
+      this.run = this.runFor(run.queryKey, run.query);
     } else if (run.failure?.kind === "unavailable") {
       run.failure = null;
     }
@@ -237,7 +268,7 @@ export class LibrarySearch {
     if (!run || run.failure) return;
     if (!run.complete) {
       const cursor = run.started ? run.cursor ?? undefined : undefined;
-      const body: LibrarySearchRequest = { version: 1, query: run.query, filter: allDocuments(), cursor };
+      const body: LibrarySearchRequest = { version: 1, query: run.query, filter: run.scope ?? allDocuments(), cursor };
       return this.send(run, LIBRARY_ENDPOINTS.search, body, (reply) => this.onSearch(run, cursor ?? null, reply));
     }
     if (this.held !== run || run.snippetFailure) return;
@@ -260,6 +291,9 @@ export class LibrarySearch {
       clearTimeout(timer);
       if (this.disposed || this.inflight !== flight) return;
       this.inflight = null;
+      // A 401 ends the session whatever the request was for, even a superseded one: otherwise a
+      // cleared query (no next request) would leave private metadata on screen until local expiry.
+      if (reply?.status === 401) return this.deps.unauthorized();
       // Superseded runs (newer input, refresh, stale restart) drop their reply unread.
       if (this.run === run) apply(reply);
       // Render first, so snippet demand is read from the grid this reply produced.
@@ -271,17 +305,13 @@ export class LibrarySearch {
 
   private onSearch(run: Run, sent: string | null, reply: Reply): void {
     if (!reply) return this.fail(run, unreachable(run));
-    if (reply.status === 401) return this.deps.unauthorized();
     if (reply.status !== 200) {
       const error = libraryError(reply.body);
       if (reply.status === 409 || error?.code === "stale_generation" || error?.code === "invalid_cursor") return this.stale(run);
       if (reply.status === 400 || error?.code === "invalid_pattern" || error?.code === "invalid_search_request") {
         return this.fail(run, { kind: "pattern", message: error?.message ?? "This pattern can't be searched." });
       }
-      if (reply.status === 422 || error?.code === "search_budget_exceeded") {
-        // Own copy: the server may suggest narrowing filters, but type and age never reach it here.
-        return this.fail(run, { kind: "budget", message: TOO_BROAD });
-      }
+      if (reply.status === 422 || error?.code === "search_budget_exceeded") return this.overBudget(run);
       return this.fail(run, { kind: "unavailable", message: error?.message ?? `Search is unavailable right now (HTTP ${reply.status}).` });
     }
     const page = parseSearchResponse(reply.body);
@@ -293,8 +323,9 @@ export class LibrarySearch {
     }
     for (const hit of page.hits) run.hits.set(hit.id, { id: hit.id, version: hit.version, matchCount: hit.matchCount });
     if (run.hits.size > LIBRARY_LIMITS.hits) {
+      if (this.held === run) this.held = null;
       run.hits.clear();
-      return this.fail(run, { kind: "budget", message: TOO_BROAD });
+      return this.overBudget(run);
     }
     run.started = true;
     run.generation = page.generation;
@@ -309,7 +340,6 @@ export class LibrarySearch {
       run.snippetFailure = "Couldn't reach the library for match previews.";
       return;
     }
-    if (reply.status === 401) return this.deps.unauthorized();
     if (reply.status !== 200) {
       const error = libraryError(reply.body);
       if (reply.status === 409 || error?.code === "stale_generation") return this.stale(run);
@@ -344,11 +374,41 @@ export class LibrarySearch {
     if (run.restarts >= MAX_STALE_RESTARTS) {
       return this.fail(run, { kind: "changing", message: "The library kept changing during this search. Refresh, then try again." });
     }
-    const next = newRun(run.key, run.query);
+    const next = newRun(run.queryKey, run.query, run.scope);
     next.restarts = run.restarts + 1;
     // Complete results stay visible until replaced: they are consistent for their generation.
     if (this.held === run && !run.complete) this.held = null;
     this.run = next;
+  }
+
+  /**
+   * Too many matches. An unscoped query is retried once within the active filter, if it narrows
+   * anything, and keeps following the filter; a scoped one, or one with no filter, fails visibly.
+   */
+  private overBudget(run: Run): void {
+    if (run.scope !== null) return this.fail(run, { kind: "budget", message: TOO_BROAD_FILTERED });
+    this.scoped = run.queryKey;
+    const next = this.runFor(run.queryKey, run.query);
+    if (next.failure) return this.fail(run, next.failure);
+    next.restarts = run.restarts;
+    this.run = next;
+  }
+
+  /** A fresh run for a query: scoped to the active filter when the query is known to need it. */
+  private runFor(queryKey: string, query: SearchQuery): Run {
+    if (this.scoped !== queryKey) return newRun(queryKey, query, null);
+    const scope = narrowing(this.deps.filter());
+    const run = newRun(queryKey, query, scope);
+    if (!scope) run.failure = { kind: "budget", message: TOO_BROAD };
+    return run;
+  }
+
+  private schedule(): void {
+    this.debounce = setTimeout(() => {
+      this.debounce = null;
+      this.pump();
+      this.deps.changed();
+    }, SEARCH_DEBOUNCE_MS);
   }
 
   private fail(run: Run, failure: SearchFailure): void {
@@ -366,9 +426,9 @@ export class LibrarySearch {
   }
 }
 
-function newRun(key: string, query: SearchQuery): Run {
+function newRun(queryKey: string, query: SearchQuery, scope: DocumentFilter | null): Run {
   return {
-    key, query, hits: new Map(), snippets: new Map(), restarts: 0, started: false, complete: false, cursor: null,
+    queryKey, scope, query, hits: new Map(), snippets: new Map(), restarts: 0, started: false, complete: false, cursor: null,
     generation: -1, failure: null, snippetFailure: null, snippetStalls: 0,
   };
 }
@@ -385,11 +445,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isCount(value: unknown): value is number {
+/** Nonnegative safe integer: counts, byte sizes and generations on the wire. */
+export function isCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
-
-export const isGeneration = isCount;
 
 function isRef(value: unknown): value is SelectionRef {
   return isRecord(value) && typeof value.id === "string" && ID_PATTERN.test(value.id)
@@ -409,7 +468,7 @@ export function isLibraryStatus(value: unknown): value is LibraryStatus {
 }
 
 function parseSearchResponse(value: unknown): LibrarySearchResponse | null {
-  if (!isRecord(value) || value.version !== 1 || !isGeneration(value.generation) || typeof value.complete !== "boolean"
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation) || typeof value.complete !== "boolean"
     || !Array.isArray(value.hits) || !isRecord(value.scope) || !isLibraryStatus(value.status)) return null;
   // complete:false requires a continuation and complete:true forbids one (frozen contract).
   if (value.complete ? value.nextCursor !== null : typeof value.nextCursor !== "string" || value.nextCursor === "") return null;
@@ -420,7 +479,7 @@ function parseSearchResponse(value: unknown): LibrarySearchResponse | null {
 interface SnippetsReply { generation: number; hits: { id: string; version: string; snippet: string; ranges: unknown }[]; unavailable: SelectionRef[] }
 
 function parseSnippetsResponse(value: unknown): SnippetsReply | null {
-  if (!isRecord(value) || value.version !== 1 || !isGeneration(value.generation) || !Array.isArray(value.hits)
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation) || !Array.isArray(value.hits)
     || !Array.isArray(value.unavailable) || !Array.isArray(value.remaining)) return null;
   if (!value.hits.every((hit) => isRef(hit) && typeof (hit as { snippet?: unknown }).snippet === "string")) return null;
   if (!value.unavailable.every(isRef) || !value.remaining.every(isRef)) return null;
