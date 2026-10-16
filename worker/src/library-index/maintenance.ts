@@ -84,20 +84,39 @@ export function createLibraryMaintenance(deps: LibraryDependencies, records: Lib
         }
       }
       if (canContinue() && counts.processed < options.documents) {
-        const rows = (await deps.db.prepare(`SELECT id, version FROM documents d WHERE
+        const rows = (await deps.db.prepare(`SELECT id, version, state FROM documents d WHERE
           ((state='pending') OR (state='failed' AND attempts < ?) OR (state='indexed' AND extractor < ? AND attempts < ?))
           AND (retry_at IS NULL OR retry_at <= ?) AND (claim_until IS NULL OR claim_until <= ?)
           AND NOT EXISTS (SELECT 1 FROM deleted_ids t WHERE t.id=d.id)
           ORDER BY coalesce(retry_at, 0), id COLLATE BINARY LIMIT ?`)
           .bind(Math.min(5, deps.config.maxAttempts), deps.config.extractorVersion, Math.min(5, deps.config.maxAttempts),
             deps.now(), deps.now(), options.documents - counts.processed + 1)
-          .all<{ id: string; version: string }>()).results;
+          .all<{ id: string; version: string; state: string }>()).results;
         for (const ref of rows) {
           // Extraction may lose a stale finalization race and still return bytes. Reserve
           // its entire possible body before claiming, then charge the actual reported bytes.
           if (!canContinue() || counts.processed >= options.documents
+            // Current records admission: claim 3 + validity/capacity/R2/body finalization,
+            // plus two maintenance gate statements, needs at least 16 ordinary operations.
+            // This is a preflight, never a charge or a guessed upper bound on R2 traversal;
+            // the wrapped resources still reject every actual opaque operation over 40.
+            || (deps.budget?.remaining ?? Infinity) < 16
             || options.textBytes - counts.textBytes < LIBRARY_LIMITS.bodyBytes) { outcome = "partial"; break; }
-          if (!await prepareMaintenanceStorage(deps, lease)) { outcome = "paused"; break; }
+          if (!await prepareMaintenanceStorage(deps, lease)) {
+            outcome = "paused";
+            // Pending rows already satisfy the pause contract. Failed/upgrade rows must
+            // cross records' guarded pause path so visible state/generation stays its owner.
+            // Persisted pause prevents body extraction; available current text is retained.
+            if (ref.state !== "pending" && canContinue()) {
+              const claim = await records.claim(ref, lease);
+              if (claim && canContinue()) {
+                const result = await records.index(claim);
+                counts.processed++;
+                counts.textBytes += result.textBytes;
+              }
+            }
+            break;
+          }
           if (!canContinue()) { outcome = "partial"; break; }
           const claim = await records.claim(ref, lease);
           if (!claim) continue;

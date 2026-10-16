@@ -197,7 +197,7 @@ it("stops after five failures, respects backoff, and retries only exact manually
 }, 30_000);
 
 it("uses measured allocation after50 indexed samples and pauses before projected corpus growth", async () => {
-  const budgetBytes = 3_500_000;
+  const budgetBytes = 10_000_000;
   const f = await createLibraryFixture({ config: { sizeBudgetBytes: budgetBytes } });
   try {
     const records = createLibraryRecords({ ...f.deps, extract: extractText });
@@ -226,7 +226,7 @@ it("uses measured allocation after50 indexed samples and pauses before projected
     const report = await invocation(f).maintain({ ...limits, listPages: 0 });
     expect(report).toMatchObject({ outcome: "paused", processed: 0, status: { counts: { indexed: 50, pending: 2000 }, storage: { paused: true } } });
     expect(report.status.storage.projectedBytes).toBeGreaterThan(budgetBytes);
-    expect(report.status.storage.bytes + Math.ceil(3.2 * 524288) + 16384).toBeLessThan(budgetBytes);
+    expect(report.status.storage.bytes + 16 * 524288 + 16384).toBeLessThan(budgetBytes);
     expect(await f.db.prepare("SELECT value FROM index_meta WHERE key='generation'").first("value")).toBe(generation);
   } finally { await f.dispose(); }
 }, 30_000);
@@ -507,4 +507,97 @@ it("does not begin extraction if a claim handoff has already consumed the deadli
     now += 40_001;
     expect((await invocation(f).maintain(limits)).indexed).toBe(1);
   } finally { await f.dispose(); }
+}, 20_000);
+
+it("pauses before a high-entropy trigram body can exceed a small configured budget", async () => {
+  const f = await createLibraryFixture({ config: { sizeBudgetBytes: 2_000_000 } });
+  try {
+    let random = 0x12345678;
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const bytes = new Uint8Array(524288);
+    for (let i = 0; i < bytes.length; i++) {
+      random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+      bytes[i] = alphabet.charCodeAt((random >>> 0) % alphabet.length);
+    }
+    await f.bucket.put("Grow0001/note.txt", bytes);
+    await createLibraryRecords(f.deps).ingest((await f.documents.resolve("Grow0001"))!.summary, f.deps.now());
+    const report = await invocation(f).maintain(limits);
+    expect((await f.db.prepare("SELECT 1").all()).meta.size_after).toBeLessThan(2_000_000);
+    expect(report).toMatchObject({ outcome: "paused", processed: 0, indexed: 0, status: { counts: { pending: 1 } } });
+  } finally { await f.dispose(); }
+}, 20_000);
+
+it("retains a persisted backend-capacity pause across cron ticks without retrying extraction", async () => {
+  const f = await createLibraryFixture();
+  try {
+    await f.bucket.put("Full0001/note.txt", "body");
+    await createLibraryRecords(f.deps).ingest((await f.documents.resolve("Full0001"))!.summary, f.deps.now());
+    await f.db.prepare("INSERT INTO index_meta(key,value) VALUES ('storage',?)").bind(JSON.stringify({
+      bytes: 0, budgetBytes: 400_000_000, planningBytes: null, projectedBytes: null,
+      paused: true, reason: "paused: index size budget",
+    })).run();
+    const generation = await f.db.prepare("SELECT value FROM index_meta WHERE key='generation'").first("value");
+    const extract = vi.fn(extractText);
+    for (let i = 0; i < 2; i++) {
+      const report = await invocation(f, extract).maintain(limits);
+      expect(report).toMatchObject({ outcome: "paused", processed: 0, generation: Number(generation), status: { storage: { paused: true } } });
+    }
+    expect(extract).not.toHaveBeenCalled();
+    expect(await f.db.prepare("SELECT attempts FROM documents WHERE id='Full0001'").first("attempts")).toBe(0);
+  } finally { await f.dispose(); }
+}, 20_000);
+
+it("uses the records pause transition for failed and extractor-upgrade rows, preserving current text", async () => {
+  for (const state of ["failed", "upgrade"] as const) {
+    let now = Date.now();
+    const f = await createLibraryFixture({ now: () => now, config: { sizeBudgetBytes: 100_000 } });
+    try {
+      const setup = createLibraryRecords({ ...f.deps, extract: extractText,
+        config: { ...f.deps.config, sizeBudgetBytes: 400_000_000 } });
+      await f.bucket.put("Hold0001/note.txt", state === "failed" ? new Uint8Array([0xff]) : "current retained text");
+      const summary = (await f.documents.resolve("Hold0001"))!.summary;
+      await setup.ingest(summary, f.deps.now());
+      await setup.index((await setup.claim(summary))!);
+      if (state === "upgrade") await f.db.prepare("UPDATE documents SET extractor=0 WHERE id='Hold0001'").run();
+      else now += 60_001; // Select an actually due retry, preserving the backoff policy.
+      const generation = Number(await f.db.prepare("SELECT value FROM index_meta WHERE key='generation'").first("value"));
+      const extract = vi.fn(extractText);
+      const report = await invocation(f, extract).maintain(limits);
+      expect(report).toMatchObject({ outcome: "paused", indexed: 0, failed: 0,
+        generation: generation + 1, status: { counts: { pending: 1, failed: 0 } } });
+      expect(extract).not.toHaveBeenCalled();
+      expect(await f.db.prepare("SELECT state FROM documents WHERE id='Hold0001'").first("state")).toBe("pending");
+      if (state === "upgrade") expect(await f.db.prepare("SELECT body FROM document_text").first("body")).toBe("current retained text");
+      const before = await f.db.prepare("SELECT attempts FROM documents WHERE id='Hold0001'").first("attempts");
+      expect((await invocation(f, extract).maintain(limits)).processed).toBe(0);
+      expect(await f.db.prepare("SELECT attempts FROM documents WHERE id='Hold0001'").first("attempts")).toBe(before);
+    } finally { await f.dispose(); }
+  }
+}, 20_000);
+
+it("verifies varied Unicode native growth separately from its conservative pre-sample admission gate", async () => {
+  let random = 0x19780521;
+  const chars: string[] = [];
+  for (let i = 0; i < 174762; i++) {
+    random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+    chars.push(String.fromCharCode(0x4e00 + (random >>> 0) % 20902));
+  }
+  const body = chars.join("");
+  expect(new TextEncoder().encode(body).length).toBe(524286);
+  for (const budgetBytes of [400_000_000, 2_000_000]) {
+    const f = await createLibraryFixture({ config: { sizeBudgetBytes: budgetBytes } });
+    try {
+      await f.bucket.put("CJK00001/note.txt", body);
+      await createLibraryRecords(f.deps).ingest((await f.documents.resolve("CJK00001"))!.summary, f.deps.now());
+      const report = await invocation(f).maintain(limits);
+      const actual = (await f.db.prepare("SELECT 1").all()).meta.size_after;
+      if (budgetBytes === 400_000_000) {
+        expect(report.indexed).toBe(1);
+        expect(actual).toBeGreaterThan(2_000_000);
+      } else {
+        expect(report).toMatchObject({ outcome: "paused", processed: 0, indexed: 0, status: { counts: { pending: 1 } } });
+        expect(actual).toBeLessThan(budgetBytes);
+      }
+    } finally { await f.dispose(); }
+  }
 }, 20_000);
