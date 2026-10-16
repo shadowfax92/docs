@@ -14,14 +14,13 @@ const bundle = async (path) => {
   });
   return result.outputFiles[0].text;
 };
-const [app, search, styles, shell] = await Promise.all([
-  bundle("src/ui/app.ts"), bundle("src/ui/search-worker.ts"), bundle("src/ui/styles.css"),
-  readFile(resolve(root, "src/ui/index.html"), "utf8"),
+// Catalog search runs against the persistent library index over HTTP; there is no browser Worker.
+const [app, styles, shell] = await Promise.all([
+  bundle("src/ui/app.ts"), bundle("src/ui/styles.css"), readFile(resolve(root, "src/ui/index.html"), "utf8"),
 ]);
 const assets = {
   "/all-docs": { type: "text/html; charset=utf-8", body: shell },
   "/all-docs/assets/app.js": { type: "text/javascript; charset=utf-8", body: app },
-  "/all-docs/assets/search-worker.js": { type: "text/javascript; charset=utf-8", body: search },
   "/all-docs/assets/styles.css": { type: "text/css; charset=utf-8", body: styles },
 };
 await mkdir(resolve(root, ".wrangler/generated"), { recursive: true });

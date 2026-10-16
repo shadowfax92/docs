@@ -452,7 +452,6 @@ describe("Documents and trusted asset interfaces", () => {
 
   it("only exposes explicitly bundled trusted assets through the asset interface", async () => {
     expect(catalogAssets("/all-docs/assets/app.js")?.headers.get("Content-Type")).toBe("text/javascript; charset=utf-8");
-    expect(catalogAssets("/all-docs/assets/search-worker.js")?.headers.get("Content-Type")).toBe("text/javascript; charset=utf-8");
     for (const path of ["/all-docs/assets/../../raw", `/${uploadId}/raw`, "/toString", "/__proto__"]) {
       expect(catalogAssets(path)).toBeNull();
     }
