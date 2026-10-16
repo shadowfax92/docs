@@ -79,6 +79,11 @@ test('busy, paused and failed stop without automatic retry resets', async () => 
 });
 test('stalled partial exits truthfully and plan opens no credentials or network', async () => {
   await fixture([report()], async ({ run, requests, dir }) => {
+    const missingCredentials = await new Promise((resolveChild, reject) => {
+      const child = spawn(process.execPath, [script, '--fixture', '--origin', 'http://127.0.0.1:19999', '--plan'], { stdio: 'ignore' });
+      child.once('error', reject); child.once('close', resolveChild);
+    });
+    assert.equal(missingCredentials, 1); // Fixture mode must never fall back to primary worker/.env.
     const planned = await run(['--plan'], resolve(dir, 'missing.env')); assert.equal(planned.code, 0); assert.equal(requests.length, 0);
     assert.match(planned.stdout, /"mutations":"none/);
     const result = await run(['--stall-batches', '2']); assert.equal(result.code, 5); assert(!result.stdout.includes('Complete:'));

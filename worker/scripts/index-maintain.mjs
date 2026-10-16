@@ -45,6 +45,7 @@ function argumentsFor(args, configuredOrigin) {
     fail('Use the configured HTTPS catalog origin, or --fixture with an explicit HTTP loopback origin.');
   }
   if (result.fixture && !seen.has('--origin')) fail('--fixture requires an explicit loopback --origin.');
+  if (result.fixture && !seen.has('--credentials-file')) fail('--fixture requires an explicit disposable --credentials-file.');
   if (seen.has('--credentials-file') && !result.fixture) fail('--credentials-file is available only with --fixture. Production uses worker/.env.');
   return result;
 }
