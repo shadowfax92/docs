@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCatalog, type CatalogSecurity } from "./catalog";
-import type { SessionResponse, TextRecord } from "./contracts";
+import type { SessionResponse } from "./contracts";
+import { DEFAULT_LIBRARY_CONFIG, LibraryIndexError, type LibraryIndex } from "./library-index";
+import type { LibraryPage, LibrarySearchResponse, LibraryStatus } from "./library-contracts";
 import type { Documents, ResolvedDocument } from "./documents";
 
 const origin = "https://library.example";
@@ -33,18 +35,19 @@ class AuthBucket {
 }
 
 function setup(overrides: Partial<CatalogSecurity> = {}, bucket = new AuthBucket()) {
-  const page = vi.fn<Documents["page"]>().mockResolvedValue({
-    version: 1, items: [], nextCursor: null, scanComplete: true, observedAt: "2026-10-14T00:00:00Z",
-  });
+  const page = vi.fn<LibraryIndex["page"]>().mockResolvedValue(libraryPage());
   const resolve = vi.fn<Documents["resolve"]>().mockResolvedValue(null);
   const remove = vi.fn<Documents["remove"]>().mockResolvedValue({ status: "deleted", deletedObjectCount: 1 });
   const documents: Documents = { create: vi.fn(), page, resolve, remove };
-  const extract = vi.fn<(doc: ResolvedDocument) => Promise<TextRecord>>();
+  const search = vi.fn<LibraryIndex["search"]>().mockResolvedValue(searchPage());
+  const snippets = vi.fn<LibraryIndex["snippets"]>().mockResolvedValue({ version: 1, generation: 1, hits: [], unavailable: [], remaining: [] });
+  const maintain = vi.fn<LibraryIndex["maintain"]>().mockResolvedValue({ version: 1, outcome: "complete", generation: 1, processed: 0, indexed: 0, failed: 0, repaired: 0, reconciledPages: 0, textBytes: 0, status: libraryStatus() });
+  const library = vi.fn(() => ({ documents, page, search, snippets, maintain }));
   const assets = vi.fn((path: string) => new Response(path === "/all-docs" ? "<h1>Trusted shell</h1>" : "trusted asset", {
     headers: { "Content-Type": path === "/all-docs" ? "text/html" : "text/javascript" },
   }));
-  const catalog = createCatalog({ documents, extract, assets, security: { ...security, ...overrides }, bucket: bucket as unknown as R2Bucket });
-  return { catalog, bucket, documents, page, resolve, remove, extract, assets };
+  const catalog = createCatalog({ library, config: DEFAULT_LIBRARY_CONFIG, assets, security: { ...security, ...overrides }, bucket: bucket as unknown as R2Bucket });
+  return { catalog, bucket, documents, page, resolve, remove, search, snippets, maintain, library, assets };
 }
 function req(path: string, options: RequestInit = {}) { return new Request(origin + path, options); }
 function jsonRequest(path: string, method = "GET", body?: unknown, headers: Record<string, string | undefined> = {}) {
@@ -137,7 +140,7 @@ describe("authentication, isolation and private failures", () => {
   it("authenticates before document validation, existence, cursors and storage errors", async () => {
     const app = setup();
     app.page.mockRejectedValue(new Error("private detail"));
-    for (const path of ["/all-docs/session", "/all-docs/api/documents?cursor=bad", "/all-docs/api/documents/Ab12Cd34/text?version=v1", "/all-docs/api/documents/invalid/text", "/all-docs/api/delete"]) {
+    for (const path of ["/all-docs/session", "/all-docs/api/documents?cursor=bad", "/all-docs/api/delete"]) {
       const response = await app.catalog.fetch(jsonRequest(path, path.endsWith("delete") ? "POST" : "GET", path.endsWith("delete") ? {} : undefined));
       expect(response.status).toBe(401);
       privateHeaders(response);
@@ -363,13 +366,13 @@ function batch(items = [{ id: "Ab12Cd34", version: "v1" }]) {
   return { version: 1, items, confirmCount: items.length, confirmation: `DELETE ${items.length} documents` };
 }
 
-describe("document discovery, extraction and reviewed removal", () => {
+describe("metadata discovery and reviewed removal", () => {
   it("signs session-owned cursor continuations, including empty pages, and rejects tampering/other sessions/expiry", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
     const app = setup();
     const { cookie } = await login(app);
-    app.page.mockResolvedValueOnce({ version: 1, items: [], nextCursor: "private-storage-continuation", scanComplete: false, observedAt: "2026-10-14T00:00:00Z" });
+    app.page.mockResolvedValueOnce(libraryPage("private-storage-continuation"));
     const first = await app.catalog.fetch(jsonRequest("/all-docs/api/documents", "GET", undefined, { Cookie: cookie }));
     expect(first.status).toBe(200);
     const page = await first.json() as { items: unknown[]; nextCursor: string; scanComplete: boolean };
@@ -392,42 +395,25 @@ describe("document discovery, extraction and reviewed removal", () => {
   it("rejects unexpected/repeated queries without document I/O", async () => {
     const app = setup();
     const { cookie } = await login(app);
-    for (const path of ["/all-docs/api/documents?cursor=a&cursor=b", "/all-docs/api/documents?olderThan=90", "/all-docs/session?token=bad", "/all-docs/api/documents/Ab12Cd34/text?version=v1&version=v2"]) {
+    for (const path of ["/all-docs/api/documents?cursor=a&cursor=b", "/all-docs/api/documents?olderThan=90", "/all-docs/session?token=bad"]) {
       expect((await app.catalog.fetch(jsonRequest(path, "GET", undefined, { Cookie: cookie }))).status).toBe(400);
     }
     expect(app.page).not.toHaveBeenCalled();
     expect(app.resolve).not.toHaveBeenCalled();
   });
 
-  it("returns inert extraction JSON only for the reviewed version and never opens raw public content", async () => {
+  it("retires extraction routes without any index or document reads, even with a signed session", async () => {
     const app = setup();
     const { cookie } = await login(app);
-    const doc = document();
-    app.resolve.mockResolvedValue(doc);
-    app.extract.mockResolvedValue({ version: 1, id: doc.summary.id, documentVersion: "v1", coverage: "full", reason: null,
-      text: "<script>inert text</script>", sourceBytes: 26, indexedBytes: 26, extractorVersion: 1 });
-    const response = await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text?version=v1", "GET", undefined, { Cookie: cookie }));
-    expect(response.status).toBe(200);
-    expect(response.headers.get("Content-Type")).toContain("application/json");
-    expect((await response.json() as TextRecord).text).toBe("<script>inert text</script>");
-    privateHeaders(response);
-    expect(app.extract).toHaveBeenCalledWith(doc);
-    expect(doc.openBody).not.toHaveBeenCalled();
-    app.extract.mockClear();
-    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text?version=old", "GET", undefined, { Cookie: cookie }))).status).toBe(409);
-    expect(app.extract).not.toHaveBeenCalled();
-    app.resolve.mockResolvedValue(null);
-    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text?version=v1", "GET", undefined, { Cookie: cookie }))).status).toBe(404);
-  });
-
-  it("rejects missing text versions and extractor identity/version mismatches", async () => {
-    const app = setup();
-    const { cookie } = await login(app);
-    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text", "GET", undefined, { Cookie: cookie }))).status).toBe(400);
+    for (const credential of [undefined, cookie]) {
+      for (const suffix of ["", "?version=v1", "?version=v1&version=v2"]) {
+        const response = await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text" + suffix, "GET", undefined, { Cookie: credential }));
+        expect(response.status).toBe(404);
+        privateHeaders(response);
+      }
+    }
+    expect(app.library).not.toHaveBeenCalled();
     expect(app.resolve).not.toHaveBeenCalled();
-    app.resolve.mockResolvedValue(document());
-    app.extract.mockResolvedValue({ version: 1, id: "Other123", documentVersion: "old", text: "", coverage: "error", reason: "changed", sourceBytes: 0, indexedBytes: 0, extractorVersion: 1 });
-    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/documents/Ab12Cd34/text?version=v1", "GET", undefined, { Cookie: cookie }))).status).toBe(409);
   });
 
   it("deletes exactly the confirmed IDs/versions in order and retains partial failures", async () => {
@@ -482,4 +468,195 @@ describe("document discovery, extraction and reviewed removal", () => {
     expect(response.status).toBe(413);
     expect(app.remove).not.toHaveBeenCalled();
   });
+});
+
+function libraryStatus(): LibraryStatus {
+  return { counts: { documents: 0, pending: 0, indexed: 0, failed: 0, metadataOnly: 0, truncated: 0 }, lastReconciledAt: null, anomalies: 0,
+    storage: { bytes: 0, budgetBytes: 400000000, planningBytes: null, projectedBytes: null, paused: false, reason: null } };
+}
+function libraryPage(nextCursor: string | null = null): LibraryPage {
+  return { version: 1, generation: 1, items: [], nextCursor, scanComplete: nextCursor === null, observedAt: "2026-10-14T00:00:00Z", status: libraryStatus() };
+}
+function searchPage(nextCursor: string | null = null): LibrarySearchResponse {
+  return { version: 1, generation: 1, hits: [], complete: nextCursor === null, nextCursor, scope: { documents: 0, pending: 0, failed: 0 }, status: libraryStatus() };
+}
+const searchRequest = () => ({ version: 1, query: { text: "needle", mode: "literal", ignoreCase: true }, filter: { kinds: [], uploadedBefore: null, uploadedAfter: null } });
+const snippetRequest = () => ({ version: 1, generation: 1, query: searchRequest().query, refs: [{ id: "Ab12Cd34", version: "a".repeat(64) }] });
+const maintainRequest = () => ({ version: 1, options: { documents: 100, textBytes: 99999999, listPages: 100, deadlineMs: 99999 } });
+const newPosts = [
+  ["/all-docs/api/search", searchRequest], ["/all-docs/api/snippets", snippetRequest],
+  ["/all-docs/api/index/maintain", maintainRequest], ["/all-docs/api/index/retry", () => ({ version: 1, refs: snippetRequest().refs })],
+] as const;
+
+describe("persistent library HTTP admission", () => {
+  it("authenticates every new POST before body consumption or index construction", async () => {
+    const app = setup();
+    const { cookie, session } = await login(app);
+    for (const [path, body] of newPosts) {
+      for (const [headers, status] of [
+        [{}, 401], [{ Cookie: cookie }, 403],
+        [{ Cookie: cookie, "X-CSRF-Token": session.csrfToken, Origin: security.publicOrigin }, 403],
+        [{ Cookie: cookie, "X-CSRF-Token": session.csrfToken, "Sec-Fetch-Site": "same-site" }, 403],
+        [{ Cookie: cookie, "X-CSRF-Token": session.csrfToken, "X-Docs-Catalog": "" }, 403],
+      ] as const) {
+        const input = jsonRequest(path, "POST", body(), headers);
+        const response = await app.catalog.fetch(input);
+        expect(response.status).toBe(status);
+        expect(input.bodyUsed).toBe(false);
+        privateHeaders(response);
+      }
+    }
+    expect(app.library).not.toHaveBeenCalled();
+  });
+
+  it("maps safe typed failures and redacts SQL/storage failures without hiding validation errors", async () => {
+    const app = setup();
+    const { cookie, session } = await login(app);
+    const headers = { Cookie: cookie, "X-CSRF-Token": session.csrfToken };
+    for (const [code, status, retryable] of [
+      ["invalid_library_request", 400, false], ["invalid_search_request", 400, false], ["invalid_pattern", 400, false],
+      ["invalid_cursor", 400, false], ["stale_generation", 409, true], ["search_budget_exceeded", 422, false], ["library_unavailable", 503, true],
+    ] as const) {
+      app.search.mockRejectedValueOnce(new LibraryIndexError(code, "SELECT private storage key", !retryable));
+      const response = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", searchRequest(), headers));
+      expect(response.status).toBe(status);
+      const payload = await response.json();
+      expect(payload).toMatchObject({ error: { code, retryable } });
+      expect(JSON.stringify(payload)).not.toMatch(/SELECT|private storage key/);
+      privateHeaders(response);
+    }
+    app.search.mockRejectedValueOnce(new Error("D1_ERROR SELECT private storage key"));
+    const response = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", searchRequest(), headers));
+    expect(response.status).toBe(503);
+    expect(await response.text()).not.toMatch(/SELECT|private storage key/);
+    const invalid = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { version: 2 }, headers));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: { retryable: false } });
+  });
+});
+
+describe("bounded library requests and operation-owned cursors", () => {
+  it("admits only the frozen request grammar before calling LibraryIndex", async () => {
+    const app = setup();
+    const { cookie, session } = await login(app);
+    const headers = { Cookie: cookie, "X-CSRF-Token": session.csrfToken };
+    const badSearch = [
+      { ...searchRequest(), version: 2 }, { ...searchRequest(), unexpected: true },
+      { ...searchRequest(), query: { ...searchRequest().query, text: "😀".repeat(65) } },
+      { ...searchRequest(), query: { ...searchRequest().query, mode: "sql" } },
+      { ...searchRequest(), query: { text: "needle", mode: "literal" } },
+      { ...searchRequest(), filter: { ...searchRequest().filter, kinds: ["unknown"] } },
+      { ...searchRequest(), filter: { ...searchRequest().filter, kinds: ["text", "text"] } },
+      { ...searchRequest(), filter: { ...searchRequest().filter, uploadedBefore: "bad date" } },
+      { ...searchRequest(), cursor: "raw-forged-internal-cursor" },
+    ];
+    for (const body of badSearch) {
+      const response = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", body, headers));
+      expect(response.status).toBe(400);
+      privateHeaders(response);
+    }
+    for (const [path, body] of [
+      ["/all-docs/api/snippets", { ...snippetRequest(), generation: -1 }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), generation: 1.5 }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: [{ id: "bad", version: "v1" }] }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: [{ id: "Ab12Cd34", version: "" }] }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: [snippetRequest().refs[0], { id: "Ab12Cd34", version: "v2" }] }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: Array.from({ length: 49 }, (_, i) => ({ id: String(i).padStart(8, "0"), version: "v1" })) }],
+      ["/all-docs/api/snippets", { ...snippetRequest(), refs: [{ id: "Ab12Cd34", version: "a".repeat(129) }] }],
+      ["/all-docs/api/index/retry", { version: 2, refs: [] }],
+      ["/all-docs/api/index/retry", { version: 1, refs: [{ id: "Ab12Cd34", version: "v1" }] }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, retry: [{ id: "Ab12Cd34", version: "v1" }] } }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, documents: -1 } }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, deadlineMs: 0.5 } }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, reconcile: "yes" } }],
+      ["/all-docs/api/index/maintain", { ...maintainRequest(), options: { ...maintainRequest().options, raiseBudget: 999 } }],
+    ] as const) {
+      expect((await app.catalog.fetch(jsonRequest(path, "POST", body, headers))).status).toBe(400);
+    }
+    expect(app.library).not.toHaveBeenCalled();
+    const exactLimit = { ...searchRequest(), query: { ...searchRequest().query, text: "😀".repeat(64) } };
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", exactLimit, headers))).status).toBe(200);
+    expect(app.search).toHaveBeenCalledWith(exactLimit);
+  });
+
+  it("rejects duplicate/prototype JSON fields, URL query text and oversized streams before index I/O", async () => {
+    const app = setup();
+    const { cookie, session } = await login(app);
+    const headers = new Headers(jsonRequest("/all-docs/api/search", "POST", undefined, { Cookie: cookie, "X-CSRF-Token": session.csrfToken }).headers);
+    for (const body of [
+      '{"version":1,"version":1}', '{"version":1,"__proto__":{}}', '{"version":1,"query":{"constructor":{}}}',
+      '{"version":1,"ver\\u0073ion":1}', '{"version":1,"options":{"documents":1,"documents":2}}',
+    ]) {
+      const response = await app.catalog.fetch(req("/all-docs/api/search", { method: "POST", body, headers }));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "invalid_json", retryable: false } });
+    }
+    for (const [path, body] of newPosts) {
+      expect((await app.catalog.fetch(jsonRequest(path + "?query=private", "POST", body(), Object.fromEntries(headers)))).status).toBe(400);
+      expect((await app.catalog.fetch(jsonRequest(path, "POST", body(), { ...Object.fromEntries(headers), "Content-Type": "text/plain" }))).status).toBe(415);
+    }
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array(80 * 1024)); }, cancel() { cancelled = true; } });
+    expect((await app.catalog.fetch(streamed(stream, "/all-docs/api/search", headers))).status).toBe(413);
+    expect(cancelled).toBe(true);
+    expect(app.library).not.toHaveBeenCalled();
+  });
+
+  it("passes snippets unchanged and caps maintain/retry to the same configured work allowance", async () => {
+    const app = setup();
+    const { cookie, session } = await login(app);
+    const headers = { Cookie: cookie, "X-CSRF-Token": session.csrfToken };
+    const snippets = { version: 1 as const, generation: 1, hits: [], unavailable: [], remaining: snippetRequest().refs };
+    app.snippets.mockResolvedValueOnce(snippets);
+    const response = await app.catalog.fetch(jsonRequest("/all-docs/api/snippets", "POST", snippetRequest(), headers));
+    expect(await response.json()).toEqual(snippets);
+    expect(app.snippets).toHaveBeenCalledWith(snippetRequest());
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/index/maintain", "POST", maintainRequest(), headers))).status).toBe(200);
+    expect(app.maintain).toHaveBeenLastCalledWith({ documents: 12, textBytes: 33554432, listPages: 1, deadlineMs: 20000 });
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/index/retry", "POST", { version: 1, refs: snippetRequest().refs }, headers))).status).toBe(200);
+    expect(app.maintain).toHaveBeenLastCalledWith({ documents: 12, textBytes: 33554432, listPages: 1, deadlineMs: 20000, retry: snippetRequest().refs });
+  });
+
+  it("round-trips worst-size opaque cursors, separates operations and refuses session replay/expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-16T00:00:00Z"));
+    const app = setup();
+    const { cookie, session } = await login(app);
+    const headers = { Cookie: cookie, "X-CSRF-Token": session.csrfToken };
+    const raw = "\u0000".repeat(8192);
+    app.page.mockResolvedValueOnce(libraryPage(raw));
+    const first = await app.catalog.fetch(jsonRequest("/all-docs/api/documents", "GET", undefined, headers));
+    expect(first.status).toBe(200);
+    const metadata = await first.json() as LibraryPage;
+    const path = "/all-docs/api/documents?cursor=" + encodeURIComponent(metadata.nextCursor!);
+    expect(new TextEncoder().encode(origin + path).length).toBeLessThanOrEqual(16 * 1024);
+    expect((await app.catalog.fetch(jsonRequest(path, "GET", undefined, headers))).status).toBe(200);
+    expect(app.page).toHaveBeenLastCalledWith(raw);
+    app.search.mockResolvedValueOnce(searchPage(raw));
+    const search = await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", searchRequest(), headers));
+    const result = await search.json() as LibrarySearchResponse;
+    expect(result.nextCursor).not.toBe(metadata.nextCursor);
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { ...searchRequest(), cursor: result.nextCursor }, headers))).status).toBe(200);
+    expect(app.search).toHaveBeenLastCalledWith({ ...searchRequest(), cursor: raw });
+    app.page.mockClear(); app.search.mockClear();
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { ...searchRequest(), cursor: metadata.nextCursor }, headers))).status).toBe(400);
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/documents?cursor=" + result.nextCursor, "GET", undefined, headers))).status).toBe(400);
+    const other = await login(app);
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { ...searchRequest(), cursor: result.nextCursor }, { Cookie: other.cookie, "X-CSRF-Token": other.session.csrfToken }))).status).toBe(400);
+    vi.advanceTimersByTime(1800000);
+    expect((await app.catalog.fetch(jsonRequest("/all-docs/api/search", "POST", { ...searchRequest(), cursor: result.nextCursor }, headers))).status).toBe(400);
+    expect(app.page).not.toHaveBeenCalled(); expect(app.search).not.toHaveBeenCalled();
+  });
+});
+
+it("preserves opaque UTF8 cursor bytes including a leading BOM", async () => {
+  const app = setup();
+  const { cookie } = await login(app);
+  const raw = "\uFEFF😀\\\"\0";
+  app.page.mockResolvedValueOnce(libraryPage(raw));
+  const first = await app.catalog.fetch(jsonRequest("/all-docs/api/documents", "GET", undefined, { Cookie: cookie }));
+  const { nextCursor } = await first.json() as LibraryPage;
+  const resumed = await app.catalog.fetch(jsonRequest("/all-docs/api/documents?cursor=" + nextCursor, "GET", undefined, { Cookie: cookie }));
+  expect(resumed.status).toBe(200);
+  expect(app.page).toHaveBeenLastCalledWith(raw);
 });
