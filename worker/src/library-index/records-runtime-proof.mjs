@@ -19,7 +19,8 @@ const bundled = await build({
       const resources = createInvocationResources(() => env.DB, env.BUCKET);
       const documents = createDocuments(resources.bucket, 'https://docs.example');
       const records = createLibraryRecords({...resources, documents, publicOrigin:'https://docs.example',
-        now:Date.now, nonce:() => crypto.randomUUID(), config:DEFAULT_LIBRARY_CONFIG,
+        now:Date.now, nonce:() => crypto.randomUUID(),
+        config:{...DEFAULT_LIBRARY_CONFIG, sizeBudgetBytes:url.searchParams.has('tiny') ? 2000000 : DEFAULT_LIBRARY_CONFIG.sizeBudgetBytes},
         defer(work) { ctx.waitUntil(work); },
         async extract(doc) { extracts++; await env.GATE.fetch("https://gate.invalid"); return extractText(doc); },
       });
@@ -34,10 +35,11 @@ const bundled = await build({
         return new Response(body.body, {headers:{'Content-Type':'application/octet-stream'}});
       }
       if (url.pathname === '/status') {
-        const row = await env.DB.prepare('SELECT state,attempts,claim_token FROM documents WHERE id=?').bind(id).first();
+        const observed = await env.DB.prepare('SELECT state,attempts,claim_token FROM documents WHERE id=?').bind(id).all();
+        const row = observed.results[0];
         const names = await env.DB.prepare('SELECT rowid FROM document_fts WHERE document_fts MATCH ?').bind('"searchable"').all();
         const bodies = await env.DB.prepare('SELECT rowid FROM document_fts WHERE document_fts MATCH ?').bind('"needle"').all();
-        return Response.json({row,names:names.results.length,bodies:bodies.results.length,extracts,budgetUsed:uploadBudget.used});
+        return Response.json({row,names:names.results.length,bodies:bodies.results.length,extracts,budgetUsed:uploadBudget.used,dbBytes:observed.meta.size_after});
       }
       return new Response('missing',{status:404});
     }};
@@ -75,6 +77,28 @@ try {
   assert.equal(indexed.row.state, "indexed"); assert.equal(indexed.bodies, 1); assert.equal(indexed.extracts, 1);
   assert.equal(indexed.budgetUsed, 25); // Includes the native extractor's conditional R2 GET.
   assert.deepEqual(new Uint8Array(await (await runtime.dispatchFetch(`https://proof.invalid/raw?id=${summary.id}`)).arrayBuffer()), bytes);
+  // Pin the maintenance-discovered xorshift corpus in the native Request.body path too.
+  // These source bytes stay exact in R2 even when text admission pauses before extraction.
+  let random = 0x12345678;
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const entropy = new Uint8Array(524_288);
+  for (let i = 0; i < entropy.length; i++) {
+    random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
+    entropy[i] = alphabet.charCodeAt((random >>> 0) % alphabet.length);
+  }
+  const tiny = await (await runtime.dispatchFetch("https://proof.invalid/upload?tiny", {
+    method: "POST", headers: { "Content-Length": String(entropy.length) }, body: entropy,
+  })).json();
+  let tinyState;
+  const tinyDeadline = Date.now() + 10_000;
+  do {
+    tinyState = await (await runtime.dispatchFetch(`https://proof.invalid/status?id=${tiny.id}`)).json();
+    assert.ok(Date.now() < tinyDeadline, "capacity-paused work settled within proof deadline");
+  } while (tinyState.row.claim_token !== null || tinyState.budgetUsed < 20);
+  assert.equal(tinyState.row.state, "pending"); assert.equal(tinyState.row.attempts, 0);
+  assert.equal(tinyState.extracts, 1); assert.equal(tinyState.budgetUsed, 20);
+  assert.ok(tinyState.dbBytes < 2_000_000);
+  assert.deepEqual(new Uint8Array(await (await runtime.dispatchFetch(`https://proof.invalid/raw?id=${tiny.id}`)).arrayBuffer()), entropy);
   const paused = await (await runtime.dispatchFetch("https://proof.invalid/upload?paused", {
     method: "POST", headers: { "Content-Length": String(bytes.length) }, body: bytes,
   })).json();
@@ -87,7 +111,7 @@ try {
   assert.equal(pausedState.row.state, "pending"); assert.equal(pausedState.row.attempts, 0);
   assert.equal(pausedState.row.claim_token, null); assert.equal(pausedState.extracts, 1);
   assert.ok(pausedState.budgetUsed <= 40);
-  console.log(JSON.stringify({ proof: "native-records-request-body-waitUntil", bytes: bytes.length, pending, indexed, paused: pausedState, passed: true }, null, 2));
+  console.log(JSON.stringify({ proof: "native-records-request-body-waitUntil", bytes: bytes.length, pending, indexed, entropyBytes: entropy.length, capacityPaused: tinyState, paused: pausedState, passed: true }, null, 2));
 } finally {
   allowExtraction();
   await runtime.dispose();
