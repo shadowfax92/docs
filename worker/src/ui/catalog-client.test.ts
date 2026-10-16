@@ -689,11 +689,12 @@ describe("catalog client: search lane", () => {
 
   it("fails a too-broad search explicitly and refuses over-long text without a request", async () => {
     const { client, catalog } = setup([range(2)]);
-    catalog.searchReply = () => libraryError(422, "search_budget_exceeded", "Too many documents match.");
+    catalog.searchReply = () => libraryError(422, "search_budget_exceeded", "Search exceeds 10,000 hits. Narrow the filters.");
     await ready(client);
     await type(client, "e");
     await searched(client);
-    expect(client.searchState().failure).toEqual({ kind: "budget", message: "Too many documents match." });
+    // Type and age never reach the server, so the copy can't suggest narrowing filters.
+    expect(client.searchState().failure).toEqual({ kind: "budget", message: "This search matches too many documents to finish. Make it more specific." });
     expect(client.results().matching).toEqual([]);
 
     await type(client, "é".repeat(129)); // 258 UTF-8 bytes.

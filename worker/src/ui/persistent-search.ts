@@ -37,6 +37,7 @@ export const SEARCH_DEBOUNCE_MS = 200;
 export const REQUEST_TIMEOUT_MS = 20_000;
 /** Fresh restarts allowed after a stale generation, per input. Past this the failure is shown. */
 export const MAX_STALE_RESTARTS = 2;
+const TOO_BROAD = "This search matches too many documents to finish. Make it more specific.";
 /** Snippet replies in a row that process nothing before the lane stops asking for this run. */
 const MAX_SNIPPET_STALLS = 2;
 const ID_PATTERN = /^[A-Za-z0-9]{8}$/;
@@ -278,7 +279,8 @@ export class LibrarySearch {
         return this.fail(run, { kind: "pattern", message: error?.message ?? "This pattern can't be searched." });
       }
       if (reply.status === 422 || error?.code === "search_budget_exceeded") {
-        return this.fail(run, { kind: "budget", message: error?.message ?? "This search is too broad to finish. Make it more specific." });
+        // Own copy: the server may suggest narrowing filters, but type and age never reach it here.
+        return this.fail(run, { kind: "budget", message: TOO_BROAD });
       }
       return this.fail(run, { kind: "unavailable", message: error?.message ?? `Search is unavailable right now (HTTP ${reply.status}).` });
     }
@@ -292,7 +294,7 @@ export class LibrarySearch {
     for (const hit of page.hits) run.hits.set(hit.id, { id: hit.id, version: hit.version, matchCount: hit.matchCount });
     if (run.hits.size > LIBRARY_LIMITS.hits) {
       run.hits.clear();
-      return this.fail(run, { kind: "budget", message: "Too many documents match. Make the search more specific." });
+      return this.fail(run, { kind: "budget", message: TOO_BROAD });
     }
     run.started = true;
     run.generation = page.generation;
