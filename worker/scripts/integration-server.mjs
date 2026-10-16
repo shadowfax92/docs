@@ -1,21 +1,27 @@
 import { Miniflare } from 'miniflare';
 import { zipSync, strToU8 } from 'fflate';
-import { mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, readdir, access } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { seedCachedCorpus } from './persistent-index-fixtures.mjs';
 
 /** Disposable two-origin acceptance environment. All product code runs unchanged in workerd;
- * only the external Cloudflare account is replaced with one shared native local R2 bucket.
+ * only the external account is replaced with shared native local D1 and R2 storage.
  * Never bind to non-loopback interfaces or load production .env/credentials here.
  */
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const run = process.env.DOCS_LOCAL_RUN || 'current';
+const run = process.env.DOCS_LOCAL_RUN || 'persistent-index-local';
 if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(run)) throw new Error('DOCS_LOCAL_RUN must be a simple local run name');
+if (!run.startsWith('persistent-index-')) throw new Error('Use a unique persistent-index-prefixed DOCS_LOCAL_RUN');
 export const state = resolve(root, '.wrangler/integration', run);
-export const publicOrigin = 'http://127.0.0.1:18787';
-export const catalogOrigin = 'http://localhost:18788';
+const port = (name, fallback) => { const value = process.env[name] ?? String(fallback); if (!/^[0-9]+$/.test(value) || +value < 1024 || +value > 65535) throw new Error('Invalid fixture port'); return +value; };
+const publicPort = port('DOCS_PUBLIC_PORT', 18977), catalogPort = port('DOCS_CATALOG_PORT', 18978);
+if (publicPort === catalogPort) throw new Error('Fixture roles require distinct ports');
+export const publicOrigin = `http://127.0.0.1:${publicPort}`;
+export const catalogOrigin = `http://localhost:${catalogPort}`;
 export const password = 'disposable-local-library-password';
 export const sessionKey = 'disposable-local-session-key-32-bytes-minimum';
 export const bearer = 'disposable-local-upload-token';
@@ -24,11 +30,13 @@ export const wordXml = text => `<w:document xmlns:w="http://schemas.openxmlforma
 export function runtime() {
   const common = { modules: true, scriptPath: resolve(root, '.wrangler/build/index.js'),
     compatibilityDate: '2024-12-01', r2Buckets: { DOCS_BUCKET: 'local-docs' },
+    d1Databases: { LIBRARY_DB: 'persistent-index-local' },
     outboundService: () => { throw new Error('Acceptance Workers may not fetch externally'); } };
-  return new Miniflare({ host: '127.0.0.1', port: 18787, cf: false, r2Persist: resolve(state, 'r2'),
+  return new Miniflare({ host: '127.0.0.1', port: publicPort, cf: false, r2Persist: resolve(state, 'r2'),
+    d1Persist: resolve(state, 'd1'),
     cachePersist: false, workers: [
       { ...common, name: 'public', bindings: { APP_ROLE: 'public', PUBLIC_DOCS_ORIGIN: publicOrigin, CATALOG_ORIGIN: catalogOrigin, AUTH_TOKEN: bearer } },
-      { ...common, name: 'catalog', unsafeDirectSockets: [{ host: '127.0.0.1', port: 18788 }],
+      { ...common, name: 'catalog', unsafeDirectSockets: [{ host: '127.0.0.1', port: catalogPort }],
         bindings: { APP_ROLE: 'catalog', PUBLIC_DOCS_ORIGIN: publicOrigin, CATALOG_ORIGIN: catalogOrigin, ALL_DOCS_PASSWORD: password, CATALOG_SESSION_KEY: sessionKey } },
     ] });
 }
@@ -48,11 +56,18 @@ function pdf(text) {
 
 export async function seed(mf) {
   const bucket = await mf.getR2Bucket('DOCS_BUCKET', 'public');
+  const mode = process.env.DOCS_FIXTURE_MODE ?? 'full';
+  if (!['full', 'scale', 'operator'].includes(mode)) throw new Error('Invalid DOCS_FIXTURE_MODE');
+  if (mode === 'scale') return seedCachedCorpus(mf);
   const fixtures = {};
   const put = async (id, filename, body, title = filename, mime = 'application/octet-stream', legacy = false) => {
     await bucket.put(`${id}/${filename}`, Buffer.isBuffer(body) ? new Uint8Array(body) : body, { customMetadata: legacy ? {} : { filename, contentType: mime, docName: title } });
-    fixtures[id] = { filename, title };
+    fixtures[id] = { filename, title, rawSha256: createHash('sha256').update(Buffer.from(body)).digest('hex') };
   };
+  if (mode === 'operator') {
+    for (let i = 0; i < 32; i++) await put(`Op${String(i).padStart(6,'0')}`, 'source.txt', `Native bounded backfill ${i} BodySentinel`, `Operator source ${i}`, 'text/plain');
+    return fixtures;
+  }
   await put('TextHi01', 'rank.txt', 'BodySentinel BodySentinel BodySentinel CaseNeedle literal.a+b', 'High body rank');
   await put('TextLo01', 'rank.txt', 'BodySentinel caseneedle literalXaab', 'Low body rank');
   await put('PlainHt1', 'authored.html', `<!doctype html><html><head><title>Authored page</title><style>body{background:rgb(240,230,220);font:18px sans-serif}p{margin:32px}</style></head><body><main><h1>Authored title</h1><p>First searchable paragraph</p><p>Second paragraph</p><form id="authored-form"><input aria-label="Authored input"><button>Submit</button><output></output></form>${Array.from({length:20},(_,i)=>`<p>Paragraph ${i + 3}</p>`).join('')}</main><script>window.authored=true;document.querySelector('form').onsubmit=e=>{e.preventDefault();document.querySelector('output').textContent=document.querySelector('input').value}</script></body></html>`, 'Authored page', 'text/html');
@@ -85,6 +100,7 @@ export async function seed(mf) {
   for (let i=0;i<103;i++) await put(`Del${String(i).padStart(5,'0')}`, 'delete.txt', `disposable ${i}`, 'Delete cohort');
   await put('AgeOld01', 'old.txt', 'Boundary older fixture', 'Age boundary older', 'text/plain');
   await put('AgeNew01', 'new.txt', 'Boundary newer fixture', 'Age boundary newer', 'text/plain');
+  await put('FailHttp', 'failed.txt', 'Native SQLite failure fixture', 'HTTP failure cohort');
   await put('FailDel1', 'failed.txt', 'Native SQLite failure fixture', 'Failure cohort');
   await put('StaleDel', 'stale.txt', 'Original version', 'Stale cohort');
   // Real media is generated locally; no conversion service or outbound fetch is used.
@@ -110,20 +126,38 @@ for path in sys.argv[1:]:
  c.execute("UPDATE _mf_objects SET uploaded=? WHERE key LIKE 'Scan00%/page.txt'", (int(time.time()*1000)-120*86400000,))
  c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeOld01/old.txt'", (int(time.time()*1000)-90*86400000-60000,))
  c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeNew01/new.txt'", (int(time.time()*1000)-90*86400000+60000,))
- c.execute("CREATE TRIGGER IF NOT EXISTS fail_fixture BEFORE DELETE ON _mf_objects WHEN OLD.key='FailDel1/failed.txt' BEGIN SELECT RAISE(ABORT,'disposable native R2 failure'); END")
+ c.execute("CREATE TRIGGER IF NOT EXISTS fail_fixture BEFORE DELETE ON _mf_objects WHEN OLD.key IN ('FailDel1/failed.txt','FailHttp/failed.txt') BEGIN SELECT RAISE(ABORT,'disposable native R2 failure'); END")
  c.commit()
 `, ...files]);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // Never attach to another campaign's sockets or overwrite an old run. Availability checks
+  // close only these short-lived owned listeners; the manifest records the retained process.
+  for (const fixturePort of [publicPort, catalogPort]) await new Promise((resolvePort, reject) => {
+    const probe = createServer(); probe.once('error', reject);
+    probe.listen(fixturePort, '127.0.0.1', () => probe.close(resolvePort));
+  });
+  try { await access(resolve(state, 'server.json')); throw new Error('Fixture run already exists; choose a new DOCS_LOCAL_RUN'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
   await mkdir(state,{recursive:true});
   let mf=runtime();
-  try { await mf.ready; await seed(mf); } finally { await mf.dispose(); }
+  try {
+    await mf.ready;
+    const db = await mf.getD1Database('LIBRARY_DB', 'public');
+    const sql = await readFile(resolve(root, 'migrations/0001_library_index.sql'), 'utf8');
+    const statements = sql.replace(/^\s*--.*$/gm, '').split(';').map(s => s.trim()).filter(Boolean);
+    await db.batch(statements.map(s => db.prepare(s)));
+    await seed(mf);
+  } finally { await mf.dispose(); }
   await prepareAdapter();
   mf=runtime(); await mf.ready;
   const bundleSha256=createHash('sha256').update(await readFile(resolve(root,'.wrangler/build/index.js'))).digest('hex');
   const sourceCommit=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
-  const info={pid:process.pid,publicOrigin,catalogOrigin,state,sourceCommit,bundleSha256,startedAt:new Date().toISOString(),stop:`kill -TERM ${process.pid}`};
+  const migrationSha256=createHash('sha256').update(await readFile(resolve(root,'migrations/0001_library_index.sql'))).digest('hex');
+  const info={pid:process.pid,publicOrigin,catalogOrigin,state,sourceCommit,bundleSha256,migrationSha256,
+    roles:['public','catalog'],resources:'one shared native D1 and one native R2',
+    startedAt:new Date().toISOString(),stop:`kill -TERM ${process.pid}`};
   await writeFile(resolve(state,'server.json'),JSON.stringify(info,null,2));
   console.log(JSON.stringify(info));
   // Out-of-band replacement is deliberately confined to one disposable legacy fixture, so an

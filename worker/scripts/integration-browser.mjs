@@ -3,7 +3,7 @@ import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, state } from './integration-server.mjs';
 
 /** Physical browser interactions against actual built Worker roles/native R2. Headless Chromium
@@ -39,12 +39,21 @@ try {
   await page.waitForFunction(()=>window.__VH.comments.all().length===2);
   await shot(page,'public-authored');
   check('authored scripts/forms/style/input, default vim j/k/search, line+visual comments and real clipboard export');
-  const bakedRaw=await (await fetch(pub+'/BuiltVim/raw')).text(),bakedPage=await(await fetch(pub+'/BuiltVim')).text();assert.equal(bakedPage,bakedRaw);
+  assert.equal(await page.evaluate(()=>window.__VH.gutter.numbers()),false);
+  await page.keyboard.type('dC');await page.waitForFunction(()=>window.__VH.comments.all().length===0);
+  await page.keyboard.press('u');await page.waitForFunction(()=>window.__VH.comments.all().length===2);
+  await page.keyboard.press('Space');await page.keyboard.type('sk');await page.locator('.docs-ks-input').waitFor();
+  await page.locator('.docs-ks-input').fill('delete all comments');assert(await page.locator('.docs-ks-row').count()>0);await page.keyboard.press('Escape');
+  check('quiet gutter, dC clear/undo and keymap picker through native public page');
+  const bakedRaw=await (await fetch(pub+'/BuiltVim/raw')).text(),bakedPage=await(await fetch(pub+'/BuiltVim')).text();
+  const fixture=JSON.parse(await readFile(resolve(state,'fixtures.json'),'utf8')).BuiltVim;
+  assert.equal(createHash('sha256').update(bakedRaw).digest('hex'),fixture.rawSha256);
+  assert(bakedPage.startsWith(bakedRaw));assert.equal(bakedPage.split('data-docs-vim-quiet').length-1,1);
   await page.goto(pub+'/BuiltVim');await page.waitForFunction(()=>window.__VH?.cursor);
   assert.equal(await page.evaluate(()=>window.__VH.cfg.source),'/synthetic/original.html');
   await page.keyboard.type('ggj');assert.equal(await page.evaluate(()=>window.__VH.cursor.get()),2);
   assert.equal(await page.locator('#vh-ui').count(),1);
-  check('real upstream-built vim HTML stays byte-exact, single runtime and original comment identity');
+  check('real upstream-built raw bytes stay exact; served append-only hook preserves single runtime and original comment identity');
   await page.goto(pub+'/PngImg01');await page.waitForFunction(()=>document.querySelector('[data-image]')?.naturalWidth===1);
   await page.goto(pub+'/WaveAud1');await page.waitForFunction(()=>document.querySelector('audio')?.readyState>=1);
   assert.equal(await page.locator('audio').evaluate(e=>e.duration),1);
@@ -97,10 +106,10 @@ async function catalogProof(context,shot,check) {
   await p.waitForFunction(()=>document.querySelector('#login-error').textContent.includes('Wrong password'));
   await p.getByLabel('Password',{exact:true}).fill(password);await p.getByRole('button',{name:'Unlock',exact:true}).click();
   await p.locator('#library-title').waitFor({state:'visible'});
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
-  assert(lists.length>=2);assert.equal(await p.locator('[data-vh-ui]').count(),0);
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
+  assert(lists.length>=1);assert.equal(await p.locator('[data-vh-ui]').count(),0);
   await p.reload();await p.locator('#library-title').waitFor({state:'visible'});
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
   await shot(p,'catalog-light-desktop');
   await p.getByRole('button',{name:'Switch to dark theme'}).click();await shot(p,'catalog-dark-desktop');
   await p.reload();assert.equal(await p.locator('html').getAttribute('data-theme'),'dark');
@@ -110,7 +119,7 @@ async function catalogProof(context,shot,check) {
   const ids=()=>p.locator('article[data-id]').evaluateAll(es=>es.map(e=>e.dataset.id));
   const query=async(value,count)=>{
     await search.fill(value);
-    await p.waitForFunction(({value,count})=>document.querySelector('#search').value===value&&document.querySelectorAll('article[data-id]').length===count&&!document.querySelector('#search-error').textContent&&(!value||document.querySelector('.coverage').textContent.startsWith('Complete')), {value,count},{timeout:30000});
+    await p.waitForFunction(({value,count})=>document.querySelector('#search').value===value&&document.querySelectorAll('article[data-id]').length===count&&!document.querySelector('#search-error').textContent&&(!value||/^(Complete|Search finished)/.test(document.querySelector('.coverage').textContent)), {value,count},{timeout:30000});
   };
   await query('BodySentinel',4); // high/low, DOCX and legacy all use real extraction
   assert.equal((await ids())[0],'TextHi01');
@@ -132,12 +141,14 @@ async function catalogProof(context,shot,check) {
   assert.match(await p.locator('article[data-id="PdfText1"] [data-coverage=reason]').innerText(),/PDF text extraction is not enabled.*No OCR/);
   await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes('content unreadable'));
   assert.match(await p.locator('article[data-id="DocxBad1"] [data-coverage=reason]').innerText(),/bounded ZIP\/XML limits/);
-  check('real search Worker literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
+  check('real persistent backend literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
+  assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
   await search.fill('');
   await p.locator('.rail input[data-kind="office"]').check();
   await p.waitForFunction(()=>document.querySelectorAll('article[data-id]').length===4);
   assert.deepEqual(new Set(await ids()),new Set(['DocxOk01','DocxBad1','DocxBomb','Office01']));
   await p.locator('.rail input[data-kind="office"]').uncheck();
+  await p.locator('.rail input[data-kind="text"]').check();
   const old=Date.now()-120*86400000;
   await p.locator('#age').selectOption('range');
   await p.locator('#range-from').fill(new Date(old-86400000).toISOString().slice(0,10));await p.locator('#range-from').press('Tab');
@@ -186,7 +197,7 @@ async function catalogProof(context,shot,check) {
   assert.equal((await fetch(pub+'/Legacy01/raw')).status,404);
   check('single-card exact-ID review deletes only its native fixture');
   await search.fill('');await p.getByRole('button',{name:'Refresh',exact:true}).click();
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
   await p.setViewportSize({width:900,height:900});await shot(p,'catalog-tablet');
   await p.setViewportSize({width:375,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile');
   await p.setViewportSize({width:320,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile-320');
