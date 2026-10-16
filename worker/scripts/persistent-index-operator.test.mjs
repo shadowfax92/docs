@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, writeFile, rm, chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { test } from 'node:test';
+import { test } from 'vitest';
 
 /** Operator's process/HTTP seam: a disposable host records requests, never implements D1.
  * Native product acceptance separately drives this same executable against compiled workerd.

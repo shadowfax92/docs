@@ -17,7 +17,7 @@
     "deploy:public": "node scripts/deploy.mjs public",
     "deploy:catalog": "node scripts/deploy.mjs catalog",
     "index:maintain": "node scripts/index-maintain.mjs",
-    "test:operator": "node --test scripts/persistent-index-operator.test.mjs",
+    "test:operator": "vitest run scripts/persistent-index-operator.test.mjs",
     "integration:persistent": "node scripts/persistent-index-native.mjs",
     "integration:scale": "node scripts/persistent-index-browser.mjs"
   },

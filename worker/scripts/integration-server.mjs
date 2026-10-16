@@ -138,25 +138,45 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const probe = createServer(); probe.once('error', reject);
     probe.listen(fixturePort, '127.0.0.1', () => probe.close(resolvePort));
   });
-  try { await access(resolve(state, 'server.json')); throw new Error('Fixture run already exists; choose a new DOCS_LOCAL_RUN'); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (process.argv.slice(2).some(arg => arg !== '--resume')) throw new Error('Only --resume is supported');
+  const resume = process.argv.includes('--resume');
+  let previous;
+  if (resume) {
+    previous = JSON.parse(await readFile(resolve(state, 'server.json'), 'utf8'));
+    if (previous.state !== state || previous.publicOrigin !== publicOrigin || previous.catalogOrigin !== catalogOrigin
+      || previous.resources !== 'one shared native D1 and one native R2') throw new Error('Resume manifest does not match this fixture');
+    if (previous.migrationSha256 !== createHash('sha256').update(await readFile(resolve(root,'migrations/0001_library_index.sql'))).digest('hex')) {
+      throw new Error('Resume requires the same committed migration');
+    }
+    // Never take over a live process, even if it has temporarily released its sockets. Resume
+    // is for this harness's stopped disposable run; it preserves the once-seeded scale corpus.
+    try { process.kill(previous.pid, 0); throw new Error('Previous fixture process is still alive'); }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+  } else {
+    try { await access(resolve(state, 'server.json')); throw new Error('Fixture run already exists; choose a new DOCS_LOCAL_RUN'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
   await mkdir(state,{recursive:true});
-  let mf=runtime();
-  try {
-    await mf.ready;
-    const db = await mf.getD1Database('LIBRARY_DB', 'public');
-    const sql = await readFile(resolve(root, 'migrations/0001_library_index.sql'), 'utf8');
-    const statements = sql.replace(/^\s*--.*$/gm, '').split(';').map(s => s.trim()).filter(Boolean);
-    await db.batch(statements.map(s => db.prepare(s)));
-    await seed(mf);
-  } finally { await mf.dispose(); }
-  await prepareAdapter();
+  let mf;
+  if (!resume) {
+    mf=runtime();
+    try {
+      await mf.ready;
+      const db = await mf.getD1Database('LIBRARY_DB', 'public');
+      const sql = await readFile(resolve(root, 'migrations/0001_library_index.sql'), 'utf8');
+      const statements = sql.replace(/^\s*--.*$/gm, '').split(';').map(s => s.trim()).filter(Boolean);
+      await db.batch(statements.map(s => db.prepare(s)));
+      await seed(mf);
+    } finally { await mf.dispose(); }
+    await prepareAdapter();
+  }
   mf=runtime(); await mf.ready;
   const bundleSha256=createHash('sha256').update(await readFile(resolve(root,'.wrangler/build/index.js'))).digest('hex');
   const sourceCommit=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
   const migrationSha256=createHash('sha256').update(await readFile(resolve(root,'migrations/0001_library_index.sql'))).digest('hex');
   const info={pid:process.pid,publicOrigin,catalogOrigin,state,sourceCommit,bundleSha256,migrationSha256,
     roles:['public','catalog'],resources:'one shared native D1 and one native R2',
+    resumed:resume,previous:previous ? {pid:previous.pid,sourceCommit:previous.sourceCommit,bundleSha256:previous.bundleSha256} : null,
     startedAt:new Date().toISOString(),stop:`kill -TERM ${process.pid}`};
   await writeFile(resolve(state,'server.json'),JSON.stringify(info,null,2));
   console.log(JSON.stringify(info));

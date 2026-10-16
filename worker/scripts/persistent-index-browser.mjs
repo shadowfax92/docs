@@ -98,7 +98,10 @@ try {
   assert(cut); assert(await page.getByRole('button', { name: 'Select all matching', exact: true }).isDisabled());
   check('transport error after real partial scan remains explicit and blocks all-matching');
   await page.unroute('**/all-docs/api/search');
-  await search.fill('['); await page.waitForFunction(() => document.querySelector('#search-error').textContent.length > 0);
+  const invalid = page.waitForResponse(r => r.url().endsWith('/all-docs/api/search')
+    && r.request().postDataJSON()?.query?.text === '[' && r.status() === 400);
+  await search.fill('['); await invalid;
+  await page.waitForFunction(() => document.querySelector('#search-error').textContent.length > 0);
   await page.getByRole('button', { name: 'Regular expression (RE2)', exact: true }).click();
   await query('Database policy', 5000);
   await page.getByRole('button', { name: 'Select all 5,000 matching', exact: true }).click();

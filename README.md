@@ -376,7 +376,7 @@ intentionally delete disposable cohort fixtures. The harness applies the committ
 and seeds legacy/group cases through native R2. It refuses occupied ports or an
 existing run manifest; choose a fresh run name and free ports (`DOCS_PUBLIC_PORT`,
 `DOCS_CATALOG_PORT`) without reusing another campaign server. While workerd is stopped, it changes only
-disposable native storage timestamps and adds a SQL failure trigger for one ID;
+disposable native storage timestamps and adds SQL failure triggers for dedicated IDs;
 product modules and their error paths remain real. SIGUSR1 changes only StaleDel
 for the frozen-version refusal proof. Headless Chromium uses an isolated profile
 and never activates an owner window. Local evidence is not live acceptance.
