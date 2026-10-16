@@ -13,7 +13,7 @@ const browser = await chromium.launch({ headless: true, channel: 'chromium',
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
 const page = await context.newPage(); page.setDefaultTimeout(30_000);
 const requests = [], responses = [], checks = [], errors = [];
-let complete = false;
+let complete = false, changedId = null;
 const check = (name, details = {}) => { checks.push({ name, ...details }); console.log(`PASS ${name}`); };
 page.on('pageerror', e => errors.push(String(e)));
 page.on('request', r => requests.push({ url: r.url(), type: r.resourceType(), method: r.method() }));
@@ -52,8 +52,8 @@ try {
   await page.waitForFunction(() => !Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Select all 5,000 matching')?.disabled);
   await Promise.all(responseWork.splice(0));
   const initial = requests.filter(r => r.url.startsWith(cat));
-  assert(initial.length <= 18, `fresh catalog requests ${initial.length}`);
-  assert.equal(initial.filter(r => r.url.includes('/api/documents')).length, 11); // 10 full pages + final empty keyset page.
+  assert(initial.length <= 15, `fresh catalog requests ${initial.length}`);
+  assert.equal(initial.filter(r => r.url.includes('/api/documents')).length, 10); // 5,000 rows, 500 per native metadata page.
   assert(!requests.some(r => /\/text(?:\?|$)|search-worker/.test(r.url)));
   assert.deepEqual(await page.evaluate(() => window.fixtureWorkers), []);
   check('fresh 5k real UI metadata-only open, no text/worker/corpus transfer', { nonThumbnailRequests: initial.length, elapsedMs: Math.round(performance.now() - started) });
@@ -111,16 +111,27 @@ try {
   const uploaded = await fetch(pub + '/upload', { method: 'PUT', headers: { Authorization: `Bearer ${bearer}`,
     'X-Filename': 'generation.txt', 'Content-Type': 'text/plain' }, body: 'Database policy new generation' });
   assert.equal(uploaded.status, 200);
+  changedId = (await uploaded.json()).id;
   await query('policy-handbook-2345', 1);
-  await page.getByText('The library changed since it loaded. Refresh to see the latest documents.', { exact: true }).waitFor();
+  await page.waitForFunction(() => Array.from(document.querySelectorAll('[role="status"], .banner')).some(e =>
+    !e.hidden && e.textContent.includes('The library changed since it loaded. Refresh to see the latest documents.')));
   assert(await page.getByRole('button', { name: 'Select all matching', exact: true }).isDisabled());
   check('real upload generation change blocks stale snapshot selection');
   assert.deepEqual(errors, []); assert(!requests.some(r => /\/text(?:\?|$)|search-worker/.test(r.url)));
   complete = true;
 } finally {
+  // Keep the once-seeded cache reusable across source fixes. Remove only this proof's real
+  // upload through the decorated public route, preserving permanent reservation/tombstone state.
+  let removedTemporaryUpload = false;
+  if (changedId) {
+    const response = await fetch(pub + '/upload/' + changedId, { method: 'DELETE', headers: { Authorization: `Bearer ${bearer}` } });
+    removedTemporaryUpload = response.status === 204;
+    if (!removedTemporaryUpload) { complete = false; errors.push('Could not remove this proof temporary upload'); }
+  }
   await Promise.allSettled(responseWork);
   const manifest = JSON.parse(await readFile(resolve(state, 'server.json'), 'utf8'));
   await writeFile(resolve(state, 'scale-browser-results.json'), JSON.stringify({ complete, checks, errors, browser: browser.version(),
-    manifest, requests, responses, limits: 'Headless local native workerd; cached D1 seeding is not 5k R2 backfill or deployed CPU/p95 acceptance.' }, null, 2));
+    manifest, removedTemporaryUpload, requests, responses, limits: 'Headless local native workerd; cached D1 seeding is not 5k R2 backfill or deployed CPU/p95 acceptance.' }, null, 2));
   await browser.close();
+  assert.deepEqual(errors, []);
 }
