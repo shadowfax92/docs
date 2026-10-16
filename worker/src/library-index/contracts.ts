@@ -1,3 +1,4 @@
+import type { InvocationBudget } from "../invocation-budget";
 import type { DocumentSummary, SelectionRef, TextRecord } from "../contracts";
 import type { Documents, ResolvedDocument } from "../documents";
 import type { IndexState, LibraryPage, LibrarySearchRequest, LibrarySearchResponse,
@@ -18,6 +19,9 @@ export interface LibraryConfig {
   deletionRepairMs: number;
 }
 export interface LibraryDependencies {
+  // HTTP/cron supply the ledger shared by wrapped D1/R2 and waitUntil. Native host fixtures may
+  // omit it; implementations never double-charge operations already admitted by the wrappers.
+  budget?: InvocationBudget;
   db: D1Database;
   documents: Documents; // Undecorated authoritative R2 module; prevents recursive maintenance.
   extract(doc: ResolvedDocument): Promise<TextRecord>;

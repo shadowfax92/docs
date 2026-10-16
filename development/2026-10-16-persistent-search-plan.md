@@ -75,7 +75,9 @@ in concise architectural comments.
      latest-only/debounced requests, bounded snippets, progressive search and
      conservative selection. Retire search-worker source/asset via a coordinated
      narrow build allowlist edit. Preserve design and all unrelated behavior.
-3. **Integration/deployment tooling (cdxsx).** After prerequisite merges, own
+3. **Integration/deployment tooling (cdxsx).** Prepare independent fixture and
+   operator tooling while the implementation wave is in final review; final
+   native acceptance and merge wait for prerequisite merges. Own
    cross-module proof scripts, real two-origin Miniflare+D1 fixture adaptation,
    safe migration/backfill/deploy recipe and any explicitly transferred glue.
    Prove a fresh 5k browser avoids per-document /text/R2 requests, warm reload,
@@ -108,3 +110,26 @@ in concise architectural comments.
   Go checks and native/browser acceptance. Distinguish local from deployed results.
 - Completion means merged code, deployed roles, existing-corpus backfill and live
   acceptance, with explicit resource, version, performance and limitation evidence.
+
+## Wave coordination amendment (2026-10-16)
+
+The HTTP/wiring owner also owns `worker/src/invocation-budget.ts`, its focused
+test, and the narrow optional budget dependency in the private index contracts.
+One ledger per fetch/scheduled invocation counts every D1 statement and opaque
+R2 operation before I/O, shared with upload waitUntil. Normal work admits 40;
+10 remain for serialized checkpoint/status/lease cleanup, with an absolute 50
+combined-operation ceiling. Batches are admitted atomically by statement count.
+Maintenance saves bounded within-page progress when needed, rather than skipping
+unprocessed rows or replaying the same admitted prefix forever. No paid-plan
+assumption or change is implied by this conservative policy.
+
+The query owner exports private `readLibraryState(deps)` for generation/status
+without returning metadata/body pages. Its agreed cost is three small statements;
+maintenance reuses it and retains its own lease/progress ownership. Shared storage
+metadata keys and the pause shape remain frozen in the library wire contracts.
+
+The UI owner has a narrow transfer to remove the obsolete browser search-worker
+transport/bundling test case in `search.test.ts` and its asset success assertion
+in `index.test.ts`. All matcher, semantic and isolation coverage remains owned by
+the original files' owners; the new browser proof verifies zero Worker/text calls.
+Detailed coordination lives in the campaign's `coordination-1.md`.
