@@ -144,7 +144,8 @@ async function main() {
       if (report.version !== 1 || !['complete', 'partial', 'busy', 'paused'].includes(report.outcome) || !counts
         || !['documents', 'pending', 'failed', 'indexed'].every(k => Number.isSafeInteger(counts[k]) && counts[k] >= 0)
         || !['processed', 'indexed', 'failed', 'repaired', 'reconciledPages', 'generation'].every(k => Number.isSafeInteger(report[k]) && report[k] >= 0)
-        || typeof report.status.storage?.paused !== 'boolean' || !Number.isSafeInteger(report.status.anomalies)
+        || counts.indexed + counts.pending + counts.failed !== counts.documents
+        || typeof report.status.storage?.paused !== 'boolean' || !Number.isSafeInteger(report.status.anomalies) || report.status.anomalies < 0
         || !(report.status.lastReconciledAt === null || Number.isFinite(Date.parse(report.status.lastReconciledAt)))) {
         fail('Stopped: invalid maintenance response.', 4);
       }

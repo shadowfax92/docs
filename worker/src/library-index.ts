@@ -12,7 +12,7 @@ export type { LibraryConfig, LibraryDependencies } from "./library-index/contrac
 
 /** Deep server-only module over a rebuildable D1 index of authoritative R2 Documents.
  * Owns version/tombstone guards, deferred extraction, generation and bounded query/repair policy.
- * This skeleton is deliberately unwired; unfinished operations throw library_unavailable.
+ * HTTP supplies per-invocation resources; both roles share this index while only catalog reads it.
  */
 export interface LibraryIndex {
   readonly documents: Documents;
