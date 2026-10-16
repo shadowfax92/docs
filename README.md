@@ -209,19 +209,112 @@ DOCX accepts at most 2 MiB compressed input and 256 directory entries, reads onl
 lines. Stored/DEFLATE packages are supported; ZIP64/multi-disk/encrypted or
 unsupported XML structures fall back honestly.
 
-Search reads at most 2 MiB source and returns at most 512 KiB UTF-8 per document.
-The browser's cancellable RE2 worker ranks by exact nonempty match count, then
-upload time/ID. Literal is the default; regex/case switches are explicit. Index
-limits are 10,000 documents and 32 MiB estimated retained memory. Query limits
-include 256 pattern bytes, 4,096 instructions, 128 Mi instruction×UTF-16 work,
-1,000,000 finds and a cooperative 1.5-second deadline. Limit errors do not become
-successful partial rankings. No private index is stored in localStorage.
+Search is a persistent, rebuildable D1 index over authoritative R2 objects. Uploads
+publish names before returning where D1 is available, then extract each version in
+`waitUntil`. A failed derived-index write preserves a successful R2 upload for
+reconciliation. Search/reload never extract documents. The browser holds metadata,
+compact exact counts and bounded plaintext snippets; it does not download or
+persist the body corpus or instantiate a search Worker. The retired `/text` route
+and browser search-worker asset return 404.
+
+Literal search uses quoted FTS5 trigram candidates and exact non-overlapping
+counts. Regex and Unicode cases use the same RE2 matcher in bounded progressive
+server scans. Aa, exact counts, UTF-16 snippet ranges, type/date filters and frozen
+ID/version deletion remain available. Partial scans and pending/failed coverage
+stay visible. All-matching selection requires complete discovery and search at the
+same generation, with no pending/failed rows in filter scope. Limit errors remain
+explicit; they never become complete empty results.
+
+Extraction reads at most 2 MiB source and stores at most 512 KiB UTF-8 text per
+version. Metadata pages contain at most 500 rows; body statements at most eight
+rows/4 MiB; scans and snippets stop at 16 MiB or one second and resume. Queries
+admit at most 256 UTF-8 bytes and 10,000 hits. One invocation shares a conservative
+40-operation SQL/R2 work allowance plus 10 cleanup operations. Large or costly
+queries can fail with an explicit budget error and must be narrowed. Neither
+local acceptance nor these limits establish deployed CPU/p95 latency.
+
+Both roles bind the same D1 database, but only the authenticated catalog exposes
+pages, search, snippets, retry and maintenance. POSTs require the signed session,
+exact Origin, same-origin Fetch Metadata, catalog header and CSRF. Responses are
+no-store/noindex; uploaded HTML cannot read the index. Deletes hide behind durable
+D1 tombstones before R2 removal; failed R2 deletion stays hidden for later repair.
+Deleted markers and upload reservations are permanent. Unsupported out-of-band
+R2 recreation is reported as an anomaly and never silently indexed.
+
+### Persistent index rollout and backfill (operator only)
+
+Do this from the final merged, verified tree. The deployment mediator owns all
+remote commands, account inspection and rollout. The dedicated database is
+`docs-library-index` (`8517827e-bcf4-4a9a-93d6-b23b7f62e259`); confirm both configs
+bind that exact ID as `LIBRARY_DB`, both bind the existing R2 bucket, and only the
+catalog has cron triggers. At the 2026-10-16 pre-rollout checkpoint migration
+`0001_library_index.sql` was already applied to the empty, unbound database and
+trigram/contentless FTS plus disposable Time Travel restoration passed. Recheck
+current state before deployment; that checkpoint is not proof of a live rollout.
+
+```sh
+cd worker
+npm ci
+npm run typecheck
+npm test
+npm run test:operator
+npm run build                    # two role dry runs
+npx --no-install wrangler d1 migrations list docs-library-index --remote --config wrangler.catalog.toml
+# Apply ONLY if the reviewed migration is pending on the exact target database:
+npx --no-install wrangler d1 migrations apply docs-library-index --remote --config wrangler.catalog.toml
+npm run deploy:public -- --plan
+npm run deploy:public
+# Verify immutable writer traffic and finish prior in-flight uploads before catalog:
+npm run deploy:catalog -- --public-ready --plan
+npm run deploy:catalog -- --public-ready
+npm run index:maintain -- --plan --max-batches 1000 --deadline-seconds 300
+# After actual auth/role/migration/capacity preflight:
+npm run index:maintain -- --max-batches 1000 --deadline-seconds 300
+```
+
+Use the existing ignored 0600 `worker/.env`; do not print it, pass passwords in
+argv, rotate the session key incidentally, or substitute production credentials
+into fixture tests. The existing deployment recipe uses logged-in local `npx`
+Wrangler and secret JSON stdin with suppressed child/debug logs. Public source
+must precede catalog source. Before backfill verify the real account plan, D1
+capabilities/schema, session/Origin/CSRF/no-store/noindex behavior, public index
+read refusal, and source count/versions against a fresh metadata baseline. Keep
+the default 400,000,000-byte storage budget until an owner explicitly approves a
+capacity change; never upgrade billing automatically.
+
+`index:maintain` defaults to the literal HTTPS catalog origin in
+`wrangler.catalog.toml`. `--plan`/`--dry-run` prints exact endpoint/options without
+opening `.env` or making requests. Execution reads the private password only at
+invocation, keeps cookie/CSRF in memory, starts/resumes one reconcile, then sends
+bounded resume batches with `reconcile:false`. Server checkpoints survive process
+exit; rerun the same command to resume. It shares the cron lease. Progress includes
+only sanitized counts/outcome/timing. Exit 0 requires a newly completed reconcile,
+a complete result, zero pending/failed/anomalies and unpaused storage. Exit 2 is
+busy, 3 paused, 4 HTTP/protocol/failed/anomaly, 5 no visible progress, 6 batch/time
+cap; other local/network failures exit 1. A partial result or zero discovered rows
+never proves completion. It does not reset retries, unhide tombstones, raise a
+budget or repair a blocked listing automatically.
+
+Inspect failures before manually retrying exact failed versions through the
+catalog's explicit retry control. A storage pause requires owner capacity review;
+names remain searchable while pending text remains disclosed. Default five-minute
+drains and daily difference-only reconciliation do not guarantee a backfill time.
+Record mean indexed bytes, actual database growth/projection, query p95/SQL rows
+read/written and extraction/regex CPU on the deployed account before declaring
+production acceptance. D1 Time Travel retention depends on the account plan; an
+FTS-bearing database cannot use ordinary D1 export as a complete backup. Keep the
+migration and rebuild path. Restore/rebuild and any R2 inconsistency require owner
+review: do not delete the database, clear tombstones, or roll back to a mutable
+writer. A prior public release lacking D1 upkeep needs a coordinated rollout and
+reconcile rather than an unreviewed source rollback.
 
 Uploaded dates come from R2 storage time, never a legacy client creation date.
 Discovery follows every cursor and keeps multi-object IDs together. It observes
 concurrent storage rather than an atomic snapshot. Selection/review freezes
-explicit ID/version refs and the age cutoff; deletion commits at most 100 IDs per
-batch and preserves changed/failed/unprocessed selections. Coordinated immutable
+explicit ID/version refs and the age cutoff. The server admits at most 100 refs
+per request; the catalog sends one frozen ref per sequential POST so each request
+gets its own bounded SQL/R2 allowance. A single review/global confirmation still
+controls the whole selection; changed/failed/unprocessed selections are preserved. Coordinated immutable
 writers and permanent claims are prerequisites described above.
 
 Public raw/download bytes stay exact and support single byte ranges, ETag/If-Range
@@ -249,29 +342,44 @@ npm ci
 npm run typecheck
 npm test
 npm run build                    # both roles, dry-run only
-DOCS_LOCAL_RUN=acceptance npm run integration:serve
+DOCS_LOCAL_RUN=persistent-index-acceptance npm run integration:serve
 ```
 
 Leave that terminal running. In another terminal at the same source checkout:
 
 ```sh
 cd worker
-DOCS_LOCAL_RUN=acceptance npm run integration:http
-DOCS_LOCAL_RUN=acceptance npm run integration:browser
+DOCS_LOCAL_RUN=persistent-index-acceptance npm run integration:http
+DOCS_LOCAL_RUN=persistent-index-acceptance npm run integration:browser
 cd ..
 go test ./...
-DOCS_NATIVE_ORIGIN=http://127.0.0.1:18787 go test ./internal/upload -run TestNativeR2Uploads -v
 ```
 
-The literal origins are `http://127.0.0.1:18787` (public) and
-`http://localhost:18788` (catalog); different hosts preserve cookie isolation as
+The operator proof uses its own disposable 0600 credentials and 32 native R2
+sources; it runs the shipped CLI through bounded backfill, held-lease refusal and
+storage pause. The scale proof seeds 5,000 cached native D1/FTS rows once (48 have
+native R2 sources), then drives the compiled UI/backend without HTTP data stubs:
+
+```sh
+cd worker
+npm run integration:persistent
+# In a separate retained server terminal, choose unused loopback ports:
+DOCS_LOCAL_RUN=persistent-index-scale DOCS_FIXTURE_MODE=scale DOCS_PUBLIC_PORT=19177 DOCS_CATALOG_PORT=19178 npm run integration:serve
+# Same environment in the proof terminal:
+DOCS_LOCAL_RUN=persistent-index-scale DOCS_PUBLIC_PORT=19177 DOCS_CATALOG_PORT=19178 npm run integration:scale
+```
+
+The literal origins are `http://127.0.0.1:18977` (public) and
+`http://localhost:18978` (catalog); different hosts preserve cookie isolation as
 well as origin isolation. The server prints its PID/stop command and saves it in
-`worker/.wrangler/integration/acceptance/server.json`. Stop only that PID with
+`worker/.wrangler/integration/persistent-index-acceptance/server.json`. Stop only that PID with
 `kill -TERM <pid>`. All data, JSON results and screenshots live in that ignored
 run directory. Use a fresh `DOCS_LOCAL_RUN` name for each full acceptance; tests
-intentionally delete disposable cohort fixtures. The harness seeds legacy/group
-and pagination cases through native R2. While workerd is stopped, it changes only
-disposable native storage timestamps and adds a SQL failure trigger for one ID;
+intentionally delete disposable cohort fixtures. The harness applies the committed migration to one real D1 shared by both roles
+and seeds legacy/group cases through native R2. It refuses occupied ports or an
+existing run manifest; choose a fresh run name and free ports (`DOCS_PUBLIC_PORT`,
+`DOCS_CATALOG_PORT`) without reusing another campaign server. While workerd is stopped, it changes only
+disposable native storage timestamps and adds SQL failure triggers for dedicated IDs;
 product modules and their error paths remain real. SIGUSR1 changes only StaleDel
 for the frozen-version refusal proof. Headless Chromium uses an isolated profile
 and never activates an owner window. Local evidence is not live acceptance.

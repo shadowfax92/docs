@@ -3,10 +3,10 @@ import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { publicOrigin as pub, catalogOrigin as cat, password, sessionKey, state } from './integration-server.mjs';
 
-/** Physical browser interactions against actual built Worker roles/native R2. Headless Chromium
+/** Physical browser interactions against actual built Worker roles/native D1 and R2. Headless Chromium
  * has an isolated profile; no owner browser/window/clipboard/storage is attached or activated.
  */
 await mkdir(resolve(state,'screenshots'),{recursive:true});
@@ -39,12 +39,21 @@ try {
   await page.waitForFunction(()=>window.__VH.comments.all().length===2);
   await shot(page,'public-authored');
   check('authored scripts/forms/style/input, default vim j/k/search, line+visual comments and real clipboard export');
-  const bakedRaw=await (await fetch(pub+'/BuiltVim/raw')).text(),bakedPage=await(await fetch(pub+'/BuiltVim')).text();assert.equal(bakedPage,bakedRaw);
+  assert.equal(await page.evaluate(()=>window.__VH.gutter.numbers()),false);
+  await page.keyboard.type('dC');await page.waitForFunction(()=>window.__VH.comments.all().length===0);
+  await page.keyboard.press('u');await page.waitForFunction(()=>window.__VH.comments.all().length===2);
+  await page.keyboard.press('Space');await page.keyboard.type('sk');await page.locator('.docs-ks-input').waitFor();
+  await page.locator('.docs-ks-input').fill('delete all comments');assert(await page.locator('.docs-ks-row').count()>0);await page.keyboard.press('Escape');
+  check('quiet gutter, dC clear/undo and keymap picker through native public page');
+  const bakedRaw=await (await fetch(pub+'/BuiltVim/raw')).text(),bakedPage=await(await fetch(pub+'/BuiltVim')).text();
+  const fixture=JSON.parse(await readFile(resolve(state,'fixtures.json'),'utf8')).BuiltVim;
+  assert.equal(createHash('sha256').update(bakedRaw).digest('hex'),fixture.rawSha256);
+  assert(bakedPage.startsWith(bakedRaw));assert.equal(bakedPage.split('data-docs-vim-quiet').length-1,1);
   await page.goto(pub+'/BuiltVim');await page.waitForFunction(()=>window.__VH?.cursor);
   assert.equal(await page.evaluate(()=>window.__VH.cfg.source),'/synthetic/original.html');
   await page.keyboard.type('ggj');assert.equal(await page.evaluate(()=>window.__VH.cursor.get()),2);
   assert.equal(await page.locator('#vh-ui').count(),1);
-  check('real upstream-built vim HTML stays byte-exact, single runtime and original comment identity');
+  check('real upstream-built raw bytes stay exact; served append-only hook preserves single runtime and original comment identity');
   await page.goto(pub+'/PngImg01');await page.waitForFunction(()=>document.querySelector('[data-image]')?.naturalWidth===1);
   await page.goto(pub+'/WaveAud1');await page.waitForFunction(()=>document.querySelector('audio')?.readyState>=1);
   assert.equal(await page.locator('audio').evaluate(e=>e.duration),1);
@@ -54,16 +63,21 @@ try {
   await shot(page,'public-video');
   await page.goto(pub+'/BadMedia');await page.locator('[data-media-error]').waitFor({state:'visible'});
   check('browser decodes PNG, plays PCM WAV and VP9 WebM; invalid MP4 displays media error fallback');
-  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');
-  await page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
+  // Subscribe before navigating: Chromium's independent PDF guest can commit before the parent
+  // load finishes, and waiting afterwards would mistake a missed event for a renderer failure.
+  const pdfGuest=page.waitForEvent('framenavigated',{predicate:f=>f.url().startsWith('chrome-extension://')});
+  await page.goto(pub+'/PdfText1');assert.equal(await page.locator('iframe').getAttribute('src'),pub+'/PdfText1/raw');await pdfGuest;
   // Chromium's PDF guest paints asynchronously after its extension frame navigates.
   await page.waitForTimeout(1200);await shot(page,'public-pdf');
   await page.goto(pub+'/DocxOk01');assert((await page.locator('main').innerText()).includes('DocxBodySentinel & 😀'));await shot(page,'public-docx-light');
   await page.getByRole('button',{name:'Switch to dark theme'}).click();await shot(page,'public-docx-dark');
+  await page.goto(pub+'/JsonDat1');const json=await page.locator('main').innerText();
+  for(const token of ['9007199254740993','1e400','-0'])assert(json.includes(token));
+  await page.goto(pub+'/SafeMark');assert.equal(await page.evaluate(()=>window.markdownPwn),undefined);
   const mobile=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,deviceScaleFactor:1});const mp=await mobile.newPage();
   await mp.goto(pub+'/CsvData1');await shot(mp,'public-csv-mobile');
   assert(await mp.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await mobile.close();
-  check('real text-PDF native wrapper, actual DOCX text and public light/dark/mobile screenshots');
+  check('real text-PDF/DOCX, exact JSON numbers, inert Markdown and public light/dark/mobile screenshots');
   // Authenticate in this browser, then open hostile uploaded markup without even relying on
   // noopener. COOP/cookie host isolation/CORS/frame denial must protect the trusted catalog.
   const trusted=await context.newPage();await trusted.goto(cat+'/all-docs');
@@ -97,10 +111,13 @@ async function catalogProof(context,shot,check) {
   await p.waitForFunction(()=>document.querySelector('#login-error').textContent.includes('Wrong password'));
   await p.getByLabel('Password',{exact:true}).fill(password);await p.getByRole('button',{name:'Unlock',exact:true}).click();
   await p.locator('#library-title').waitFor({state:'visible'});
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
-  assert(lists.length>=2);assert.equal(await p.locator('[data-vh-ui]').count(),0);
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
+  // Full fixture deliberately retains failed DOCX versions. Frozen contracts require the
+  // all-matching gate even for an empty query; metadata discovery alone is insufficient.
+  assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
+  assert(lists.length>=1);assert.equal(await p.locator('[data-vh-ui]').count(),0);
   await p.reload();await p.locator('#library-title').waitFor({state:'visible'});
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
   await shot(p,'catalog-light-desktop');
   await p.getByRole('button',{name:'Switch to dark theme'}).click();await shot(p,'catalog-dark-desktop');
   await p.reload();assert.equal(await p.locator('html').getAttribute('data-theme'),'dark');
@@ -110,7 +127,7 @@ async function catalogProof(context,shot,check) {
   const ids=()=>p.locator('article[data-id]').evaluateAll(es=>es.map(e=>e.dataset.id));
   const query=async(value,count)=>{
     await search.fill(value);
-    await p.waitForFunction(({value,count})=>document.querySelector('#search').value===value&&document.querySelectorAll('article[data-id]').length===count&&!document.querySelector('#search-error').textContent&&(!value||document.querySelector('.coverage').textContent.startsWith('Complete')), {value,count},{timeout:30000});
+    await p.waitForFunction(({value,count})=>document.querySelector('#search').value===value&&document.querySelectorAll('article[data-id]').length===count&&!document.querySelector('#search-error').textContent&&(!value||/^(Complete|Search finished)/.test(document.querySelector('.coverage').textContent)), {value,count},{timeout:30000});
   };
   await query('BodySentinel',4); // high/low, DOCX and legacy all use real extraction
   assert.equal((await ids())[0],'TextHi01');
@@ -130,14 +147,16 @@ async function catalogProof(context,shot,check) {
   await shot(p,'catalog-docx-body-search');
   await query('Text PDF',1);assert((await p.locator('article[data-id="PdfText1"]').innerText()).includes('name match only'));
   assert.match(await p.locator('article[data-id="PdfText1"] [data-coverage=reason]').innerText(),/PDF text extraction is not enabled.*No OCR/);
-  await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes('content unreadable'));
+  await query('broken',1);assert((await p.locator('article[data-id="DocxBad1"]').innerText()).includes("content couldn't be indexed · name searched"));
   assert.match(await p.locator('article[data-id="DocxBad1"] [data-coverage=reason]').innerText(),/bounded ZIP\/XML limits/);
-  check('real search Worker literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
+  check('real persistent backend literal/regex/case, body-only sentinel ranking, invalid-pattern gate and visible DOCX/PDF/error coverage');
+  assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
   await search.fill('');
   await p.locator('.rail input[data-kind="office"]').check();
   await p.waitForFunction(()=>document.querySelectorAll('article[data-id]').length===4);
   assert.deepEqual(new Set(await ids()),new Set(['DocxOk01','DocxBad1','DocxBomb','Office01']));
   await p.locator('.rail input[data-kind="office"]').uncheck();
+  await p.locator('.rail input[data-kind="text"]').check();
   const old=Date.now()-120*86400000;
   await p.locator('#age').selectOption('range');
   await p.locator('#range-from').fill(new Date(old-86400000).toISOString().slice(0,10));await p.locator('#range-from').press('Tab');
@@ -145,11 +164,12 @@ async function catalogProof(context,shot,check) {
   await p.waitForFunction(()=>document.querySelector('#results-label').textContent.startsWith('100 of '));
   await p.locator('#age').selectOption('gt90');
   await p.waitForFunction(()=>document.querySelector('.cutoff')&&!document.querySelector('.cutoff').hidden);
-  const cutoff=(await p.locator('.cutoff span').innerText()).split(' · cutoff fixed')[0];
   await p.waitForFunction(()=>document.querySelector('#results-label').textContent.startsWith('101 of '));
+  const cutoff=(await p.locator('.cutoff span').innerText()).split(' · cutoff fixed')[0];
   await p.getByRole('button',{name:'Select all 101 matching',exact:true}).click();
   await p.getByRole('button',{name:'Review deletion',exact:true}).click();
-  assert((await p.locator('dialog[open]').innerText()).includes(cutoff));
+  const reviewText=await p.locator('dialog[open]').innerText();
+  assert(reviewText.includes(cutoff),JSON.stringify({cutoff,reviewSummary:reviewText.slice(0,400)}));
   assert.equal(await p.locator('dialog[open] .review-list li').count(),101);
   assert(await p.locator('dialog[open]').getByText('AgeOld01',{exact:true}).count());
   assert.equal(await p.locator('dialog[open]').getByText('AgeNew01',{exact:true}).count(),0);
@@ -163,13 +183,27 @@ async function catalogProof(context,shot,check) {
   assert.equal(await p.locator('dialog[open] .review-list li').count(),103);
   const confirm=p.getByRole('button',{name:'Delete 103 documents',exact:true});assert(await confirm.isDisabled());
   await p.locator('#confirm-count').fill('102');assert(await confirm.isDisabled());
+  const batchStart=batches.length;
+  const frozenRefs=await p.evaluate(async()=>{
+    const response=await fetch('/all-docs/api/documents',{headers:{'X-Docs-Catalog':'1'}});
+    return (await response.json()).items.filter(d=>/^Del\d{5}$/.test(d.id)).map(({id,version})=>({id,version}));
+  });
+  assert.equal(frozenRefs.length,103);
   await p.locator('#confirm-count').fill('103');await shot(p,'catalog-exact-count-delete');await confirm.click();
-  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents');
-  assert.deepEqual(batches.slice(-2).map(b=>b.items.length),[100,3]);
-  const deleted=batches.slice(-2).flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
-  for(const b of batches.slice(-2)){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
+  await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 103 documents',null,{timeout:120000});
+  const deletionBatches=batches.slice(batchStart);assert.equal(deletionBatches.length,103);assert(deletionBatches.every(b=>b.items.length===1));
+  const deleted=deletionBatches.flatMap(b=>b.items.map(i=>i.id));assert.equal(new Set(deleted).size,103);assert(deleted.every(id=>/^Del\d{5}$/.test(id)));
+  assert.deepEqual(deletionBatches.flatMap(b=>b.items).sort((a,b)=>a.id.localeCompare(b.id)),frozenRefs.sort((a,b)=>a.id.localeCompare(b.id)));
+  for(let start=0;start<deleted.length;start+=4) await Promise.all(deleted.slice(start,start+4).map(async id=>{
+    assert.equal((await fetch(pub+'/'+id+'/raw')).status,404,`deleted native source ${id}`);
+  }));
+  for(const b of deletionBatches){assert.equal(b.confirmCount,b.items.length);assert.equal(b.confirmation,`DELETE ${b.items.length} documents`);}
   await p.getByRole('button',{name:'Done',exact:true}).click();
-  check('page selection vs all 103 matching, wrong-count refusal and real 100+3 bounded native deletion');
+  check('page selection vs all 103 matching, wrong-count refusal and real 103 sequential single-ref native deletes');
+  // Successful deletes advanced persistent generation. A fresh global selection must refresh
+  // its metadata snapshot before freezing another set; explicit retained refs remain independent.
+  await p.locator('.scan-line').getByRole('button',{name:'Refresh',exact:true}).click();
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh'));
   await p.getByRole('button',{name:'Regular expression (RE2)',exact:true}).click();await query('Failure cohort|Stale cohort',2);
   await p.getByRole('button',{name:'Select all 2 matching',exact:true}).click();await p.getByRole('button',{name:'Review deletion',exact:true}).click();
   const beforeStale=await(await fetch(pub+'/StaleDel/raw')).text();
@@ -185,8 +219,8 @@ async function catalogProof(context,shot,check) {
   await p.getByRole('button',{name:'Delete Legacy01',exact:true}).click();await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 1 document');await p.getByRole('button',{name:'Done',exact:true}).click();
   assert.equal((await fetch(pub+'/Legacy01/raw')).status,404);
   check('single-card exact-ID review deletes only its native fixture');
-  await search.fill('');await p.getByRole('button',{name:'Refresh',exact:true}).click();
-  await p.waitForFunction(()=>Array.from(document.querySelectorAll('button')).some(e=>/^Select all \d[\d,]* matching$/.test(e.textContent)&&!e.disabled));
+  await search.fill('');await p.locator('.scan-line').getByRole('button',{name:'Refresh',exact:true}).click();
+  await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
   await p.setViewportSize({width:900,height:900});await shot(p,'catalog-tablet');
   await p.setViewportSize({width:375,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile');
   await p.setViewportSize({width:320,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile-320');

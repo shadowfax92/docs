@@ -15,7 +15,11 @@
     "deploy": "node scripts/deploy.mjs all",
     "deploy:all": "node scripts/deploy.mjs all",
     "deploy:public": "node scripts/deploy.mjs public",
-    "deploy:catalog": "node scripts/deploy.mjs catalog"
+    "deploy:catalog": "node scripts/deploy.mjs catalog",
+    "index:maintain": "node scripts/index-maintain.mjs",
+    "test:operator": "vitest run scripts/persistent-index-operator.test.mjs",
+    "integration:persistent": "node scripts/persistent-index-native.mjs",
+    "integration:scale": "node scripts/persistent-index-browser.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",

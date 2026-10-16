@@ -52,11 +52,9 @@ export const MAX_SNAPSHOT_RESTARTS = 2;
 /** Manual indexing retry accepts at most 48 exact refs per request (frozen retry contract). */
 export const RETRY_REFS = 48;
 /**
- * Frozen refs per delete request: a transport choice, not the protocol cap. The route admits up to
- * MAX_DELETE_BATCH_ITEMS (100) refs, but each request is one Worker invocation with a shared budget
- * of about 40 D1 statements plus R2 operations (10 more reserved for cleanup). One decorated delete
- * (tombstone, R2 removal, finalize) spends several, so a 100-ref request deleted only 2 and failed
- * the rest. One ref per request always fits; the user still reviews and confirms the set once.
+ * One frozen ref gives each deletion an independent invocation allowance. Server admission of
+ * 100 refs is distinct from the normal 40 combined SQL/R2 operation budget (10 more for cleanup).
+ * Individual storage or budget failures remain per-document; the user confirms the set once.
  */
 export const DELETE_REFS_PER_REQUEST = 1;
 const DAY_MS = 86_400_000;
