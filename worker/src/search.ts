@@ -123,65 +123,16 @@ export function createSearchIndex(): SearchIndex {
       }
       const before = cutoff(filter.uploadedBefore);
       const after = cutoff(filter.uploadedAfter);
-      const pattern = compile(query);
-      const alternatives = query.mode === "regex" ? literalAlternatives(query.text) : [query.text];
-      const scanBranches = alternatives?.length ?? null;
-      // RE2 compilation above remains authoritative even when execution can use string search.
-      // Only proven ASCII branches have the tiny fold alphabet audited against pinned RE2JS.
-      const nativeTerms = alternatives?.every((term) => term.length && !/[^\x00-\x7f]/.test(term))
-        ? alternatives.map((term) => query.ignoreCase ? foldASCII(term) : term) : null;
-      const instructions = pattern?.programSize() ?? 0;
-      const hits: SearchHit[] = [];
-      let work = 0;
-      let finds = 0;
+      const matcher = compileSearchMatcher(query);
       const deadline = performance.now() + 1500;
+      const hits: SearchHit[] = [];
       try {
         for (const record of records.values()) {
-          // Cutoffs refer to the authoritative uploaded timestamp. Upper is strict (<), lower is
-          // inclusive (>=), allowing a whole calendar day to be expressed without millisecond gaps.
+          // Upper cutoff is strict, lower inclusive, using the authoritative R2 upload time.
           if ((filter.kinds.length && !filter.kinds.includes(record.kind as DocumentSummary["kind"]))
             || (before !== null && record.uploadedAt >= before) || (after !== null && record.uploadedAt < after)) continue;
-          let matchCount = 0;
-          let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: record.title.slice(0, SNIPPET_LENGTH), ranges: [] };
-          for (const field of [record.filename, record.title, record.body]) {
-            // Each literal branch scans a field monotonically. Folding adds one bounded pass,
-            // not a program-size multiplier; no field copy survives this iteration/query. The
-            // other regexes can rescan suffixes, so keep their conservative instruction charging.
-            if (scanBranches !== null) work += field.length * scanBranches;
-            if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
-            if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
-            const matcher = nativeTerms
-              ? literalMatcher(query.ignoreCase ? foldASCII(field) : field, nativeTerms)
-              : pattern.matcher(field);
-            let window: SnippetWindow | undefined;
-            let searchedThrough = 0;
-            while (true) {
-              // Each regex find can rescan the entire remaining suffix (a.*b|a). Charge that
-              // conservative upper bound before entering RE2, including the final failing find.
-              // Bounded literal alternatives cannot perform that unbounded suffix lookahead.
-              if (scanBranches === null) work += (field.length - searchedThrough + 1) * instructions;
-              if (work > MAX_QUERY_WORK || ++finds > MAX_FINDS || performance.now() > deadline) queryBudget();
-              const found = matcher.find();
-              if (performance.now() > deadline) queryBudget();
-              if (!found) break;
-              const start = matcher.start();
-              const end = matcher.end();
-              // RE2JS advances zero-width finds by a code point; do not add phantom counts/ranges.
-              searchedThrough = end;
-              if (start === end) {
-                if (end < field.length) searchedThrough += field.codePointAt(end)! > 0xffff ? 2 : 1;
-                continue;
-              }
-              matchCount++;
-              if (!window) window = snippetWindow(field, start);
-              if (window.ranges.length < MAX_RANGES && start < window.end) {
-                window.ranges.push([start - window.start + window.prefix, Math.min(end, window.end) - window.start + window.prefix]);
-              }
-            }
-            // Prefer a body match; otherwise retain the last matching title/filename window.
-            if (window) snippet = { snippet: window.snippet, ranges: window.ranges };
-          }
-          if (!pattern || matchCount) hits.push({ id: record.id, version: record.version, matchCount, ...snippet });
+          const match = matcher.match(record);
+          if (match) hits.push({ id: record.id, version: record.version, ...match });
         }
         hits.sort((a, b) => b.matchCount - a.matchCount
           || records.get(b.id)!.uploadedAt - records.get(a.id)!.uploadedAt
@@ -189,11 +140,95 @@ export function createSearchIndex(): SearchIndex {
         if (performance.now() > deadline) queryBudget();
         return hits;
       } finally {
-        // RE2's per-pattern automata/cache have no purpose after this synchronous query finishes.
-        pattern?.reset();
+        matcher.dispose();
       }
     },
     clear() { records.clear(); metadataBytes = 0; bodyBytes = 0; incomplete = false; },
+  };
+}
+
+/** Immutable names/body input; matching retains no document or corpus between calls. */
+export interface SearchFields { filename: string; title: string; body: string }
+export type SearchMatch = Pick<SearchHit, "matchCount" | "snippet" | "ranges">;
+
+/** One compiled RE2 query and aggregate work/find/deadline budget for a synchronous scan slice.
+ * Reuse across records, then dispose in finally to release RE2 caches. null means no nonempty
+ * match; the empty query returns a zero-count title snippet for every document.
+ */
+export interface CompiledSearchMatcher {
+  match(fields: SearchFields): SearchMatch | null;
+  dispose(): void;
+}
+
+export function compileSearchMatcher(query: SearchQuery, options: { maxElapsedMs?: number } = {}): CompiledSearchMatcher {
+  if (!query || typeof query.text !== "string" || !["literal", "regex"].includes(query.mode ?? "literal")
+    || typeof query.ignoreCase !== "boolean") {
+    throw new SearchError("invalid_search_request", "Search requires literal/regex mode and an explicit case flag.");
+  }
+  // The compiled query outlives its caller's wire object; later edits cannot change its folds.
+  query = { ...query };
+  const elapsed = options.maxElapsedMs ?? 1500;
+  if (!Number.isFinite(elapsed) || elapsed <= 0 || elapsed > 1500) {
+    throw new SearchError("invalid_search_request", "Matching deadlines must be between 0 and 1,500 ms.");
+  }
+  const pattern = compile(query);
+  const alternatives = query.mode === "regex" ? literalAlternatives(query.text) : [query.text];
+  const scanBranches = alternatives?.length ?? null;
+  // RE2 compilation above remains authoritative even when execution can use string search.
+  // Only proven ASCII branches have the tiny fold alphabet audited against pinned RE2JS.
+  const nativeTerms = alternatives?.every((term) => term.length && !/[^\x00-\x7f]/.test(term))
+    ? alternatives.map((term) => query.ignoreCase ? foldASCII(term) : term) : null;
+  const instructions = pattern?.programSize() ?? 0;
+  let work = 0;
+  let finds = 0;
+  let disposed = false;
+  const deadline = performance.now() + elapsed;
+  return {
+    match(fields) {
+      if (disposed) throw new SearchError("invalid_search_request", "The compiled matcher was disposed.");
+      let matchCount = 0;
+      let snippet: Pick<SearchHit, "snippet" | "ranges"> = { snippet: fields.title.slice(0, SNIPPET_LENGTH), ranges: [] };
+      for (const field of [fields.filename, fields.title, fields.body]) {
+        // Each literal branch scans a field monotonically. Folding adds one bounded pass,
+        // not a program-size multiplier; no field copy survives this iteration/query. The
+        // other regexes can rescan suffixes, so keep their conservative instruction charging.
+        if (scanBranches !== null) work += field.length * scanBranches;
+        if (work > MAX_QUERY_WORK || performance.now() > deadline) queryBudget();
+        if (!pattern) continue; // Empty query lists every filtered document, with zero matches.
+        const matcher = nativeTerms
+          ? literalMatcher(query.ignoreCase ? foldASCII(field) : field, nativeTerms)
+          : pattern.matcher(field);
+        let window: SnippetWindow | undefined;
+        let searchedThrough = 0;
+        while (true) {
+          // Each regex find can rescan the entire remaining suffix (a.*b|a). Charge that
+          // conservative upper bound before entering RE2, including the final failing find.
+          // Bounded literal alternatives cannot perform that unbounded suffix lookahead.
+          if (scanBranches === null) work += (field.length - searchedThrough + 1) * instructions;
+          if (work > MAX_QUERY_WORK || ++finds > MAX_FINDS || performance.now() > deadline) queryBudget();
+          const found = matcher.find();
+          if (performance.now() > deadline) queryBudget();
+          if (!found) break;
+          const start = matcher.start();
+          const end = matcher.end();
+          // RE2JS advances zero-width finds by a code point; do not add phantom counts/ranges.
+          searchedThrough = end;
+          if (start === end) {
+            if (end < field.length) searchedThrough += field.codePointAt(end)! > 0xffff ? 2 : 1;
+            continue;
+          }
+          matchCount++;
+          if (!window) window = snippetWindow(field, start);
+          if (window.ranges.length < MAX_RANGES && start < window.end) {
+            window.ranges.push([start - window.start + window.prefix, Math.min(end, window.end) - window.start + window.prefix]);
+          }
+        }
+        // Prefer a body match; otherwise retain the last matching title/filename window.
+        if (window) snippet = { snippet: window.snippet, ranges: window.ranges };
+      }
+      return !pattern || matchCount ? { matchCount, ...snippet } : null;
+    },
+    dispose() { pattern?.reset(); disposed = true; },
   };
 }
 
