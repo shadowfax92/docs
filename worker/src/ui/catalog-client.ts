@@ -11,7 +11,7 @@
  *   GET  /all-docs/api/documents?cursor ─ ≤500-row pages at one generation ─► metadata snapshot
  *   POST /all-docs/api/search, /snippets ─ LibrarySearch: one request in flight, latest input wins
  *   POST /all-docs/api/index/retry ─ ≤48 failed refs, only when asked
- *   review ─► POST /all-docs/api/delete  (≤100 frozen refs per batch, sequential, oldest first)
+ *   review ─► POST /all-docs/api/delete  (one frozen ref per request, sequential, oldest first)
  *
  * Safety invariants: a delete only ever sends ID/version refs frozen when the review opened; no
  * filter or query is re-evaluated after that. "Select all matching" is refused until the snapshot
@@ -20,7 +20,6 @@
  * snippets, never document bodies, and persists none of it. lock()/expiry abort owned requests and
  * drop everything; obsolete replies are discarded by session epoch and snapshot-run checks.
  */
-import { MAX_DELETE_BATCH_ITEMS } from "../contracts";
 import type {
   CatalogError, DeleteBatchRequest, DeleteProgress, DocumentFilter, DocumentSummary, FileKind,
   SelectionRef, SessionResponse, UploadId,
@@ -52,6 +51,14 @@ export const RENDER_STEP = 48;
 export const MAX_SNAPSHOT_RESTARTS = 2;
 /** Manual indexing retry accepts at most 48 exact refs per request (frozen retry contract). */
 export const RETRY_REFS = 48;
+/**
+ * Frozen refs per delete request: a transport choice, not the protocol cap. The route admits up to
+ * MAX_DELETE_BATCH_ITEMS (100) refs, but each request is one Worker invocation with a shared budget
+ * of about 40 D1 statements plus R2 operations (10 more reserved for cleanup). One decorated delete
+ * (tombstone, R2 removal, finalize) spends several, so a 100-ref request deleted only 2 and failed
+ * the rest. One ref per request always fits; the user still reviews and confirms the set once.
+ */
+export const DELETE_REFS_PER_REQUEST = 1;
 const DAY_MS = 86_400_000;
 
 export type AgePreset = "any" | "lt7" | "lt30" | "lt90" | "gt30" | "gt90" | "gt365" | "range";
@@ -1095,7 +1102,7 @@ export class CatalogClient {
   }
 
   // ------------------------------------------------------------------------------------------
-  // Delete review: freeze, confirm, commit in bounded batches, keep failures selected.
+  // Delete review: freeze, confirm once, commit one ref per request, keep failures selected.
 
   /** Freezes the selection (or one card) into explicit refs with the metadata observed now. */
   openReview(single?: UploadId): ReviewState | null {
@@ -1173,13 +1180,13 @@ export class CatalogClient {
     this.changed();
     const wanted = new Set(ids);
     const refs = review.items.filter((item) => wanted.has(item.ref.id)).map((item) => item.ref);
-    for (let start = 0; start < refs.length; start += MAX_DELETE_BATCH_ITEMS) {
+    for (let start = 0; start < refs.length; start += DELETE_REFS_PER_REQUEST) {
       if (review.stopRequested) {
         review.phase = "stopped";
         return this.changed();
       }
-      const batch = refs.slice(start, start + MAX_DELETE_BATCH_ITEMS);
-      // The frozen contract confirms each batch on its own; the typed global count was checked above.
+      const batch = refs.slice(start, start + DELETE_REFS_PER_REQUEST);
+      // The frozen contract confirms each request on its own; the typed global count was checked above.
       const body: DeleteBatchRequest = {
         version: 1, items: batch, confirmCount: batch.length, confirmation: `DELETE ${batch.length} documents`,
       };
@@ -1188,7 +1195,7 @@ export class CatalogClient {
         response = await this.request("/all-docs/api/delete", { method: "POST", body, csrf: session.csrfToken });
       } catch {
         if (epoch !== this.epoch || this.review !== review) return;
-        this.failBatch(review, batch, "Couldn't reach storage; this batch's result is unknown, so it was kept.");
+        this.failBatch(review, batch, "Couldn't reach storage; this request's result is unknown, so it was kept.");
         review.phase = "partial";
         return this.changed();
       }

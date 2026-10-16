@@ -1225,7 +1225,7 @@ class LibraryApp {
           single ? null : h("div", { class: "confirm" },
             h("label", { for: "confirm-count" }, `Type ${total} to confirm`),
             input,
-            h("p", { class: "muted", id: "confirm-help" }, `Deletes run in batches of up to 100, oldest first.`)),
+            h("p", { class: "muted", id: "confirm-help" }, `Deletes run one document at a time, oldest first.`)),
         ),
         h("div", { class: "dialog-foot" }, cancel, submit),
       );
@@ -1234,7 +1234,7 @@ class LibraryApp {
 
     if (review.phase === "running") {
       const stop = h("button", { type: "button", class: "pill secondary", disabled: review.stopRequested },
-        review.stopRequested ? "Stopping after this batch…" : "Stop after this batch");
+        review.stopRequested ? "Stopping after the current document…" : "Stop after the current document");
       stop.addEventListener("click", () => client.stopReview());
       replace(dialog,
         h("div", { class: "dialog-body" },

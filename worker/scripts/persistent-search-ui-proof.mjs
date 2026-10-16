@@ -442,14 +442,16 @@ try {
   await page.locator('#confirm-count').fill(String(selectedCount));
   await page.getByRole('button', { name: `Delete ${selectedCount.toLocaleString('en-US')} documents` }).click();
   await page.waitForFunction(() => /^Deleted/.test(document.querySelector('#review-title')?.textContent ?? ''), null, { timeout: 15000 });
-  assert(deletes.length >= 1 && deletes.every((batch) => batch.items.length <= 100));
+  // One exact frozen ref per request (transport), within the route's 100-ref admission cap.
+  assert(deletes.length === selectedCount && deletes.every((batch) => batch.items.length === 1 && batch.confirmCount === 1));
+  assert.equal(new Set(deletes.map((batch) => batch.items[0].id)).size, selectedCount, 'no ref sent twice');
   assert(deletes.every((batch) => JSON.stringify(Object.keys(batch).sort()) === JSON.stringify(['confirmCount', 'confirmation', 'items', 'version'])));
   assert.equal(deletes.reduce((sum, batch) => sum + batch.items.length, 0), selectedCount);
   await page.getByRole('button', { name: 'Done' }).click();
   for (const batch of deletes) for (const item of batch.items) docs.splice(docs.findIndex((doc) => doc.id === item.id), 1);
   generation++; // The server's own deletions are a visible change.
-  check('select all only with a clean filtered scope; review sends frozen ID/version batches ≤100, never a query', {
-    selected: selectedCount, batches: deletes.map((batch) => batch.items.length),
+  check('select all only with a clean filtered scope; one review, then one frozen ID/version ref per request, never a query', {
+    selected: selectedCount, requests: deletes.length,
   });
 
   // 8. A newer generation prompts Refresh; Refresh restores the gate.

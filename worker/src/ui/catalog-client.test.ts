@@ -5,7 +5,7 @@ import type {
 } from "../library-contracts";
 import { compileSearchMatcher, SearchError } from "../search";
 import {
-  CatalogClient, MAX_SNAPSHOT_RESTARTS, ageWindow, describeWindow, filtersFromParams, filtersToParams, formatBytes,
+  CatalogClient, DELETE_REFS_PER_REQUEST, MAX_SNAPSHOT_RESTARTS, ageWindow, describeWindow, filtersFromParams, filtersToParams, formatBytes,
   formatRelative,
 } from "./catalog-client";
 import { MAX_STALE_RESTARTS, REQUEST_TIMEOUT_MS, SEARCH_DEBOUNCE_MS } from "./persistent-search";
@@ -1125,7 +1125,7 @@ describe("catalog client: selection", () => {
 });
 
 describe("catalog client: delete review", () => {
-  it("freezes refs oldest first, requires the typed count and commits batches of at most 100", async () => {
+  it("freezes refs oldest first, requires the typed count once and sends one exact ref per request", async () => {
     const docs = range(205);
     const { client, catalog } = setup([docs.slice(0, 120), docs.slice(120)]);
     await ready(client);
@@ -1146,7 +1146,10 @@ describe("catalog client: delete review", () => {
 
     await client.confirmReview("205");
     const batches = catalog.requests("POST", "/all-docs/api/delete");
-    expect(batches.map((request) => (request.body as DeleteBatchRequest).items.length)).toEqual([100, 100, 5]);
+    // Transport, not protocol: the route admits 100 refs, but one per request fits the invocation budget.
+    expect(DELETE_REFS_PER_REQUEST).toBe(1);
+    expect(batches).toHaveLength(205);
+    expect(batches.every((request) => (request.body as DeleteBatchRequest).items.length === 1)).toBe(true);
     for (const request of batches) {
       const body = request.body as DeleteBatchRequest;
       expect(body).toMatchObject({ version: 1, confirmCount: body.items.length, confirmation: `DELETE ${body.items.length} documents` });
@@ -1155,6 +1158,7 @@ describe("catalog client: delete review", () => {
       expect(request.headers["x-docs-catalog"]).toBe("1");
     }
     const sent = batches.flatMap((request) => (request.body as DeleteBatchRequest).items);
+    // Exact frozen refs, oldest first, each sent once: no duplicates, no widening.
     expect(sent).toEqual([...docs].reverse().map((document) => ({ id: document.id, version: document.version })));
     expect(client.review?.phase).toBe("complete");
 
@@ -1200,37 +1204,60 @@ describe("catalog client: delete review", () => {
     expect(sent).toEqual([{ id: old.id, version: old.version }]);
   });
 
-  it("keeps changed, failed and unprocessed refs selected after a partial run", async () => {
+  it("keeps changed, failed, omitted and unprocessed refs selected after a partial run", async () => {
     const docs = range(150);
     const { client, catalog } = setup([docs]);
     await ready(client);
     for (const document of docs) client.toggle(document.id);
+    // One request per ref, oldest first. Request 101 fails at the HTTP level, which stops the run.
+    const reply = (request: DeleteBatchRequest, status: DeleteProgress["outcomes"][number]["status"] | null) => Response.json({
+      version: 1, outcomes: status ? [{ id: request.items[0].id, status }] : [], // null: the server omitted it.
+    } satisfies DeleteProgress);
     catalog.deleteReply = (request, call) => {
-      if (call === 2) return error(500);
-      return Response.json({
-        version: 1,
-        outcomes: request.items.map((item, index) => ({
-          id: item.id,
-          status: (index === 0 ? "changed" : index === 1 ? "failed" : index === 2 ? "not-found" : "deleted") as DeleteProgress["outcomes"][number]["status"],
-        })).slice(0, -1), // The last ref has no outcome at all.
-      } satisfies DeleteProgress);
+      if (call === 101) return error(500);
+      return reply(request, call === 1 ? "changed" : call === 2 ? "failed" : call === 3 ? "not-found" : call === 4 ? null : "deleted");
     };
 
     client.openReview();
     await client.confirmReview("150");
+    expect(catalog.requests("POST", "/all-docs/api/delete")).toHaveLength(101);
     expect(client.review?.phase).toBe("partial");
-    const outcomes = [...(client.review?.outcomes.values() ?? [])];
-    expect(outcomes.filter((outcome) => outcome === "deleted")).toHaveLength(96);
-    expect(outcomes.filter((outcome) => outcome === "failed")).toHaveLength(2 + 50);
+    const outcomes = client.review?.outcomes ?? new Map();
+    const oldest = [...docs].reverse().map((document) => document.id);
+    expect([0, 1, 2, 3, 100].map((index) => outcomes.get(oldest[index]))).toEqual(["changed", "failed", "not-found", "failed", "failed"]);
+    expect(client.review?.reasons.get(oldest[3])).toBe("The server returned no result for it.");
+    const values = [...outcomes.values()];
+    expect(values.filter((outcome) => outcome === "deleted")).toHaveLength(96);
+    expect(values.filter((outcome) => outcome === "unprocessed")).toHaveLength(49);
 
     client.closeReview();
-    // 100 in batch one: 96 deleted + 1 missing leave; changed, failed and no-outcome stay.
+    // 96 deleted + 1 already gone leave; changed, failed, omitted, the failed request and the
+    // 49 never sent stay selected as explicit refs.
     expect(client.observed()).toHaveLength(150 - 97);
     expect(client.selection.scope).toBe("refs");
-    expect(client.selectedIds().size).toBe(3 + 50);
+    expect(client.selectedIds().size).toBe(3 + 1 + 49);
   });
 
-  it("stops after the current batch and keeps unprocessed refs selected", async () => {
+  it("retries only failed and unprocessed refs, one per request, with their frozen versions", async () => {
+    const docs = range(5);
+    const { client, catalog } = setup([docs]);
+    await ready(client);
+    expect(client.selectAllMatching()).toBe(true);
+    catalog.deleteReply = (request, call) => call === 3 ? error(503) : Response.json({
+      version: 1, outcomes: [{ id: request.items[0].id, status: "deleted" as const }],
+    } satisfies DeleteProgress);
+    client.openReview();
+    await client.confirmReview("5");
+    expect(client.review?.phase).toBe("partial");
+
+    await client.retryReview();
+    const sent = catalog.requests("POST", "/all-docs/api/delete").map((request) => (request.body as DeleteBatchRequest).items);
+    const oldest = [...docs].reverse().map((document) => ({ id: document.id, version: document.version }));
+    expect(sent).toEqual([[oldest[0]], [oldest[1]], [oldest[2]], [oldest[2]], [oldest[3]], [oldest[4]]]);
+    expect(client.review?.phase).toBe("complete");
+  });
+
+  it("stops after the current request and keeps unprocessed refs selected", async () => {
     const docs = range(250);
     const { client, catalog } = setup([docs]);
     await ready(client);
@@ -1254,11 +1281,11 @@ describe("catalog client: delete review", () => {
     expect(catalog.requests("POST", "/all-docs/api/delete")).toHaveLength(1);
     client.closeReview();
     expect(client.selection.scope).toBe("refs");
-    expect(client.selectedIds().size).toBe(150);
-    expect(client.observed()).toHaveLength(150);
+    expect(client.selectedIds().size).toBe(249);
+    expect(client.observed()).toHaveLength(249);
   });
 
-  it("ends the session on a 401 mid-run without sending the remaining batches", async () => {
+  it("ends the session on a 401 mid-run without sending the remaining requests", async () => {
     const docs = range(120);
     const { client, catalog } = setup([docs]);
     await ready(client);
