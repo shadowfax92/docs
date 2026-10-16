@@ -3,12 +3,16 @@
  *
  * Only the extractor knows why coverage is partial: a source-prefix cap, an output-text cap, DOCX
  * main-document scope, primary-object-only extraction of a multi-object ID, an unsupported format
- * or a parse error. It reports that as free text in `TextRecord.reason`, which catalog-client.ts
- * carries into `ContentState`. The card therefore pairs a neutral label (never "first N bytes" or a
- * percentage of the source) with that reason. app.ts uses this one function both to render the card
- * and to build the grid's re-render key, so a coverage or reason update always rebuilds the card.
+ * or a parse error. The library index stores that free text as `LibraryMetadata.reason`, beside
+ * the document's index state, and catalog-client.ts keeps it in the metadata snapshot. The card
+ * therefore pairs a neutral label (never "first N bytes" or a percentage of the source) with that
+ * reason. Rows the index hasn't extracted yet (pending, including a paused size budget) or couldn't
+ * extract (failed) were matched by title and filename only, and say so. app.ts uses this one
+ * function both to render the card and to build the grid's re-render key, so a coverage or reason
+ * update always rebuilds the card.
  */
-import { formatBytes, type ContentState } from "./catalog-client";
+import type { LibraryMetadata } from "../library-contracts";
+import { formatBytes } from "./catalog-client";
 
 export interface CoverageNote {
   /** Short status in the card's note style, e.g. "512 KB of text searched" or "name match only". */
@@ -22,17 +26,20 @@ export const REASON_DISPLAY_CHARS = 320;
 // Normalizing work is bounded by the prefix scanned, however long a malformed reason is.
 const REASON_SCAN_UNITS = REASON_DISPLAY_CHARS * 4;
 
-/** Returns null for full coverage and for documents not yet indexed: those cards stay unchanged. */
-export function coverageNote(content: ContentState | null): CoverageNote | null {
-  if (content?.status !== "indexed") return null;
-  switch (content.coverage) {
+/** Returns null for fully indexed text and for unknown documents: those cards stay unchanged. */
+export function coverageNote(index: LibraryMetadata | null): CoverageNote | null {
+  if (!index) return null;
+  if (index.state === "pending") return { label: "content not indexed yet · name searched", reason: displayReason(index.reason) };
+  if (index.state === "failed") return { label: "content couldn't be indexed · name searched", reason: displayReason(index.reason) };
+  if (index.state !== "indexed") return null;
+  switch (index.coverage) {
     case "truncated":
       // indexedBytes measures extracted UTF-8 text, not a share or prefix of the stored file.
-      return { label: `${formatBytes(content.indexedBytes)} of text searched`, reason: displayReason(content.reason) };
+      return { label: `${formatBytes(index.indexedBytes)} of text searched`, reason: displayReason(index.reason) };
     case "metadata-only":
-      return { label: "name match only", reason: displayReason(content.reason) };
+      return { label: "name match only", reason: displayReason(index.reason) };
     case "error":
-      return { label: "content unreadable · name only", reason: displayReason(content.reason) };
+      return { label: "content unreadable · name only", reason: displayReason(index.reason) };
     default:
       return null;
   }

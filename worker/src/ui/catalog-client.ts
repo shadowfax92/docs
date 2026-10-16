@@ -2,29 +2,38 @@
  * Catalog client: the browser-side model of the private library at /all-docs.
  *
  * It owns everything between the catalog's inert JSON routes and the DOM: the in-memory session
- * token, full cursor discovery, bounded text extraction into the search Web Worker, query
- * generations, filters/sort/URL state, the global selection and the frozen delete review.
- * app.ts renders `CatalogClient` state and forwards intent; it never speaks HTTP or postMessage.
+ * token, the metadata snapshot read from the persistent library index, filters/sort/URL state, the
+ * global selection and the frozen delete review. Query text goes to the index through
+ * persistent-search.ts. app.ts renders `CatalogClient` state and forwards intent; it never speaks HTTP.
  *
- *   catalog origin (same-origin fetch)                    search Web Worker (postMessage)
+ *   catalog origin (same-origin fetch; session cookie, X-Docs-Catalog, CSRF on every POST)
  *   GET  /all-docs/session ─ csrfToken, expiresAt
- *   GET  /all-docs/api/documents?cursor ─ every page ─► metadata(gen) ─► names ready(gen)
- *   GET  /all-docs/api/documents/:id/text?version (≤3) ───────► add(gen) ─► ready(gen)
- *   filters / query ──────────────────────────────────────────► query(gen) ─► results(gen)
+ *   GET  /all-docs/api/documents?cursor ─ ≤500-row pages at one generation ─► metadata snapshot
+ *   POST /all-docs/api/search, /snippets ─ LibrarySearch: one request in flight, latest input wins
+ *   POST /all-docs/api/index/retry ─ ≤48 failed refs, only when asked
  *   review ─► POST /all-docs/api/delete  (≤100 frozen refs per batch, sequential, oldest first)
  *
  * Safety invariants: a delete only ever sends ID/version refs frozen when the review opened; no
- * filter is re-evaluated after that. "Select all matching" is refused until discovery, indexing
- * and the current search are complete. Extracted text lives only in transit to the worker and in
- * the worker; nothing is persisted. lock()/expiry abort requests, terminate the worker and drop
- * every document, so obsolete async replies are discarded by epoch and generation checks.
+ * filter or query is re-evaluated after that. "Select all matching" is refused until the snapshot
+ * is complete, the current search is complete at the snapshot's generation, and nothing in the
+ * filtered scope is still pending or failed. The tab holds metadata, compact hits and bounded
+ * snippets, never document bodies, and persists none of it. lock()/expiry abort owned requests and
+ * drop everything; obsolete replies are discarded by session epoch and snapshot-run checks.
  */
 import { MAX_DELETE_BATCH_ITEMS } from "../contracts";
 import type {
-  CatalogError, CatalogPage, Coverage, DeleteBatchRequest, DeleteProgress, DocumentFilter,
-  DocumentSummary, FileKind, SelectionRef, SessionResponse, TextRecord, UploadId,
+  CatalogError, DeleteBatchRequest, DeleteProgress, DocumentFilter, DocumentSummary, FileKind,
+  SelectionRef, SessionResponse, UploadId,
 } from "../contracts";
-import type { SearchHit, SearchQuery, SearchWorkerRequest, SearchWorkerResponse } from "../search";
+import {
+  LIBRARY_ENDPOINTS, LIBRARY_LIMITS,
+  type LibraryDocument, type LibraryHit, type LibraryMetadata, type LibraryRetryRequest, type LibraryStatus,
+  type MaintenanceReport, type SearchQuery,
+} from "../library-contracts";
+import {
+  LibrarySearch, isCount, isLibraryStatus, libraryError, scopeKey, searchKey,
+  type SearchFailure, type SearchPhase, type Snippet,
+} from "./persistent-search";
 
 export const FILE_KINDS: readonly FileKind[] = [
   "html", "markdown", "text", "data", "pdf", "image", "audio", "video", "archive", "office", "binary",
@@ -36,13 +45,13 @@ export const KIND_LABEL: Record<FileKind, string> = {
 
 /** Cards are revealed 48 at a time: it divides evenly into 2, 3, 4 and 6 columns. */
 export const RENDER_STEP = 48;
-/** At most three text extractions per tab, matching the catalog's per-tab body-read budget. */
-export const TEXT_CONCURRENCY = 3;
-/** In-tab text budget. Reaching it stops indexing visibly; it never silently drops documents. */
-export const TEXT_BUDGET_BYTES = 32 * 1024 * 1024;
-/** A query the worker has not answered in this time is abandoned and the worker restarted. */
-export const QUERY_BUDGET_MS = 2_000;
-const REQUERY_DELAY_MS = 150;
+/**
+ * Fresh snapshot restarts after the library changed mid-listing (stale generation). A busy library
+ * must not keep a tab re-listing forever; past this the banner asks for Refresh instead.
+ */
+export const MAX_SNAPSHOT_RESTARTS = 2;
+/** Manual indexing retry accepts at most 48 exact refs per request (frozen retry contract). */
+export const RETRY_REFS = 48;
 const DAY_MS = 86_400_000;
 
 export type AgePreset = "any" | "lt7" | "lt30" | "lt90" | "gt30" | "gt90" | "gt365" | "range";
@@ -216,15 +225,9 @@ export function describeWindow(window: AgeWindow, timeZone?: string): string | n
 // ---------------------------------------------------------------------------------------------
 // Client state.
 
-export interface SearchPort {
-  post(message: SearchWorkerRequest): void;
-  terminate(): void;
-}
 export interface CatalogClientDeps {
   /** Same-origin catalog transport; browsers attach the exact Origin on POST/DELETE themselves. */
   fetch(input: string, init: RequestInit): Promise<Response>;
-  /** Starts a fresh search worker. Replies and crashes arrive through the handlers. */
-  openSearch(handlers: { message(reply: SearchWorkerResponse): void; failure(reason: string): void }): SearchPort;
   now(): number;
   timeZone?: string;
 }
@@ -238,43 +241,51 @@ export interface LoginState {
   busy: boolean;
 }
 
-/** Per-document extraction state. Text itself is never retained here. */
-export type ContentState =
-  | { status: "pending" | "fetching" | "indexing" }
-  | { status: "indexed"; coverage: Coverage; indexedBytes: number; reason: string | null }
-  | { status: "failed"; reason: string }
-  | { status: "skipped"; reason: string };
-
+/** The metadata snapshot: every library page read since open or Refresh. */
 export interface ScanState {
   status: "idle" | "running" | "complete" | "incomplete" | "error";
   pages: number;
   error: string | null;
+  /** The library kept changing while listing, so only a fresh Refresh can help (not Retry). */
+  stale: boolean;
   finishedAt: number | null;
+  /** Generation every page of this snapshot was read at; null before the first page. */
+  generation: number | null;
 }
 
+/** What the toolbar, grid and gate need to know about the search for the current query. */
 export interface SearchState {
-  status: "idle" | "pending" | "ready" | "error" | "timeout" | "unavailable";
-  message: string | null;
-  /** Latest answered hits; kept while a new pattern is pending or invalid ("last valid pattern"). */
-  hits: Map<UploadId, SearchHit> | null;
-  hitsKey: string | null;
+  phase: SearchPhase;
+  failure: SearchFailure | null;
+  snippetFailure: string | null;
+  /** Results are on screen, possibly still those of an earlier input. */
+  held: boolean;
+  /** The results on screen belong to the current input (false while a newer input is pending). */
+  current: boolean;
+  /** The results on screen are final for the current input. */
+  complete: boolean;
+  /** The query was too broad for the whole library, so it is searched within the active filter. */
+  scoped: boolean;
+  /** Identity of the results on screen (input, scope and generation), for render memoization. */
+  resultsKey: string | null;
 }
 
-export interface ContentProgress {
+/**
+ * Index coverage of every snapshot document inside the type and age filters, whatever the query
+ * matches. Pending and failed rows are searched by title and filename only.
+ */
+export interface ScopeCoverage {
   total: number;
-  settled: number;
-  searched: number;   // full or truncated text in the index
+  searchable: number; // Indexed text, full or truncated.
   truncated: number;
-  nameOnly: number;   // metadata-only: matched by name/title only
-  unreadable: number; // extraction error: in the index by name/title only
-  failed: number;     // body fetch/index failure; metadata may still be searchable
-  skipped: number;    // over the body budget; metadata admission is independent
-  names: number;      // worker-acknowledged title/filename records
-  metadataFailed: number;
+  nameOnly: number;   // Metadata-only: no extractable text, matched by name only.
   nameOnlyKinds: FileKind[];
-  complete: boolean; // scan complete and every observed document settled
-  budgetExceeded: boolean;
+  unreadable: number; // Extraction error: matched by name only.
+  pending: number;    // Not indexed yet.
+  failed: number;     // Indexing failed; retryable.
 }
+
+export interface RetryState { status: "idle" | "running" | "done" | "error"; message: string | null }
 
 export interface SelectionState {
   scope: "none" | "refs" | "matching";
@@ -309,34 +320,28 @@ export interface Results {
   /** What the grid shows: `matching`, or the selection while "Show selected" is on. */
   visible: DocumentSummary[];
   kindCounts: Map<FileKind, number>; // Every filter except type.
-  olderThan90: number;               // Every filter except age.
+  /** Kinds in the snapshot whose match count a scoped search can't know (outside its type scope). */
+  unknownKinds: FileKind[];
+  olderThan90: number | null;        // Every filter except age; null when a scoped search can't know.
   hiddenSelected: number;
   sort: SortKey;
+  /** "Most matches" waits for a complete search; until then cards stay newest first. */
+  provisional: boolean;
+  scope: ScopeCoverage;
 }
 
 export type SelectAllGate = { ok: true; count: number } | { ok: false; reason: string };
 
-interface Entry {
-  summary: DocumentSummary;
-  content: ContentState;
-  metadata: "indexing" | "indexed" | "failed";
-  bodyCost?: number; // Reserved while posted, released on rejection/replacement/restart.
-}
-/** Each acknowledgement owns one exact Entry, not just an ID that discovery may replace. */
-type IndexFlight = { entry: Entry } & (
-  | { phase: "metadata" }
-  | { phase: "body"; coverage: { coverage: Coverage; indexedBytes: number; reason: string | null } }
-);
-interface QueryFlight { generation: number; key: string; corpus: number; timer: ReturnType<typeof setTimeout> }
-
-const NO_WINDOW: AgeWindow = { after: null, before: null };
-
-function queryKey(query: SearchQuery): string {
-  return JSON.stringify([query.mode, query.ignoreCase, query.text]);
-}
-
 function emptySelection(): SelectionState {
   return { scope: "none", refs: new Map(), excluded: new Set(), label: null, window: null, windowMixed: false, anchor: null };
+}
+
+function emptyScan(): ScanState {
+  return { status: "idle", pages: 0, error: null, stale: false, finishedAt: null, generation: null };
+}
+
+function noun(count: number, one: string, many: string): string {
+  return `${count.toLocaleString("en-US")} ${count === 1 ? one : many}`;
 }
 
 export class CatalogClient {
@@ -344,8 +349,10 @@ export class CatalogClient {
   login: LoginState = { problem: null, message: null, retryAfterSeconds: null, busy: false };
   /** Shown on the login view after a lock whose server-side logout failed. */
   lockNotice: string | null = null;
-  scan: ScanState = { status: "idle", pages: 0, error: null, finishedAt: null };
-  search: SearchState = { status: "idle", message: null, hits: null, hitsKey: null };
+  scan: ScanState = emptyScan();
+  /** Index status from the latest snapshot page; see libraryStatus() for the freshest view. */
+  library: LibraryStatus | null = null;
+  retry: RetryState = { status: "idle", message: null };
   filters: Filters = { ...DEFAULT_FILTERS };
   /** Instant the age cutoff was frozen: on page load, on activating an age filter, or on reset. */
   frozenNow: number;
@@ -358,29 +365,19 @@ export class CatalogClient {
 
   private readonly listeners = new Set<() => void>();
   private announcer: (text: string) => void = () => {};
-  private readonly docs = new Map<UploadId, Entry>();
+  private readonly docs = new Map<UploadId, LibraryDocument>();
   private session: SessionResponse | null = null;
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
-  // Epoch: bumped by lock, expiry and refresh. Every await re-checks it before touching state.
+  // Epoch: bumped by lock and expiry. Every await re-checks it before touching state.
   private epoch = 0;
+  // Snapshot run: bumped by every Refresh, so pages of an abandoned listing are dropped.
+  private scanRun = 0;
+  private snapshotRestarts = 0;
   private abort = new AbortController();
-  private worker: SearchPort | null = null;
-  // Generation: one counter for every worker message, so replies correlate unambiguously.
-  private generation = 0;
-  private readonly pendingAdds = new Map<number, IndexFlight>();
-  private workerIncarnation = 0; // Reject even crash callbacks from a terminated worker.
-  private queue: UploadId[] = [];
-  private resumeCursor: string | null = null; // Next unread listing page after a scan error.
-  private textInFlight = 0;
-  private indexedBytes = 0;
-  private budgetExceeded = false;
-  private searchBroken: string | null = null;
-  private corpusRevision = 0; // Bumped on acknowledged metadata or body changes.
-  private flight: QueryFlight | null = null;
-  private queued = false;
-  private requeryTimer: ReturnType<typeof setTimeout> | null = null;
-  private hitsCorpus = -1;
-  private readonly timedOut = new Set<string>();
+  /** One per signed-in session; disposed on lock/expiry so its late replies are inert. */
+  private search: LibrarySearch | null = null;
+  private resumeCursor: string | null = null; // Next unread library page after a load error.
+  private retryGeneration: number | null = null; // Generation reported by the last indexing retry.
   private resultsCache: { revision: number; value: Results } | null = null;
 
   constructor(private readonly deps: CatalogClientDeps, params = new URLSearchParams()) {
@@ -476,7 +473,16 @@ export class CatalogClient {
     const remaining = Date.parse(session.expiresAt) - this.deps.now();
     // Expiry is enforced locally too, so private content never outlives the cookie on screen.
     this.expiryTimer = setTimeout(() => this.expire(), Math.min(Math.max(remaining, 0), 2_147_483_647));
-    this.startCorpus();
+    this.search = new LibrarySearch({
+      post: (path, body, signal) => this.post(path, body, signal),
+      visible: () => this.snippetDemand(),
+      filter: () => this.activeFilter(),
+      unauthorized: () => this.expire(),
+      changed: () => this.changed(),
+    });
+    // A query restored from the URL is searched right away, alongside the metadata listing.
+    this.search.setQuery(this.currentQuery(), true);
+    this.startSnapshot();
   }
 
   /** The server or the clock ended the session: same teardown as lock, without a DELETE. */
@@ -492,15 +498,14 @@ export class CatalogClient {
     this.abort = new AbortController();
     if (this.expiryTimer !== null) clearTimeout(this.expiryTimer);
     this.expiryTimer = null;
-    this.stopWorker();
+    this.search?.dispose();
+    this.search = null;
     this.session = null;
     this.docs.clear();
-    this.queue = [];
-    this.textInFlight = 0;
-    this.indexedBytes = 0;
-    this.budgetExceeded = false;
-    this.scan = { status: "idle", pages: 0, error: null, finishedAt: null };
-    this.search = { status: "idle", message: null, hits: null, hitsKey: null };
+    this.scan = emptyScan();
+    this.library = null;
+    this.retry = { status: "idle", message: null };
+    this.retryGeneration = null;
     this.selection = emptySelection();
     this.selectedOnly = false;
     this.review = null;
@@ -526,114 +531,158 @@ export class CatalogClient {
   }
 
   // ------------------------------------------------------------------------------------------
-  // Discovery and extraction.
+  // Metadata snapshot and the search seam.
 
-  /** Rescans storage from the first cursor and rebuilds the content index from scratch. */
+  /** Re-lists the library from the first page. The current query is searched again alongside. */
   refresh(): void {
     if (this.view !== "library" || this.scan.status === "running" || this.review?.phase === "running") return;
-    this.epoch++;
-    this.abort.abort();
-    this.abort = new AbortController();
     if (this.selection.scope === "matching") this.clearSelection("Selection cleared because the library was refreshed.");
-    this.stopWorker();
-    this.docs.clear();
-    this.queue = [];
-    this.textInFlight = 0;
-    this.indexedBytes = 0;
-    this.budgetExceeded = false;
-    this.search = { status: this.filters.text ? "pending" : "idle", message: null, hits: null, hitsKey: null };
-    this.startCorpus();
+    this.retry = { status: "idle", message: null };
+    this.retryGeneration = null;
+    this.search?.restart();
+    this.startSnapshot();
   }
 
-  /** Continues discovery after a network or server error, keeping the observed set. */
-  retryScan(cursor: string | null = this.resumeCursor): void {
+  /** Continues listing after a network or server error, keeping the pages already read. */
+  retryScan(): void {
     if (this.view !== "library" || this.scan.status !== "error") return;
-    void this.discover(this.epoch, cursor);
+    // A stale generation can't be resumed: its cursor is bound to the old generation.
+    if (this.scan.stale) return this.refresh();
+    void this.discover(this.epoch, this.scanRun, this.resumeCursor);
   }
 
-  /** Re-queues documents whose text fetch or indexing failed, keeping everything already indexed. */
-  retryContent(): void {
-    if (this.view !== "library" || this.budgetExceeded || this.searchBroken || !this.worker) return;
-    for (const [id, entry] of this.docs) {
-      if (entry.content.status !== "failed") continue;
-      if (entry.metadata === "failed") this.indexMetadata(entry);
-      entry.content = { status: "pending" };
-      this.queue.push(id);
+  /** Retries a failed search or its match previews for the current query. */
+  retrySearch(): void {
+    this.search?.retry();
+  }
+
+  /**
+   * Asks the index to re-extract up to RETRY_REFS failed documents in the current type/age scope.
+   * Rows change on the server only; the snapshot learns about it on Refresh (the reply's newer
+   * generation raises the "library changed" notice).
+   */
+  async retryIndexing(): Promise<void> {
+    const session = this.session;
+    if (this.view !== "library" || !session || this.retry.status === "running") return;
+    const window = this.window();
+    const kinds = this.filters.kinds;
+    const refs = [...this.docs.values()]
+      .filter((doc) => doc.index.state === "failed" && inWindow(Date.parse(doc.uploadedAt), window)
+        && (kinds.length === 0 || kinds.includes(doc.kind)))
+      .slice(0, RETRY_REFS)
+      .map((doc) => ({ id: doc.id, version: doc.version }));
+    if (!refs.length) return;
+    const epoch = this.epoch;
+    this.retry = { status: "running", message: null };
+    this.changed();
+    let response: Response;
+    let body: unknown;
+    try {
+      const request: LibraryRetryRequest = { version: 1, refs };
+      response = await this.request(LIBRARY_ENDPOINTS.retry, { method: "POST", body: request, csrf: session.csrfToken });
+      if (epoch !== this.epoch) return;
+      if (response.status === 401) return this.expire();
+      body = await readJson<unknown>(response);
+    } catch {
+      if (epoch !== this.epoch) return;
+      this.retry = { status: "error", message: "Couldn't reach the library to retry indexing." };
+      return this.changed();
     }
-    this.pump();
+    if (epoch !== this.epoch) return;
+    const report = response.ok ? parseReport(body) : null;
+    if (!report) {
+      this.retry = { status: "error", message: libraryError(body)?.message ?? `Retrying indexing failed (HTTP ${response.status}).` };
+      return this.changed();
+    }
+    this.retryGeneration = Math.max(this.retryGeneration ?? 0, report.generation);
+    const message = report.outcome === "busy" ? "Indexing is busy right now. Try again in a minute."
+      : report.outcome === "paused" ? "Content indexing is paused by the index size budget. Names stay searchable."
+      : `Retried ${noun(refs.length, "document", "documents")}: ${report.indexed.toLocaleString("en-US")} indexed, ${
+        report.failed.toLocaleString("en-US")} still failing. Refresh to update coverage.`;
+    this.retry = { status: report.outcome === "busy" ? "error" : "done", message };
+    this.announcer(message);
     this.changed();
   }
 
-  private startCorpus(): void {
-    this.searchBroken = null;
-    this.timedOut.clear();
-    this.startWorker();
-    this.scan = { status: "running", pages: 0, error: null, finishedAt: null };
+  private startSnapshot(): void {
+    this.scanRun++;
+    this.snapshotRestarts = 0;
+    this.docs.clear();
+    this.library = null;
+    this.scan = { ...emptyScan(), status: "running" };
     this.changed();
-    void this.discover(this.epoch, null);
+    void this.discover(this.epoch, this.scanRun, null);
   }
 
-  private async discover(epoch: number, startCursor: string | null): Promise<void> {
+  /**
+   * Reads ≤500-row metadata pages until the last one. Every page of a snapshot carries the first
+   * page's generation: the server refuses a continuation whose generation moved (409), and a
+   * mismatching page is treated the same, so a snapshot never mixes two library states.
+   */
+  private async discover(epoch: number, run: number, startCursor: string | null): Promise<void> {
+    const live = () => epoch === this.epoch && run === this.scanRun;
     let cursor = startCursor;
-    this.scan = { ...this.scan, status: "running", error: null };
+    this.scan = { ...this.scan, status: "running", error: null, stale: false };
     this.changed();
     for (;;) {
       this.resumeCursor = cursor;
-      const path = cursor === null ? "/all-docs/api/documents"
-        : `/all-docs/api/documents?cursor=${encodeURIComponent(cursor)}`;
-      let page: CatalogPage | null = null;
+      const path = cursor === null ? LIBRARY_ENDPOINTS.documents
+        : `${LIBRARY_ENDPOINTS.documents}?cursor=${encodeURIComponent(cursor)}`;
+      let response: Response;
+      let body: unknown;
       try {
-        const response = await this.request(path, { method: "GET" });
-        if (epoch !== this.epoch) return;
+        response = await this.request(path, { method: "GET" });
+        if (!live()) return;
         if (response.status === 401) return this.expire();
-        if (!response.ok) {
-          const error = await readError(response);
-          if (epoch !== this.epoch) return;
-          return this.scanFailed(error?.message ?? `Storage listing failed (HTTP ${response.status}).`);
-        }
-        page = await readJson<CatalogPage>(response);
+        body = await readJson<unknown>(response);
       } catch {
-        if (epoch !== this.epoch) return;
-        return this.scanFailed("Couldn't reach storage.");
+        if (!live()) return;
+        return this.scanFailed("Couldn't reach the library.");
       }
-      if (epoch !== this.epoch) return;
-      if (!isCatalogPage(page)) return this.scanFailed("Storage returned an unreadable page.");
-      let unreadable = 0;
-      for (const summary of page.items) {
-        if (!isSummary(summary)) {
-          unreadable++;
-          continue;
+      if (!live()) return;
+      if (!response.ok) {
+        const error = libraryError(body);
+        if (response.status === 409 || error?.code === "stale_generation" || (cursor !== null && error?.code === "invalid_cursor")) {
+          return this.restartSnapshot(epoch, run);
         }
-        const previous = this.docs.get(summary.id);
-        if (previous && previous.summary.version === summary.version) continue;
-        this.indexedBytes -= previous?.bodyCost ?? 0;
-        const entry: Entry = { summary, content: { status: "pending" }, metadata: "indexing" };
-        this.docs.set(summary.id, entry);
-        this.indexMetadata(entry);
-        this.queue.push(summary.id);
+        return this.scanFailed(error?.message ?? `Loading the library failed (HTTP ${response.status}).`);
       }
-      this.scan = { ...this.scan, pages: this.scan.pages + 1 };
-      this.pump();
-      this.changed();
+      const page = parseLibraryPage(body);
+      if (!page) return this.scanFailed("The library returned an unreadable page.");
+      if (this.scan.generation !== null && page.generation !== this.scan.generation) return this.restartSnapshot(epoch, run);
+      let unreadable = 0;
+      for (const item of page.items) {
+        if (isLibraryDocument(item)) this.docs.set(item.id, item);
+        else unreadable++;
+      }
+      this.library = page.status;
+      this.scan = { ...this.scan, generation: page.generation, pages: this.scan.pages + 1 };
       if (unreadable) {
-        // Skipping an entry would make "all matching" a lie, so the whole scan becomes incomplete.
-        this.scan = { ...this.scan, status: "incomplete", error: `${unreadable} storage entries were unreadable.`, finishedAt: this.deps.now() };
+        // Skipping an entry would make "all matching" a lie, so the whole snapshot becomes incomplete.
+        this.scan = { ...this.scan, status: "incomplete", error: `${unreadable} library entries were unreadable.`, finishedAt: this.deps.now() };
         return this.changed();
       }
       if (page.nextCursor === null) {
-        this.scan = {
-          ...this.scan,
-          status: page.scanComplete ? "complete" : "incomplete",
-          error: page.scanComplete ? null : "Storage reported an incomplete listing.",
-          finishedAt: this.deps.now(),
-        };
+        this.scan = { ...this.scan, status: "complete", error: null, finishedAt: this.deps.now() };
         this.resumeCursor = null;
         this.pruneSelection();
-        this.scheduleRequery();
         return this.changed();
       }
+      this.changed();
       cursor = page.nextCursor;
     }
+  }
+
+  /** The library changed mid-listing: start a clean snapshot, a bounded number of times. */
+  private restartSnapshot(epoch: number, run: number): Promise<void> | void {
+    if (this.snapshotRestarts >= MAX_SNAPSHOT_RESTARTS) {
+      this.scan = { ...this.scan, status: "error", stale: true, error: "The library kept changing while it loaded." };
+      return this.changed();
+    }
+    this.snapshotRestarts++;
+    this.docs.clear();
+    this.scan = { ...this.scan, pages: 0, generation: null };
+    return this.discover(epoch, run, null);
   }
 
   private scanFailed(message: string): void {
@@ -641,193 +690,10 @@ export class CatalogClient {
     this.changed();
   }
 
-  /** Starts queued text fetches up to TEXT_CONCURRENCY. Called after every arrival and settlement. */
-  private pump(): void {
-    if (this.budgetExceeded || this.searchBroken) {
-      // Nothing more can be indexed. Settle the rest visibly rather than leaving them "pending",
-      // which would keep coverage at "indexing…" forever.
-      const content: ContentState = this.searchBroken
-        ? { status: "failed", reason: this.searchBroken }
-        : { status: "skipped", reason: "Over this tab's search budget." };
-      for (const id of this.queue) {
-        const entry = this.docs.get(id);
-        if (entry?.content.status === "pending") entry.content = content;
-      }
-      this.queue = [];
-      return;
-    }
-    while (this.textInFlight < TEXT_CONCURRENCY && this.queue.length) {
-      const id = this.queue.shift() as UploadId;
-      const entry = this.docs.get(id);
-      if (!entry || entry.content.status !== "pending") continue;
-      this.textInFlight++;
-      entry.content = { status: "fetching" };
-      const epoch = this.epoch;
-      void this.extract(epoch, entry.summary).finally(() => {
-        // Refresh and teardown bump the epoch and reset the counter; only live requests settle it.
-        if (epoch !== this.epoch) return;
-        this.textInFlight--;
-        this.pump();
-        this.changed();
-      });
-    }
-  }
-
-  private async extract(epoch: number, summary: DocumentSummary): Promise<void> {
-    const settle = (content: ContentState) => {
-      const entry = this.docs.get(summary.id);
-      if (epoch === this.epoch && entry?.summary === summary) entry.content = content;
-    };
-    let record: TextRecord | null;
-    try {
-      const response = await this.request(
-        `/all-docs/api/documents/${encodeURIComponent(summary.id)}/text?version=${encodeURIComponent(summary.version)}`,
-        { method: "GET" },
-      );
-      if (epoch !== this.epoch) return;
-      if (response.status === 401) return this.expire();
-      if (response.status === 409) return settle({ status: "failed", reason: "Changed since the scan. Refresh to read it." });
-      if (!response.ok) {
-        const error = await readError(response);
-        return settle({ status: "failed", reason: error?.message ?? `Content unavailable (HTTP ${response.status}).` });
-      }
-      record = await readJson<TextRecord>(response);
-    } catch {
-      return settle({ status: "failed", reason: "Couldn't reach storage for this document's content." });
-    }
-    if (epoch !== this.epoch || this.docs.get(summary.id)?.summary !== summary) return;
-    if (!isTextRecord(record) || record.id !== summary.id || record.documentVersion !== summary.version) {
-      return settle({ status: "failed", reason: "The content response did not match this document version." });
-    }
-    const cost = Math.max(record.indexedBytes, record.text.length);
-    if (this.indexedBytes + cost > TEXT_BUDGET_BYTES) {
-      this.budgetExceeded = true;
-      return settle({ status: "skipped", reason: "Over this tab's search budget." });
-    }
-    if (!this.worker) return settle({ status: "failed", reason: this.searchBroken ?? "Content search is unavailable." });
-    this.indexedBytes += cost;
-    const generation = ++this.generation;
-    const entry = this.docs.get(summary.id)!;
-    entry.bodyCost = cost;
-    this.pendingAdds.set(generation, {
-      entry, phase: "body", coverage: { coverage: record.coverage, indexedBytes: record.indexedBytes, reason: record.reason },
-    });
-    settle({ status: "indexing" });
-    // The record is handed to the worker by structured clone; no reference to its text survives here.
-    this.worker.post({ version: 1, generation, operation: "add", summary, text: record });
-  }
-
-  // ------------------------------------------------------------------------------------------
-  // Search worker: one message counter, one query in flight, latest query wins.
-
-  /** Announce names before extraction. Its acknowledgement never settles body coverage. */
-  private indexMetadata(entry: Entry): void {
-    if (!this.worker) { entry.metadata = "failed"; return; }
-    entry.metadata = "indexing";
-    const generation = ++this.generation;
-    this.pendingAdds.set(generation, { entry, phase: "metadata" });
-    this.worker.post({ version: 1, generation, operation: "metadata", summary: entry.summary });
-  }
-
-  private startWorker(): void {
-    this.generation++;
-    const incarnation = ++this.workerIncarnation;
-    this.pendingAdds.clear();
-    this.flight = null;
-    this.queued = false;
-    try {
-      this.worker = this.deps.openSearch({
-        message: (reply) => { if (incarnation === this.workerIncarnation) this.onReply(reply); },
-        failure: (reason) => { if (incarnation === this.workerIncarnation) this.onWorkerFailure(reason); },
-      });
-    } catch {
-      this.worker = null;
-      this.searchBroken = "Content search could not start in this browser.";
-    }
-  }
-
-  private stopWorker(): void {
-    this.workerIncarnation++;
-    if (this.flight) clearTimeout(this.flight.timer);
-    if (this.requeryTimer !== null) clearTimeout(this.requeryTimer);
-    this.requeryTimer = null;
-    this.flight = null;
-    this.queued = false;
-    this.pendingAdds.clear();
-    if (this.worker) {
-      // Clear first for implementations that release memory eagerly; terminate guarantees it.
-      try {
-        this.worker.post({ version: 1, generation: ++this.generation, operation: "clear" });
-      } catch { /* A crashed worker cannot accept messages; terminate still applies. */ }
-      this.worker.terminate();
-    }
-    this.worker = null;
-  }
-
-  private onWorkerFailure(reason: string): void {
-    this.stopWorker();
-    this.searchBroken = reason || "Content search stopped working.";
-    for (const entry of this.docs.values()) {
-      if (entry.content.status === "indexing" || entry.content.status === "pending") {
-        entry.content = { status: "failed", reason: this.searchBroken };
-      }
-    }
-    this.search = { ...this.search, status: "unavailable", message: this.searchBroken };
-    this.changed();
-  }
-
-  private onReply(reply: SearchWorkerResponse): void {
-    if (!reply || reply.version !== 1) return;
-    const added = this.pendingAdds.get(reply.generation);
-    if (added !== undefined) {
-      this.pendingAdds.delete(reply.generation);
-      const { entry, phase } = added;
-      if (this.docs.get(entry.summary.id) !== entry) return; // Superseded version/scan entry.
-      if (reply.status !== "ready" && reply.status !== "error") return;
-      if (reply.status === "error" && reply.code === "search_budget_exceeded") {
-        this.budgetExceeded = true;
-        this.pump(); // Metadata rejection can arrive while all body slots are held: settle the queue now.
-      }
-      if (phase === "metadata") {
-        entry.metadata = reply.status === "ready" ? "indexed" : "failed";
-      } else {
-        if (reply.status === "error") {
-          this.indexedBytes -= entry.bodyCost ?? 0;
-          entry.bodyCost = 0;
-        }
-        entry.content = reply.status === "error"
-          ? { status: reply.code === "search_budget_exceeded" ? "skipped" : "failed", reason: reply.message || "The search index rejected this document." }
-          : { status: "indexed", ...added.coverage };
-      }
-      // Metadata-budget rejection invalidates the worker's whole index. Invalidate query
-      // freshness too, so cached hits cannot stay "ready" after the hard admission failure.
-      // Body rejection leaves admitted names valid and does not change query freshness.
-      if (reply.status === "ready" || phase === "metadata") {
-        this.corpusRevision++;
-        this.scheduleRequery();
-      }
-      return this.changed();
-    }
-    const flight = this.flight;
-    if (!flight || reply.generation !== flight.generation) return; // Obsolete generation.
-    clearTimeout(flight.timer);
-    this.flight = null;
-    if (flight.key === this.currentKey()) {
-      if (reply.status === "results") {
-        this.search = {
-          status: "ready", message: null,
-          hits: new Map((Array.isArray(reply.hits) ? reply.hits : []).map((hit) => [hit.id, hit])),
-          hitsKey: flight.key,
-        };
-        this.hitsCorpus = flight.corpus;
-      } else if (reply.status === "error") {
-        this.search = { ...this.search, status: "error", message: reply.message || "This pattern can't be searched." };
-        this.hitsCorpus = flight.corpus;
-      }
-      if (this.corpusRevision !== flight.corpus) this.scheduleRequery();
-    }
-    this.flushQuery();
-    this.changed();
+  /** Rendered cards that matched, for the snippet lane. Snippets wait until the listing settles. */
+  private snippetDemand(): SelectionRef[] {
+    if (this.view !== "library" || this.scan.status === "running" || this.scan.status === "idle") return [];
+    return this.rendered().filter((doc) => this.hitFor(doc)).map((doc) => ({ id: doc.id, version: doc.version }));
   }
 
   private currentQuery(): SearchQuery | null {
@@ -837,86 +703,50 @@ export class CatalogClient {
 
   private currentKey(): string | null {
     const query = this.currentQuery();
-    return query ? queryKey(query) : null;
+    return query ? searchKey(query) : null;
   }
 
-  private requestQuery(): void {
+  /** The type/age filter as a DocumentFilter, with the frozen cutoff instant. */
+  private activeFilter(): DocumentFilter {
+    return toDocumentFilter(this.window(), this.filters.kinds);
+  }
+
+  /** Held results answer the current query, and a scoped search's scope is the active filter. */
+  private heldIsCurrent(): boolean {
+    const held = this.search?.results;
     const key = this.currentKey();
-    if (key === null) {
-      this.search = { status: "idle", message: null, hits: null, hitsKey: null };
-      return;
-    }
-    if (this.searchBroken) {
-      this.search = { ...this.search, status: "unavailable", message: this.searchBroken };
-      return;
-    }
-    if (this.timedOut.has(key)) {
-      this.search = { ...this.search, status: "timeout", message: null };
-      return;
-    }
-    this.search = { ...this.search, status: "pending", message: null };
-    this.queued = true;
-    this.flushQuery();
+    return key !== null && !!held && held.queryKey === key
+      && (held.scope === null || scopeKey(held.scope) === scopeKey(this.activeFilter()));
   }
 
-  /** Sends the latest wanted query once nothing is in flight; superseded keystrokes never queue. */
-  private flushQuery(): void {
-    if (this.flight || !this.queued || !this.worker) return;
-    this.queued = false;
-    const query = this.currentQuery();
-    if (!query) return;
-    const key = queryKey(query);
-    if (this.timedOut.has(key)) return;
-    const generation = ++this.generation;
-    const timer = setTimeout(() => this.onQueryTimeout(generation), QUERY_BUDGET_MS);
-    this.flight = { generation, key, corpus: this.corpusRevision, timer };
-    // Filtering by type and age happens here, over the full hit set, so the rail and the age chip
-    // can count every alternative. The worker therefore always searches every kind and date.
-    this.worker.post({
-      version: 1, generation, operation: "query", query,
-      filter: { kinds: [...FILE_KINDS], uploadedBefore: null, uploadedAfter: null },
-    });
+  searchState(): SearchState {
+    const search = this.search;
+    const held = search?.results ?? null;
+    const key = this.currentKey();
+    const current = this.heldIsCurrent();
+    return {
+      phase: search?.phase ?? "idle",
+      failure: search?.failure ?? null,
+      snippetFailure: search?.snippetFailure ?? null,
+      held: key !== null && held !== null,
+      current,
+      complete: current && !!held?.complete,
+      scoped: key !== null && !!held?.scope,
+      resultsKey: key !== null && held ? `${held.queryKey}|${scopeKey(held.scope)}@${held.generation}` : null,
+    };
   }
 
-  /** A stuck query can't be cancelled inside a worker: abandon it, restart, and re-index. */
-  private onQueryTimeout(generation: number): void {
-    if (!this.flight || this.flight.generation !== generation) return;
-    const key = this.flight.key;
-    this.timedOut.add(key);
-    this.stopWorker();
-    this.startWorker();
-    this.indexedBytes = 0;
-    this.budgetExceeded = false;
-    this.queue = [];
-    // A fresh process owns an empty corpus. Replay every name, including fetching/failed bodies;
-    // old hits cannot represent this new index. Existing fetches can upgrade it when they arrive.
-    this.search = { ...this.search, hits: null, hitsKey: null };
-    for (const [id, entry] of this.docs) {
-      entry.bodyCost = 0;
-      this.indexMetadata(entry);
-      if (entry.content.status === "fetching") continue; // Its in-flight fetch settles into the new worker.
-      entry.content = { status: "pending" };
-      this.queue.push(id);
-    }
-    if (key === this.currentKey()) this.search = { ...this.search, status: "timeout", message: null };
-    this.pump();
-    this.changed();
+  /** A search or retry reported a generation other than the snapshot's: the library changed. */
+  libraryChanged(): boolean {
+    const snapshot = this.scan.generation;
+    if (snapshot === null) return false;
+    const seen = [this.search?.latestGeneration ?? null, this.retryGeneration].filter((value): value is number => value !== null);
+    return seen.some((generation) => generation !== snapshot);
   }
 
-  private scheduleRequery(): void {
-    if (!this.filters.text || this.requeryTimer !== null) return;
-    this.requeryTimer = setTimeout(() => {
-      this.requeryTimer = null;
-      const key = this.currentKey();
-      if (!key || this.timedOut.has(key) || !this.worker) return;
-      const fresh = this.flight
-        ? this.flight.key === key && this.flight.corpus === this.corpusRevision
-        : this.search.hitsKey === key && this.hitsCorpus === this.corpusRevision;
-      if (fresh) return;
-      this.queued = true;
-      this.flushQuery();
-      this.changed();
-    }, REQUERY_DELAY_MS);
+  /** The freshest index status: a search reply's when one arrived after the snapshot page. */
+  libraryStatus(): LibraryStatus | null {
+    return this.search?.status ?? this.library;
   }
 
   // ------------------------------------------------------------------------------------------
@@ -939,7 +769,12 @@ export class CatalogClient {
       this.renderLimit = RENDER_STEP;
       if (this.selection.scope === "matching") this.clearSelection("Selection cleared because filters changed.");
     }
-    if (next.text !== before.text || next.regex !== before.regex || next.matchCase !== before.matchCase) this.requestQuery();
+    if (next.text !== before.text || next.regex !== before.regex || next.matchCase !== before.matchCase) {
+      this.search?.setQuery(this.currentQuery());
+    }
+    if (next.age !== before.age || next.from !== before.from || next.to !== before.to || next.kinds.join() !== before.kinds.join()) {
+      this.search?.filtersChanged();
+    }
     this.changed();
   }
 
@@ -958,6 +793,7 @@ export class CatalogClient {
     this.frozenNow = this.deps.now();
     this.renderLimit = RENDER_STEP;
     if (this.selection.scope === "matching") this.clearSelection("Selection cleared because the cutoff changed.");
+    this.search?.filtersChanged();
     this.changed();
   }
 
@@ -998,39 +834,69 @@ export class CatalogClient {
     if (this.resultsCache?.revision === this.revision) return this.resultsCache.value;
     const window = this.window();
     const key = this.currentKey();
-    const hits = key === null ? null : this.search.hits;
+    // Held hits may still belong to an earlier input while a newer one is pending; the grid shows
+    // them dimmed, and the gate below only trusts complete results for the current input.
+    const held = key === null ? null : this.search?.results ?? null;
+    const hits = held?.hits ?? null;
     const kinds = this.filters.kinds;
-    const matchesQuery = (doc: DocumentSummary) => {
-      if (key === null) return true;
-      const hit = hits?.get(doc.id);
-      return hit !== undefined && hit.version === doc.version;
-    };
+    const matchesQuery = (doc: DocumentSummary) => key === null || hits?.get(doc.id)?.version === doc.version;
     const ofKind = (doc: DocumentSummary) => kinds.length === 0 || kinds.includes(doc.kind);
     const olderBound = this.frozenNow - 90 * DAY_MS;
     const kindCounts = new Map<FileKind, number>();
+    const scope: ScopeCoverage = {
+      total: 0, searchable: 0, truncated: 0, nameOnly: 0, nameOnlyKinds: [], unreadable: 0, pending: 0, failed: 0,
+    };
+    const nameOnlyKinds = new Set<FileKind>();
+    const presentKinds = new Set<FileKind>();
     let olderThan90 = 0;
     const matching: DocumentSummary[] = [];
-    for (const { summary } of this.docs.values()) {
-      if (!matchesQuery(summary)) continue;
-      const uploaded = Date.parse(summary.uploadedAt);
+    for (const doc of this.docs.values()) {
+      const uploaded = Date.parse(doc.uploadedAt);
       const inAge = inWindow(uploaded, window);
-      if (inAge) kindCounts.set(summary.kind, (kindCounts.get(summary.kind) ?? 0) + 1);
-      if (ofKind(summary) && uploaded < olderBound) olderThan90++;
-      if (inAge && ofKind(summary)) matching.push(summary);
+      if (inAge) presentKinds.add(doc.kind);
+      if (inAge && ofKind(doc)) {
+        scope.total++;
+        const index = doc.index;
+        if (index.state === "pending") scope.pending++;
+        else if (index.state === "failed") scope.failed++;
+        else if (index.coverage === "metadata-only") {
+          scope.nameOnly++;
+          nameOnlyKinds.add(doc.kind);
+        } else if (index.coverage === "error") scope.unreadable++;
+        else {
+          scope.searchable++;
+          if (index.coverage === "truncated") scope.truncated++;
+        }
+      }
+      if (!matchesQuery(doc)) continue;
+      if (inAge) kindCounts.set(doc.kind, (kindCounts.get(doc.kind) ?? 0) + 1);
+      if (ofKind(doc) && uploaded < olderBound) olderThan90++;
+      if (inAge && ofKind(doc)) matching.push(doc);
     }
+    scope.nameOnlyKinds = FILE_KINDS.filter((kind) => nameOnlyKinds.has(kind));
+    // A scoped search has no hits outside its scope, so those alternatives' counts are unknown.
+    const searched = held?.scope ?? null;
+    const unknownKinds = searched?.kinds.length
+      ? FILE_KINDS.filter((kind) => presentKinds.has(kind) && !searched.kinds.includes(kind)) : [];
+    const olderKnown = !searched || (searched.uploadedAfter === null
+      && (searched.uploadedBefore === null || Date.parse(searched.uploadedBefore) >= olderBound));
     const sort = this.effectiveSort();
-    const compare = comparator(sort, hits);
+    // Counts of a partial scan still grow, so "Most matches" order would reshuffle under the user.
+    const provisional = sort === "matches" && !(this.heldIsCurrent() && held?.complete);
+    const compare = comparator(provisional ? "newest" : sort, hits);
     matching.sort(compare);
     const selected = this.selectedIds();
     const visible = this.selectedOnly
-      ? [...selected].map((id) => this.docs.get(id)?.summary).filter((doc): doc is DocumentSummary => !!doc).sort(compare)
+      ? [...selected].map((id) => this.docs.get(id)).filter((doc): doc is LibraryDocument => !!doc).sort(compare)
       : matching;
     let hiddenSelected = 0;
     if (!this.selectedOnly && selected.size) {
       const shown = new Set(matching.map((doc) => doc.id));
       for (const id of selected) if (!shown.has(id)) hiddenSelected++;
     }
-    const value: Results = { matching, visible, kindCounts, olderThan90, hiddenSelected, sort };
+    const value: Results = {
+      matching, visible, kindCounts, unknownKinds, olderThan90: olderKnown ? olderThan90 : null, hiddenSelected, sort, provisional, scope,
+    };
     this.resultsCache = { revision: this.revision, value };
     return value;
   }
@@ -1040,73 +906,59 @@ export class CatalogClient {
   }
 
   summary(id: UploadId): DocumentSummary | null {
-    return this.docs.get(id)?.summary ?? null;
+    return this.docs.get(id) ?? null;
   }
 
-  contentOf(id: UploadId): ContentState | null {
-    return this.docs.get(id)?.content ?? null;
+  /** Index state of one snapshot document: pending, indexed (with coverage) or failed. */
+  indexOf(id: UploadId): LibraryMetadata | null {
+    return this.docs.get(id)?.index ?? null;
   }
 
-  hitFor(doc: DocumentSummary): SearchHit | null {
+  hitFor(doc: DocumentSummary): LibraryHit | null {
     if (this.currentKey() === null) return null;
-    const hit = this.search.hits?.get(doc.id);
+    const hit = this.search?.results?.hits.get(doc.id);
     return hit && hit.version === doc.version ? hit : null;
   }
 
-  observed(): DocumentSummary[] {
-    return [...this.docs.values()].map((entry) => entry.summary);
+  /** The match preview for a hit card: ready, unavailable, or null while not fetched. */
+  snippetFor(doc: DocumentSummary): Snippet | null {
+    if (this.currentKey() === null || !this.hitFor(doc)) return null;
+    return this.search?.snippet(doc.id, doc.version) ?? null;
   }
 
-  contentProgress(): ContentProgress {
-    const progress: ContentProgress = {
-      total: this.docs.size, settled: 0, searched: 0, truncated: 0, nameOnly: 0, unreadable: 0, failed: 0, skipped: 0,
-      names: 0, metadataFailed: 0, nameOnlyKinds: [], complete: false, budgetExceeded: this.budgetExceeded,
-    };
-    const nameOnlyKinds = new Set<FileKind>();
-    for (const { summary, content, metadata } of this.docs.values()) {
-      if (metadata === "indexed") progress.names++;
-      if (metadata === "failed") progress.metadataFailed++;
-      switch (content.status) {
-        case "indexed":
-          progress.settled++;
-          if (content.coverage === "full" || content.coverage === "truncated") progress.searched++;
-          if (content.coverage === "truncated") progress.truncated++;
-          if (content.coverage === "metadata-only") {
-            progress.nameOnly++;
-            nameOnlyKinds.add(summary.kind);
-          }
-          if (content.coverage === "error") progress.unreadable++;
-          break;
-        case "failed": progress.settled++; progress.failed++; break;
-        case "skipped": progress.settled++; progress.skipped++; break;
-        default: break;
-      }
-    }
-    progress.nameOnlyKinds = FILE_KINDS.filter((kind) => nameOnlyKinds.has(kind));
-    progress.complete = this.scan.status === "complete" && progress.settled === progress.total;
-    return progress;
+  observed(): DocumentSummary[] {
+    return [...this.docs.values()];
   }
 
   /** Whether "Select all N matching" may freeze the current matching set, and why not. */
   selectAllGate(): SelectAllGate {
     const scan = this.scan;
-    if (scan.status === "running") return { ok: false, reason: `Available when the scan finishes (${this.docs.size} found so far)` };
-    if (scan.status !== "complete") return { ok: false, reason: "Unavailable because the storage scan is incomplete" };
+    if (scan.status === "running") return { ok: false, reason: `Available when the library finishes loading (${this.docs.size} found so far)` };
+    if (scan.status !== "complete") return { ok: false, reason: "Unavailable because the library listing is incomplete" };
     if (this.selectedOnly) return { ok: false, reason: "Turn off “Show selected” to select by filter" };
+    // A known newer generation means the snapshot is stale, with or without query text.
+    if (this.libraryChanged()) return { ok: false, reason: "The library changed since it loaded — Refresh to select all matching" };
     const key = this.currentKey();
     if (key !== null) {
-      const progress = this.contentProgress();
-      if (progress.budgetExceeded) return { ok: false, reason: "Unavailable: the library exceeds this tab's search budget" };
-      if (this.searchBroken) return { ok: false, reason: "Unavailable while content search is down" };
-      if (this.timedOut.has(key)) return { ok: false, reason: "Unavailable because this search stopped early" };
-      if (!progress.complete) return { ok: false, reason: `Available when content indexing finishes (${progress.settled} of ${progress.total})` };
-      // Metadata hits do not prove body completeness; retain the conservative full-search gate.
-      if (progress.names !== progress.total) return { ok: false, reason: "Unavailable until every document's names are indexed" };
-      if (progress.failed) return { ok: false, reason: `Unavailable: ${progress.failed} ${progress.failed === 1 ? "document" : "documents"} couldn't be indexed — retry them first` };
-      if (this.flight || this.queued || this.search.hitsKey !== key || this.hitsCorpus !== this.corpusRevision
-        || this.search.status !== "ready") {
-        return { ok: false, reason: this.search.status === "error" ? "Unavailable while the search reports an error" : "Available when the search finishes" };
+      const search = this.search;
+      const held = search?.results ?? null;
+      if (search?.failure) return { ok: false, reason: "Unavailable while the search reports an error" };
+      // phase covers a restart still running behind complete results that stay on screen.
+      if (!held || !this.heldIsCurrent() || !held.complete || search?.phase !== "complete") {
+        return { ok: false, reason: "Available when the search finishes" };
       }
+      // Hits and snapshot must describe the same library state, or "all matching" could miss changes.
+      if (held.generation !== scan.generation) return { ok: false, reason: "The library changed since it loaded — Refresh to select all matching" };
+    }
+    // Frozen contract: no pending or failed row inside the type/age filters, with or without query
+    // text (a pending row may hold body matches the index can't see yet). Rows outside the filters
+    // don't count, and explicit refs or page selection stay available meanwhile.
+    const scope = this.results().scope;
+    if (scope.pending) {
+      return { ok: false, reason: `Unavailable: ${noun(scope.pending, "document in these filters isn't", "documents in these filters aren't")} indexed yet` };
+    }
+    if (scope.failed) {
+      return { ok: false, reason: `Unavailable: ${noun(scope.failed, "document", "documents")} couldn't be indexed — retry ${scope.failed === 1 ? "it" : "them"} first` };
     }
     const count = this.results().matching.length;
     if (count === 0) return { ok: false, reason: "Nothing matches" };
@@ -1138,7 +990,7 @@ export class CatalogClient {
 
   /** Toggles one card; with `range`, toggles every rendered card between the anchor and this one. */
   toggle(id: UploadId, range = false): void {
-    const doc = this.docs.get(id)?.summary;
+    const doc = this.docs.get(id);
     if (!doc) return;
     const order = this.rendered().map((summary) => summary.id);
     const anchor = this.selection.anchor;
@@ -1150,7 +1002,7 @@ export class CatalogClient {
     const selection = wasEmpty ? { ...emptySelection(), scope: "refs" as const } : this.selection;
     if (select && selection.scope === "refs") this.noteWindow(selection, wasEmpty);
     for (const target of targets) {
-      const summary = this.docs.get(target)?.summary;
+      const summary = this.docs.get(target);
       if (!summary) continue;
       if (selection.scope === "matching") {
         if (select) selection.excluded.delete(target);
@@ -1231,7 +1083,7 @@ export class CatalogClient {
     if (this.selection.scope !== "refs") return;
     let dropped = 0;
     for (const [id, ref] of this.selection.refs) {
-      if (this.docs.get(id)?.summary.version !== ref.version) {
+      if (this.docs.get(id)?.version !== ref.version) {
         this.selection.refs.delete(id);
         dropped++;
       }
@@ -1249,11 +1101,11 @@ export class CatalogClient {
   openReview(single?: UploadId): ReviewState | null {
     if (this.view !== "library" || this.review?.phase === "running") return null;
     const refs: SelectionRef[] = single
-      ? (this.docs.has(single) ? [{ id: single, version: (this.docs.get(single) as Entry).summary.version }] : [])
+      ? (this.docs.has(single) ? [{ id: single, version: (this.docs.get(single) as LibraryDocument).version }] : [])
       : [...this.selectedIds()].map((id) => this.selection.refs.get(id) as SelectionRef);
     const items: ReviewItem[] = [];
     for (const ref of refs) {
-      const summary = this.docs.get(ref.id)?.summary;
+      const summary = this.docs.get(ref.id);
       if (summary) items.push({ ref: { id: ref.id, version: ref.version }, summary });
     }
     if (!items.length) return null;
@@ -1433,24 +1285,37 @@ export class CatalogClient {
   // ------------------------------------------------------------------------------------------
   // Transport and notification.
 
-  private async request(path: string, init: { method: string; body?: unknown; csrf?: string }): Promise<Response> {
+  private async request(path: string, init: { method: string; body?: unknown; csrf?: string; signal?: AbortSignal }): Promise<Response> {
     const headers: Record<string, string> = { Accept: "application/json", "X-Docs-Catalog": "1" };
     if (init.body !== undefined) headers["Content-Type"] = "application/json";
     if (init.csrf) headers["X-CSRF-Token"] = init.csrf;
     // redirect: manual keeps JSON calls on this origin; a redirect is treated as an error response.
     return this.deps.fetch(path, {
       method: init.method, headers, credentials: "same-origin", cache: "no-store", redirect: "manual",
-      body: init.body === undefined ? undefined : JSON.stringify(init.body), signal: this.abort.signal,
+      body: init.body === undefined ? undefined : JSON.stringify(init.body), signal: init.signal ?? this.abort.signal,
     });
+  }
+
+  /**
+   * LibrarySearch's transport. It passes its own per-request signal, which its dispose() aborts on
+   * lock/expiry; query text travels only in the POST body, never in a URL.
+   */
+  private async post(path: string, body: unknown, signal: AbortSignal): Promise<{ status: number; body: unknown }> {
+    const session = this.session;
+    if (!session) throw new Error("The session has ended.");
+    const response = await this.request(path, { method: "POST", body, csrf: session.csrfToken, signal });
+    return { status: response.status, body: await readJson<unknown>(response) };
   }
 
   private changed(): void {
     this.revision++;
     for (const listener of this.listeners) listener();
+    // Any change can alter which result cards are rendered; the lane fetches their snippets when free.
+    this.search?.demandChanged();
   }
 }
 
-function comparator(sort: SortKey, hits: Map<UploadId, SearchHit> | null) {
+function comparator(sort: SortKey, hits: ReadonlyMap<UploadId, LibraryHit> | null) {
   const time = (doc: DocumentSummary) => Date.parse(doc.uploadedAt);
   const newest = (a: DocumentSummary, b: DocumentSummary) => time(b) - time(a) || compareText(a.id, b.id);
   switch (sort) {
@@ -1490,23 +1355,48 @@ function isSession(value: SessionResponse | null): value is SessionResponse {
     && !Number.isNaN(Date.parse(value.expiresAt));
 }
 
-function isCatalogPage(value: CatalogPage | null): value is CatalogPage {
-  return !!value && value.version === 1 && Array.isArray(value.items)
-    && (value.nextCursor === null || typeof value.nextCursor === "string") && typeof value.scanComplete === "boolean";
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isSummary(value: DocumentSummary): boolean {
-  return !!value && typeof value.id === "string" && /^[A-Za-z0-9]{8}$/.test(value.id)
-    && typeof value.version === "string" && typeof value.title === "string" && typeof value.filename === "string"
-    && (FILE_KINDS as readonly string[]).includes(value.kind) && typeof value.sizeBytes === "number"
+function isSummary(value: unknown): value is DocumentSummary {
+  return isRecord(value) && typeof value.id === "string" && /^[A-Za-z0-9]{8}$/.test(value.id)
+    && typeof value.version === "string" && value.version.length > 0 && typeof value.title === "string"
+    && typeof value.filename === "string" && (FILE_KINDS as readonly unknown[]).includes(value.kind)
+    && typeof value.mime === "string" && typeof value.sizeBytes === "number" && typeof value.uploadedAt === "string"
     && !Number.isNaN(Date.parse(value.uploadedAt)) && typeof value.publicUrl === "string"
-    && typeof value.rawUrl === "string" && Array.isArray(value.warnings);
+    && typeof value.rawUrl === "string" && typeof value.objectCount === "number"
+    && Array.isArray(value.warnings) && value.warnings.every((warning) => typeof warning === "string");
 }
 
-function isTextRecord(value: TextRecord | null): value is TextRecord {
-  return !!value && value.version === 1 && typeof value.text === "string" && typeof value.indexedBytes === "number"
-    && Number.isFinite(value.indexedBytes) && value.indexedBytes >= 0
-    && ["full", "truncated", "metadata-only", "error"].includes(value.coverage);
+const COVERAGES: readonly unknown[] = ["full", "truncated", "metadata-only", "error"];
+
+function isLibraryDocument(value: unknown): value is LibraryDocument {
+  if (!isSummary(value)) return false;
+  const index = (value as { index?: unknown }).index;
+  return isRecord(index) && ["pending", "indexed", "failed"].includes(index.state as string)
+    && (index.coverage === null || COVERAGES.includes(index.coverage))
+    && (index.reason === null || typeof index.reason === "string")
+    && isCount(index.indexedBytes) && isCount(index.extractorVersion);
+}
+
+interface PageReply { generation: number; items: unknown[]; nextCursor: string | null; status: LibraryStatus }
+
+function parseLibraryPage(value: unknown): PageReply | null {
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation) || !Array.isArray(value.items)
+    || value.items.length > LIBRARY_LIMITS.metadataRows || !isLibraryStatus(value.status)) return null;
+  const { nextCursor } = value;
+  if (nextCursor !== null && (typeof nextCursor !== "string" || nextCursor === "")) return null;
+  // scanComplete is exactly nextCursor === null (frozen contract); anything else is unreadable.
+  if (value.scanComplete !== (nextCursor === null)) return null;
+  return { generation: value.generation, items: value.items, nextCursor, status: value.status };
+}
+
+function parseReport(value: unknown): MaintenanceReport | null {
+  if (!isRecord(value) || value.version !== 1 || !isCount(value.generation)
+    || !["complete", "partial", "busy", "paused"].includes(value.outcome as string)
+    || !isCount(value.indexed) || !isCount(value.failed) || !isLibraryStatus(value.status)) return null;
+  return value as unknown as MaintenanceReport;
 }
 
 function isDeleteProgress(value: DeleteProgress | null): value is DeleteProgress {

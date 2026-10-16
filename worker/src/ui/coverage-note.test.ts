@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ContentState } from "./catalog-client";
+import type { LibraryMetadata } from "../library-contracts";
 import { REASON_DISPLAY_CHARS, coverageNote } from "./coverage-note";
 
 // Reason strings as the catalog extractor writes them; the UI must show them verbatim, not guess.
@@ -10,8 +10,8 @@ const PRIMARY_ONLY = "Only the primary object of this multi-object document was 
 const PDF = "PDF text extraction is not enabled: bounded stream expansion and page parsing are not yet verified. No OCR is performed.";
 const PARSE = "DOCX could not be parsed within the bounded ZIP/XML limits.";
 
-function indexed(coverage: "full" | "truncated" | "metadata-only" | "error", reason: unknown, indexedBytes = 0): ContentState {
-  return { status: "indexed", coverage, indexedBytes, reason } as ContentState;
+function indexed(coverage: "full" | "truncated" | "metadata-only" | "error", reason: unknown, indexedBytes = 0): LibraryMetadata {
+  return { state: "indexed", coverage, indexedBytes, reason, extractorVersion: 1 } as LibraryMetadata;
 }
 
 describe("coverageNote", () => {
@@ -38,13 +38,20 @@ describe("coverageNote", () => {
     expect(coverageNote(indexed("error", PARSE))).toEqual({ label: "content unreadable · name only", reason: PARSE });
   });
 
-  it("leaves full coverage and unsettled documents without a note", () => {
+  it("leaves fully indexed text and unknown documents without a note", () => {
     expect(coverageNote(indexed("full", null, 2048))).toBeNull();
     expect(coverageNote(indexed("full", "unexpected", 2048))).toBeNull();
     expect(coverageNote(null)).toBeNull();
-    for (const status of ["pending", "fetching", "indexing"] as const) expect(coverageNote({ status })).toBeNull();
-    expect(coverageNote({ status: "failed", reason: "Couldn't reach storage." })).toBeNull();
-    expect(coverageNote({ status: "skipped", reason: "Over this tab's search budget." })).toBeNull();
+  });
+
+  it("says pending and failed rows were matched by name only, with the index's own reason", () => {
+    const row = (state: "pending" | "failed", reason: string | null): LibraryMetadata =>
+      ({ state, coverage: null, reason, indexedBytes: 0, extractorVersion: 0 });
+    expect(coverageNote(row("pending", null))).toEqual({ label: "content not indexed yet · name searched", reason: null });
+    // A paused size budget keeps rows pending; its reason is disclosed verbatim, not as a failure.
+    expect(coverageNote(row("pending", "paused: index size budget")))
+      .toEqual({ label: "content not indexed yet · name searched", reason: "paused: index size budget" });
+    expect(coverageNote(row("failed", PARSE))).toEqual({ label: "content couldn't be indexed · name searched", reason: PARSE });
   });
 
   it("has no reason for null, empty, blank or non-string values", () => {

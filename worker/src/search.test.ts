@@ -1,10 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RE2JS } from "re2js";
-import { build } from "esbuild";
-// @ts-expect-error Node-only test adapter; the production Worker/browser targets omit Node types.
-import { Worker } from "node:worker_threads";
 import type { DocumentFilter, DocumentSummary, TextRecord } from "./contracts";
-import { compileSearchMatcher, createSearchIndex, type SearchQuery, type SearchWorkerRequest, type SearchWorkerResponse } from "./search";
+import { compileSearchMatcher, createSearchIndex, type SearchQuery } from "./search";
 
 const all: DocumentFilter = { kinds: [], uploadedBefore: null, uploadedAfter: null };
 const literal = (text: string, ignoreCase = true): SearchQuery => ({ text, mode: "literal", ignoreCase });
@@ -391,40 +388,4 @@ describe("createSearchIndex", () => {
     index.add(fixture.summary);
     expect(index.query(literal("note"), all)).toHaveLength(1);
   });
-});
-
-it("uses the bundled worker protocol for generations, errors, FIFO additions and lifecycle clear", async () => {
-  const bundled = await build({ entryPoints: ["src/ui/search-worker.ts"], bundle: true, write: false, format: "iife", platform: "browser", target: "es2022" });
-  const worker = new Worker(`
-    const {parentPort} = require('node:worker_threads');
-    global.self = {postMessage: (message) => parentPort.postMessage(message)};
-    ${bundled.outputFiles[0].text}
-    parentPort.on('message', data => self.onmessage({data}));
-  `, { eval: true });
-  const send = (request: SearchWorkerRequest | object) => new Promise<SearchWorkerResponse>((resolve, reject) => {
-    worker.once("message", (message: SearchWorkerResponse) => { worker.off("error", reject); resolve(message); });
-    worker.once("error", reject);
-    worker.postMessage(request);
-  });
-  try {
-    const fixture = document("Worker01", "old private text");
-    expect(await send({ version: 1, generation: 7, operation: "add", ...fixture })).toMatchObject({ generation: 7, status: "ready" });
-    const response = await send({ version: 1, generation: 8, operation: "query", query: literal("private"), filter: all });
-    expect(response).toMatchObject({ generation: 8, status: "results", hits: [{ id: "Worker01", matchCount: 1 }] });
-    expect(await send({ version: 1, generation: 9, operation: "query", query: { text: "(?=a)", mode: "regex", ignoreCase: false }, filter: all }))
-      .toMatchObject({ generation: 9, status: "error", code: "invalid_pattern" });
-    expect(await send({ version: 1, generation: 10, operation: "clear" })).toMatchObject({ generation: 10, status: "ready" });
-    expect(await send({ version: 1, generation: 11, operation: "query", query: literal(""), filter: all })).toMatchObject({ generation: 11, status: "results", hits: [] });
-    expect(await send({ version: 1, generation: 12, operation: "unknown" })).toMatchObject({ generation: 12, status: "error", code: "invalid_search_request" });
-    expect(await send({ version: 1, generation: 13, operation: "metadata", summary: fixture.summary })).toMatchObject({ status: "ready" });
-    expect(await send({ version: 1, generation: 14, operation: "query", query: literal("note"), filter: all })).toMatchObject({ status: "results", hits: [{ id: "Worker01" }] });
-    expect(await send({ version: 1, generation: 15, operation: "query", query: literal("private"), filter: all })).toMatchObject({ status: "results", hits: [] });
-    expect(await send({ version: 1, generation: 16, operation: "add", ...fixture })).toMatchObject({ status: "ready" });
-    expect(await send({ version: 1, generation: 17, operation: "metadata", summary: { ...fixture.summary, version: "v2", title: "Replacement name" } })).toMatchObject({ status: "ready" });
-    expect(await send({ version: 1, generation: 18, operation: "add", ...fixture })).toMatchObject({ status: "error", code: "invalid_search_request" });
-    expect(await send({ version: 1, generation: 19, operation: "query", query: literal("private"), filter: all })).toMatchObject({ status: "results", hits: [] });
-    expect(await send({ version: 1, generation: 20, operation: "add", summary: fixture.summary })).toMatchObject({ status: "error", code: "invalid_search_request" });
-
-
-  } finally { await worker.terminate(); }
 });
