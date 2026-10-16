@@ -3,6 +3,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { chromium } from 'playwright';
 
 /** Native operator acceptance uses the exact built app, its real lease and real R2 sources.
  * Only fixture preparation writes SQL; every behavior assertion crosses the authenticated HTTP
@@ -86,6 +87,26 @@ try {
   const storage = JSON.parse((await db.prepare("SELECT value FROM index_meta WHERE key='storage'").first()).value);
   assert.equal(storage.paused, true); assert.equal(storage.budgetBytes, 400000000);
   check('real paused response stops CLI and preserves configured budget');
+  const pendingBytes = Buffer.from('UnindexedPendingBodySentinel');
+  response = await fetch(pub + '/upload', { method: 'PUT', headers: { Authorization: `Bearer ${bearer}`,
+    'X-Filename': 'pending.txt', 'Content-Type': 'text/plain', 'Content-Length': String(pendingBytes.length) }, body: pendingBytes });
+  assert.equal(response.status, 200); const pending = await response.json();
+  assert.equal((await db.prepare('SELECT state FROM documents WHERE id=?').bind(pending.id).first()).state, 'pending');
+  const browser = await chromium.launch({ headless: true, channel: 'chromium',
+    ...(process.env.DOCS_CHROMIUM ? { executablePath: process.env.DOCS_CHROMIUM } : {}) });
+  try {
+    const page = await browser.newPage();
+    await page.goto(cat + '/all-docs'); await page.getByLabel('Password', { exact: true }).fill(password);
+    await page.getByRole('button', { name: 'Unlock', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('.scan-line')?.textContent.includes('Refresh'));
+    assert(await page.getByRole('button', { name: 'Select all matching', exact: true }).isDisabled());
+    await page.getByRole('searchbox', { name: 'Search names and content' }).fill('pending.txt');
+    const label = page.locator(`article[data-id="${pending.id}"] [data-coverage="label"]`);
+    await label.waitFor(); assert.equal(await label.innerText(), 'content not indexed yet · name searched');
+    assert(await page.getByRole('button', { name: 'Select all matching', exact: true }).isDisabled());
+    await page.screenshot({ path: resolve(state, 'native-pending-ui.png') });
+    check('real paused upload stays pending in compiled UI; empty and nonempty all-matching refused', { browser: browser.version() });
+  } finally { await browser.close(); }
   complete = true;
 } finally {
   await writeFile(resolve(state, 'native-results.json'), JSON.stringify({ complete, checks, state,

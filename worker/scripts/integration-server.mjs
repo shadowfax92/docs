@@ -124,8 +124,8 @@ for path in sys.argv[1:]:
  c=sqlite3.connect(path)
  if not c.execute("SELECT name FROM sqlite_master WHERE name='_mf_objects'").fetchone(): continue
  c.execute("UPDATE _mf_objects SET uploaded=? WHERE key LIKE 'Scan00%/page.txt'", (int(time.time()*1000)-120*86400000,))
- c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeOld01/old.txt'", (int(time.time()*1000)-90*86400000-60000,))
- c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeNew01/new.txt'", (int(time.time()*1000)-90*86400000+60000,))
+ c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeOld01/old.txt'", (int(time.time()*1000)-90*86400000-86400000,))
+ c.execute("UPDATE _mf_objects SET uploaded=? WHERE key='AgeNew01/new.txt'", (int(time.time()*1000)-90*86400000+86400000,))
  c.execute("CREATE TRIGGER IF NOT EXISTS fail_fixture BEFORE DELETE ON _mf_objects WHEN OLD.key IN ('FailDel1/failed.txt','FailHttp/failed.txt') BEGIN SELECT RAISE(ABORT,'disposable native R2 failure'); END")
  c.commit()
 `, ...files]);
