@@ -1,5 +1,9 @@
-import { MAX_DELETE_BATCH_ITEMS, type CatalogError, type DeleteBatchRequest, type DeleteProgress, type SessionResponse, type TextRecord } from "./contracts";
-import { isUploadId, type Documents, type ResolvedDocument } from "./documents";
+import { MAX_DELETE_BATCH_ITEMS, type CatalogError, type DeleteBatchRequest, type DeleteProgress, type SessionResponse } from "./contracts";
+import { isUploadId } from "./documents";
+import { LibraryIndexError, type LibraryConfig, type LibraryIndex } from "./library-index";
+import { LIBRARY_ENDPOINTS, type LibraryErrorCode } from "./library-contracts";
+import { HTTP_CURSOR_BYTES, HTTP_CURSOR_TOKEN_BYTES, HTTP_LIBRARY_BODY_BYTES, HTTP_SEARCH_BYTES,
+  httpJson, httpMaintainRequest, httpMaintenanceOptions, httpRetryRequest, httpSearchRequest, httpSnippetsRequest } from "./http-library";
 
 export interface CatalogSecurity {
   catalogOrigin: string;
@@ -12,34 +16,33 @@ const COOKIE = "__Host-docs_catalog";
 const SESSION_SECONDS = 12 * 60 * 60;
 const LOGIN_BYTES = 2048;
 const DELETE_BYTES = 32 * 1024;
-const CURSOR_BYTES = 8192;
 const THROTTLE_WINDOW = 10 * 60;
 // This cannot overlap an upload ID. Documents discovery must suppress internal keys, and public
 // routes cannot resolve this prefix. Counters contain only keyed IP digests, never credentials.
 const INTERNAL_PREFIX = "__docs_internal/catalog/v1/throttle/";
-const ASSETS = new Set(["/all-docs", "/all-docs/assets/app.js", "/all-docs/assets/styles.css", "/all-docs/assets/search-worker.js"]);
+const ASSETS = new Set(["/all-docs", "/all-docs/assets/app.js", "/all-docs/assets/styles.css"]);
 const encoder = new TextEncoder();
 
 /** Signed session state is intentionally stateless: logout clears this browser's cookie, while
  * rotating password/key revokes copied cookies too. Session and cursor MACs use separate domains.
  */
 interface Session { v: 1; sid: string; iat: number; exp: number; csrf: string }
-interface Cursor { v: 1; sid: string; exp: number; cursor: string }
+interface Cursor { v: 1; op: "metadata" | "search"; sid: string; exp: number; cursor: string }
 
 class HttpError extends Error {
   constructor(readonly status: number, readonly code: string, message: string, readonly retryable = false) { super(message); }
 }
 
-/** Deep HTTP module: callers supply Documents/extraction/assets, never auth helpers or R2 keys.
+/** Deep HTTP module: callers supply LibraryIndex/assets, never auth helpers or R2 keys.
  * R2 is external; the other dependencies are in-process. The fetch seam hides credential/session
  * lifecycle, cursor ownership and bounded mutation ordering. Authentication precedes document I/O;
  * each confirmed ID has its own outcome, so one storage failure cannot erase earlier successes.
  */
 export function createCatalog(deps: {
-  documents: Documents;
+  library: () => LibraryIndex;
+  config: Readonly<LibraryConfig>;
   bucket: R2Bucket;
   security: CatalogSecurity;
-  extract: (doc: ResolvedDocument) => Promise<TextRecord>;
   assets: (path: string) => Response | null;
 }): { fetch(request: Request): Promise<Response> } {
   const { security } = deps;
@@ -134,11 +137,30 @@ export function createCatalog(deps: {
     }
   }
 
+  async function readCursor(token: string, session: Session, op: Cursor["op"]): Promise<string> {
+    const state = await verify(`library-${op}-cursor-v1`, token, HTTP_CURSOR_TOKEN_BYTES);
+    if (!isRecord(state) || state.v !== 1 || state.op !== op || state.sid !== session.sid
+      || !Number.isSafeInteger(state.exp) || (state.exp as number) <= now() || (state.exp as number) > session.exp
+      || typeof state.cursor !== "string" || !state.cursor || encoder.encode(state.cursor).length > HTTP_CURSOR_BYTES) {
+      throw new HttpError(400, "invalid_cursor", "Refresh the library to restart discovery.");
+    }
+    return state.cursor;
+  }
+  async function writeCursor(cursor: string | null, session: Session, op: Cursor["op"]): Promise<string | null> {
+    if (cursor === null) return null;
+    if (!cursor || encoder.encode(cursor).length > HTTP_CURSOR_BYTES) throw new LibraryIndexError("library_unavailable", "Invalid continuation.", true);
+    // HTTP authenticates ownership/operation/expiry. LibraryIndex alone validates query and visible
+    // generation inside this opaque payload, so clients cannot forge a traversal or scan identity.
+    return sign(`library-${op}-cursor-v1`, {
+      v: 1, op, sid: session.sid, exp: Math.min(session.exp, now() + 30 * 60), cursor,
+    } satisfies Cursor);
+  }
+
   async function route(request: Request): Promise<Response> {
     if (!configured(security) || new URL(request.url).origin !== security.catalogOrigin) {
       throw new HttpError(503, "catalog_unavailable", "The private library is not configured.");
     }
-    if (request.url.length > 24 * 1024) throw new HttpError(414, "url_too_long", "The request URL is too long.");
+    if (request.url.length > HTTP_CURSOR_TOKEN_BYTES + 1024) throw new HttpError(414, "url_too_long", "The request URL is too long.");
     const url = new URL(request.url);
     const path = url.pathname;
     if (request.method === "GET" && ASSETS.has(path)) {
@@ -163,11 +185,10 @@ export function createCatalog(deps: {
       return response;
     }
     const sessionRoute = path === "/all-docs/session" && (request.method === "GET" || request.method === "DELETE");
-    const listRoute = path === "/all-docs/api/documents" && request.method === "GET";
-    const textRoute = /^\/all-docs\/api\/documents\/([^/]+)\/text$/.exec(path);
-    const textRead = request.method === "GET" && textRoute;
-    const deleteRoute = path === "/all-docs/api/delete" && request.method === "POST";
-    if (!sessionRoute && !listRoute && !textRead && !deleteRoute) throw new HttpError(404, "not_found", "Not found.");
+    const listRoute = path === LIBRARY_ENDPOINTS.documents && request.method === "GET";
+    const postRoute = request.method === "POST" && [LIBRARY_ENDPOINTS.search, LIBRARY_ENDPOINTS.snippets,
+      LIBRARY_ENDPOINTS.maintain, LIBRARY_ENDPOINTS.retry, LIBRARY_ENDPOINTS.delete].some((route) => route === path);
+    if (!sessionRoute && !listRoute && !postRoute) throw new HttpError(404, "not_found", "Not found.");
 
     // Neither invalid browser headers nor bad routes probe Documents. Session authentication is
     // first on every document route, so absence, versions and storage failures stay private.
@@ -181,44 +202,41 @@ export function createCatalog(deps: {
     }
     if (listRoute) {
       queryKeys(url, ["cursor"]);
-      let cursor: string | undefined;
-      if (url.searchParams.has("cursor")) {
-        const state = await verify("cursor-v1", url.searchParams.get("cursor")!, 16 * 1024);
-        if (!isRecord(state) || state.v !== 1 || state.sid !== session.sid
-          || !Number.isSafeInteger(state.exp) || (state.exp as number) <= now() || (state.exp as number) > session.exp
-          || typeof state.cursor !== "string" || !state.cursor || encoder.encode(state.cursor).length > CURSOR_BYTES) {
-          throw new HttpError(400, "invalid_cursor", "Refresh the library to restart discovery.");
-        }
-        cursor = state.cursor;
-      }
-      const page = await deps.documents.page(cursor);
-      if (page.nextCursor !== null && (!page.nextCursor || encoder.encode(page.nextCursor).length > CURSOR_BYTES)) throw new Error("Invalid document continuation");
-      const nextCursor = page.nextCursor === null ? null : await sign("cursor-v1", {
-        v: 1, sid: session.sid, exp: Math.min(session.exp, now() + 30 * 60), cursor: page.nextCursor,
-      } satisfies Cursor);
-      return Response.json({ ...page, nextCursor });
-    }
-    if (textRead) {
-      queryKeys(url, ["version"]);
-      const id = textRead[1];
-      const version = url.searchParams.get("version");
-      if (!isUploadId(id) || !validVersion(version)) throw new HttpError(400, "invalid_document", "Supply a valid document ID and version.");
-      const document = await deps.documents.resolve(id);
-      if (!document) throw new HttpError(404, "not_found", "Document not found.");
-      if (document.summary.version !== version) throw new HttpError(409, "document_changed", "Refresh the changed document.");
-      const text = await deps.extract(document);
-      if (text.id !== id || text.documentVersion !== version) throw new HttpError(409, "document_changed", "Refresh the changed document.");
-      return Response.json(text);
+      const cursor = url.searchParams.has("cursor") ? await readCursor(url.searchParams.get("cursor")!, session, "metadata") : undefined;
+      const page = await deps.library().page(cursor);
+      return Response.json({ ...page, nextCursor: await writeCursor(page.nextCursor, session, "metadata") });
     }
     queryKeys(url, []);
     await mutate(request, session);
+    // Admission errors keep their 4xx identity. Only calls across LibraryIndex can produce database
+    // failures; neither malformed JSON nor an unauthenticated body may touch the index.
+    if (path === LIBRARY_ENDPOINTS.search) {
+      const input = httpSearchRequest(await jsonBody(request, HTTP_SEARCH_BYTES));
+      const cursor = input.cursor === undefined ? undefined : await readCursor(input.cursor, session, "search");
+      const result = await deps.library().search({ ...input, ...(cursor === undefined ? {} : { cursor }) });
+      return Response.json({ ...result, nextCursor: await writeCursor(result.nextCursor, session, "search") });
+    }
+    if (path === LIBRARY_ENDPOINTS.snippets) {
+      const input = httpSnippetsRequest(await jsonBody(request, HTTP_LIBRARY_BODY_BYTES));
+      return Response.json(await deps.library().snippets(input));
+    }
+    if (path === LIBRARY_ENDPOINTS.maintain) {
+      const options = httpMaintainRequest(await jsonBody(request, HTTP_LIBRARY_BODY_BYTES), deps.config);
+      return Response.json(await deps.library().maintain(options));
+    }
+    if (path === LIBRARY_ENDPOINTS.retry) {
+      const retry = httpRetryRequest(await jsonBody(request, HTTP_LIBRARY_BODY_BYTES));
+      // Manual retry is deliberately the same bounded, leased operation as cron/backfill; a retry
+      // cannot reset unrelated versions or run a second drain outside the maintenance lease.
+      return Response.json(await deps.library().maintain({ ...httpMaintenanceOptions(deps.config), retry }));
+    }
     const batch = deleteBatch(await jsonBody(request, DELETE_BYTES));
     const outcomes: DeleteProgress["outcomes"] = [];
     // Sequential execution bounds storage pressure and preserves the reviewed order. remove owns
     // immutable-ID/version checks; never rescan a filter or widen the set after confirmation.
     for (const item of batch.items) {
       try {
-        const result = await deps.documents.remove(item.id, item.version);
+        const result = await deps.library().documents.remove(item.id, item.version);
         outcomes.push({ id: item.id, status: result.status });
       } catch { outcomes.push({ id: item.id, status: "failed" }); }
     }
@@ -228,7 +246,7 @@ export function createCatalog(deps: {
     async fetch(request) {
       try { return privatize(await route(request), frameSource); }
       catch (error) {
-        const failure = error instanceof HttpError ? error : new HttpError(503, "catalog_failure", "The library operation could not complete.", true);
+        const failure = error instanceof HttpError ? error : libraryFailure(error);
         return privatize(Response.json({ version: 1, error: {
           code: failure.code, message: failure.message, retryable: failure.retryable,
         } } satisfies CatalogError, {
@@ -247,7 +265,7 @@ function checkBrowser(request: Request, mutation: boolean) {
   // Fetch Metadata is additional evidence, never authentication. Reads with no Origin must be
   // explicit same-origin fetches; same-site sibling uploads are rejected even with a valid cookie.
   if ((origin !== null && origin !== expected) || (site !== null && site !== "same-origin")
-    || (mutation ? origin !== expected : origin === null && site !== "same-origin")
+    || (mutation ? origin !== expected || site !== "same-origin" : origin === null && site !== "same-origin")
     || request.headers.get("X-Docs-Catalog") !== "1") {
     throw new HttpError(403, "origin_forbidden", "Use the private library on its configured origin.");
   }
@@ -300,7 +318,7 @@ async function jsonBody(request: Request, maxBytes: number): Promise<unknown> {
     throw new HttpError(413, "body_too_large", "The request body is too large.");
   }
   const body = await boundedText(request.body, maxBytes);
-  try { return JSON.parse(body); } catch { throw new HttpError(400, "invalid_json", "Supply a valid JSON request."); }
+  try { return httpJson(body); } catch { throw new HttpError(400, "invalid_json", "Supply a valid JSON request."); }
 }
 
 /** Count streamed bytes, not a client-supplied Content-Length. Cancel on overflow, timeout, invalid
@@ -349,4 +367,22 @@ function privatize(response: Response, frameSource: string | null): Response {
   headers.set("Origin-Agent-Cluster", "?1");
   headers.set("Content-Security-Policy", `default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; ${frameSource ? `frame-src ${frameSource}; ` : ""}object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+/** Only a closed code table crosses the HTTP seam. Even typed module messages may contain backend
+ * context, so the browser receives fixed descriptions and retry policy instead of arbitrary text.
+ */
+function libraryFailure(error: unknown): HttpError {
+  const failures: Record<LibraryErrorCode, [number, string, boolean]> = {
+    invalid_library_request: [400, "Supply a valid library request.", false],
+    invalid_search_request: [400, "Supply a valid search and filters.", false],
+    invalid_pattern: [400, "The search pattern is invalid.", false],
+    invalid_cursor: [400, "Refresh the library to restart discovery.", false],
+    stale_generation: [409, "The library changed. Refresh before continuing.", true],
+    search_budget_exceeded: [422, "Narrow the filters or simplify the search pattern.", false],
+    library_unavailable: [503, "The library operation could not complete. Try again later.", true],
+  };
+  const code = error instanceof LibraryIndexError && Object.hasOwn(failures, error.code) ? error.code : "library_unavailable";
+  const [status, message, retryable] = failures[code];
+  return new HttpError(status, code, message, retryable);
 }

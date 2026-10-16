@@ -9,9 +9,17 @@ command = "node scripts/build.mjs"
 APP_ROLE = "public"
 PUBLIC_DOCS_ORIGIN = "https://docs.shadowfax92.workers.dev"
 CATALOG_ORIGIN = "https://docs-library.shadowfax92.workers.dev"
+LIBRARY_SIZE_BUDGET_BYTES = "400000000"
 
 [[r2_buckets]]
 binding = "DOCS_BUCKET"
 bucket_name = "docs-cli"
 
 # Set AUTH_TOKEN via: npx wrangler secret put AUTH_TOKEN
+
+# Both roles write the same rebuildable index; only the catalog exposes authenticated reads.
+[[d1_databases]]
+binding = "LIBRARY_DB"
+database_name = "docs-library-index"
+database_id = "8517827e-bcf4-4a9a-93d6-b23b7f62e259"
+migrations_dir = "migrations"
