@@ -75,7 +75,9 @@ in concise architectural comments.
      latest-only/debounced requests, bounded snippets, progressive search and
      conservative selection. Retire search-worker source/asset via a coordinated
      narrow build allowlist edit. Preserve design and all unrelated behavior.
-3. **Integration/deployment tooling (cdxsx).** After prerequisite merges, own
+3. **Integration/deployment tooling (cdxsx).** Prepare independent fixture and
+   operator tooling while the implementation wave is in final review; final
+   native acceptance and merge wait for prerequisite merges. Own
    cross-module proof scripts, real two-origin Miniflare+D1 fixture adaptation,
    safe migration/backfill/deploy recipe and any explicitly transferred glue.
    Prove a fresh 5k browser avoids per-document /text/R2 requests, warm reload,
