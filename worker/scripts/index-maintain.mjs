@@ -104,7 +104,7 @@ async function main() {
   async function request(path, payload) {
     if (performance.now() >= end || cancellation.signal.aborted) fail('Stopped: deadline or cancellation; server checkpoints are retained.', 6);
     const response = await fetch(options.origin + path, { method: payload === undefined ? 'GET' : 'POST',
-      redirect: 'error', signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(Math.max(1, end - performance.now()))]),
+      redirect: 'error', signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(Math.max(1, Math.floor(end - performance.now())))]),
       headers: { Origin: options.origin, 'Sec-Fetch-Site': 'same-origin', 'X-Docs-Catalog': '1',
         ...(cookie && { Cookie: cookie }), ...(csrf && { 'X-CSRF-Token': csrf }),
         ...(payload !== undefined && { 'Content-Type': 'application/json' }) },

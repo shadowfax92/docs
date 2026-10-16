@@ -164,11 +164,12 @@ async function catalogProof(context,shot,check) {
   await p.waitForFunction(()=>document.querySelector('#results-label').textContent.startsWith('100 of '));
   await p.locator('#age').selectOption('gt90');
   await p.waitForFunction(()=>document.querySelector('.cutoff')&&!document.querySelector('.cutoff').hidden);
-  const cutoff=(await p.locator('.cutoff span').innerText()).split(' · cutoff fixed')[0];
   await p.waitForFunction(()=>document.querySelector('#results-label').textContent.startsWith('101 of '));
+  const cutoff=(await p.locator('.cutoff span').innerText()).split(' · cutoff fixed')[0];
   await p.getByRole('button',{name:'Select all 101 matching',exact:true}).click();
   await p.getByRole('button',{name:'Review deletion',exact:true}).click();
-  assert((await p.locator('dialog[open]').innerText()).includes(cutoff));
+  const reviewText=await p.locator('dialog[open]').innerText();
+  assert(reviewText.includes(cutoff),JSON.stringify({cutoff,reviewSummary:reviewText.slice(0,400)}));
   assert.equal(await p.locator('dialog[open] .review-list li').count(),101);
   assert(await p.locator('dialog[open]').getByText('AgeOld01',{exact:true}).count());
   assert.equal(await p.locator('dialog[open]').getByText('AgeNew01',{exact:true}).count(),0);
@@ -218,7 +219,7 @@ async function catalogProof(context,shot,check) {
   await p.getByRole('button',{name:'Delete Legacy01',exact:true}).click();await p.waitForFunction(()=>document.querySelector('#review-title').textContent==='Deleted 1 document');await p.getByRole('button',{name:'Done',exact:true}).click();
   assert.equal((await fetch(pub+'/Legacy01/raw')).status,404);
   check('single-card exact-ID review deletes only its native fixture');
-  await search.fill('');await p.getByRole('button',{name:'Refresh',exact:true}).click();
+  await search.fill('');await p.locator('.scan-line').getByRole('button',{name:'Refresh',exact:true}).click();
   await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
   await p.setViewportSize({width:900,height:900});await shot(p,'catalog-tablet');
   await p.setViewportSize({width:375,height:812});assert(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot(p,'catalog-mobile');
