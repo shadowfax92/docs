@@ -11,6 +11,11 @@ type Sql = { sql: string; values: unknown[] };
 const sql = (query: string, ...values: unknown[]): Sql => ({ sql: query, values });
 const encoder = new TextEncoder();
 const PAUSED = "paused: index size budget";
+// Admission policy shared with maintenance: native 512-KiB entropy regressed the empirical
+// 3.2x planning estimate. Reserve 16x text +16 KiB; this is conservative headroom, not a
+// universal SQLite bound. Keep actual-size samples, the generation fence and storage-full pause.
+const TEXT_STORAGE_MULTIPLIER = 16;
+const TEXT_STORAGE_HEADROOM_BYTES = 16 * 1024;
 const active = "(SELECT token FROM index_meta WHERE key='generation') = ?";
 const noTombstone = "NOT EXISTS (SELECT 1 FROM deleted_ids WHERE id=?)";
 
@@ -134,7 +139,7 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
     const budgetBytes = deps.config.sizeBudgetBytes;
     const projectedBytes = info.indexed >= 50 ? Math.ceil(bytes + info.pending * bytes / info.indexed) : stored?.projectedBytes ?? null;
     if (stored?.paused || !Number.isSafeInteger(budgetBytes) || budgetBytes <= 0
-      || bytes + Math.ceil(3.2 * nextBytes) + 16_384 > budgetBytes || (projectedBytes !== null && projectedBytes > budgetBytes)) {
+      || bytes + Math.ceil(TEXT_STORAGE_MULTIPLIER * nextBytes) + TEXT_STORAGE_HEADROOM_BYTES > budgetBytes || (projectedBytes !== null && projectedBytes > budgetBytes)) {
       const storage: LibraryStatus["storage"] = { bytes, budgetBytes, planningBytes: stored?.planningBytes ?? null,
         projectedBytes, paused: true, reason: PAUSED };
       await prepare(sql(`INSERT INTO index_meta(key,value) VALUES ('storage',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, JSON.stringify(storage))).run();
@@ -185,6 +190,8 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
     let textBytes = 0;
     const stale = (): IndexRecordResult => ({ outcome: "stale", textBytes });
     if (!await prepare(sql(`SELECT 1 WHERE ${recordGuard(claim).sql}`, ...recordGuard(claim).values)).first()) return stale();
+    // Compressed source bytes do not bound extracted text. Admit the full 512-KiB text cap
+    // before extraction; the second gate can use the actual bounded output without re-extracting.
     if (!(await capacity(LIBRARY_LIMITS.bodyBytes)).allowed) { await release(claim, true); return { outcome: "paused", textBytes }; }
     let record: TextRecord;
     try {
