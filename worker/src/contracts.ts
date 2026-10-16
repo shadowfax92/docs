@@ -73,6 +73,9 @@ export interface CatalogError {
 }
 
 interface RoleEnvironment {
+  LIBRARY_DB: D1Database;
+  // This rollout can lower the default 400 MB gate; HTTP never enables a larger paid capacity.
+  LIBRARY_SIZE_BUDGET_BYTES?: string;
   DOCS_BUCKET: R2Bucket;
   PUBLIC_DOCS_ORIGIN: string;
   CATALOG_ORIGIN: string;
