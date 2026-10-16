@@ -3,6 +3,8 @@ import { createLibraryFixture } from "../library-index.test-support";
 import type { TextRecord } from "../contracts";
 import type { ResolvedDocument } from "../documents";
 import { createLibraryRecords } from "./records";
+import { createDocuments } from "../documents";
+import { createInvocationResources, InvocationBudgetExceeded } from "../invocation-budget";
 import { Headers as NativeHeaders } from "miniflare";
 
 function barrier<T>() {
@@ -449,5 +451,150 @@ describe("LibraryRecords stale metadata observations", () => {
     expect(await f.records.ingest(third, 1000)).toBe("written");
     release.resolve(); expect(await work).toBe("stale");
     expect(await row(f, old.id)).toMatchObject({ version: third.version });
+  }, 20_000);
+});
+
+function invocation(f: Fixture, overrides: Partial<import("./contracts").LibraryDependencies> = {}) {
+  const resources = createInvocationResources(() => f.db, f.bucket);
+  const documents = createDocuments(resources.bucket, f.deps.publicOrigin);
+  const records = createLibraryRecords({ ...f.deps, ...resources, documents, ...overrides });
+  return { ...resources, records };
+}
+async function consume(db: D1Database, count: number) {
+  await db.batch(Array.from({ length: count }, () => db.prepare("SELECT 1")));
+}
+
+describe("LibraryRecords shared invocation accounting", () => {
+  it("uses one native ledger for upload and deferred extraction without double charging", async () => {
+    const f = await setup({ extract: async (doc) => text(doc.summary.id, doc.summary.version, "budget needle") });
+    const run = invocation(f);
+    const summary = await run.records.documents.create({ body: null, filename: "x.txt", title: "Budget searchable", mime: "text/plain" });
+    const before = run.budget.used;
+    await f.flush();
+    expect(await row(f, summary.id)).toMatchObject({ state: "indexed", attempts: 0 });
+    expect(run.budget.used).toBe(24);
+    expect(run.budget.used).toBeGreaterThanOrEqual(before);
+    expect(run.budget.remaining).toBe(40 - run.budget.used);
+  }, 20_000);
+
+  it("returns successful R2 creation when the whole metadata batch cannot be admitted", async () => {
+    const f = await setup(); const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const run = invocation(f); await consume(run.db, 32);
+    const summary = await run.records.documents.create({ body: null, filename: "x.txt", title: "Survives budget", mime: "text/plain" });
+    await f.flush();
+    expect(run.budget.used).toBe(37);
+    expect(await row(f, summary.id)).toBeNull();
+    expect(await generation(f)).toBe(0);
+    expect(await f.documents.resolve(summary.id)).not.toBeNull();
+    expect(log).toHaveBeenCalledWith("library-records", { category: "upload-upkeep" });
+    expect(await f.records.ingest(summary, Date.now())).toBe("written");
+  }, 20_000);
+
+  it("does not record admission refusal as extraction failure, even inside the extractor", async () => {
+    const f = await setup(); const summary = await seed(f); await f.records.ingest(summary, Date.now());
+    const owned = (await f.records.claim(summary))!;
+    const run = invocation(f, { extract: async () => { throw new InvocationBudgetExceeded(); } });
+    await expect(run.records.index(owned)).rejects.toBeInstanceOf(InvocationBudgetExceeded);
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 0, claim_token: owned.token });
+    expect(await generation(f)).toBe(1);
+  }, 20_000);
+
+  it("rejects the final text batch atomically without retry attempts or partial FTS/body state", async () => {
+    const f = await setup({ extract: async (doc) => text(doc.summary.id, doc.summary.version, "budget needle") });
+    const summary = await seed(f); await f.records.ingest(summary, Date.now());
+    const owned = (await f.records.claim(summary))!;
+    const run = invocation(f); await consume(run.db, 31);
+    await expect(run.records.index(owned)).rejects.toBeInstanceOf(InvocationBudgetExceeded);
+    expect(run.budget.used).toBe(35);
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 0 });
+    expect(await matches(f, "needle")).toHaveLength(0);
+    expect(await generation(f)).toBe(1);
+  }, 20_000);
+
+  it("refuses an indivisible hide before R2 and leaves a refused finalization hidden for repair", async () => {
+    let now = 1000; const f = await setup({ now: () => now }); const summary = await indexed(f);
+    const rejectedHide = invocation(f); await consume(rejectedHide.db, 37);
+    await expect(rejectedHide.records.documents.remove(summary.id, summary.version)).rejects.toBeInstanceOf(InvocationBudgetExceeded);
+    expect(rejectedHide.budget.used).toBe(37);
+    expect(await f.documents.resolve(summary.id)).not.toBeNull();
+    expect(await f.db.prepare("SELECT count(*) AS n FROM deleted_ids").first("n")).toBe(0);
+    const rejectedFinish = invocation(f); await consume(rejectedFinish.db, 25);
+    await expect(rejectedFinish.records.documents.remove(summary.id, summary.version)).rejects.toBeInstanceOf(InvocationBudgetExceeded);
+    expect(rejectedFinish.budget.used).toBe(35);
+    expect(await f.documents.resolve(summary.id)).toBeNull();
+    expect(await row(f, summary.id)).toMatchObject({ state: "deleting" });
+    const owner = await deleting(f, summary.id); now += 600_000;
+    const held = await lease(f, "repair", now + 100_000);
+    const fresh = invocation(f);
+    expect(await fresh.records.repairDeletion(owner, held)).toBe("deleted");
+    expect(fresh.budget.used).toBeLessThanOrEqual(40);
+    expect(await row(f, summary.id)).toBeNull();
+  }, 20_000);
+});
+
+describe("LibraryRecords reviewed storage guards", () => {
+  it("fences concurrent actual-size samples so four bodies cannot spend the same capacity", async () => {
+    const body = "x".repeat(524_288);
+    const extract = vi.fn(async (doc: ResolvedDocument) => text(doc.summary.id, doc.summary.version, body));
+    const f = await setup({ now: () => 1000, extract, config: { sizeBudgetBytes: 2_000_000 } });
+    const refs = [];
+    for (let i = 0; i < 4; i++) {
+      const summary = await seed(f, `Budget0${i}`); refs.push(summary);
+      await f.records.ingest(summary, 1000);
+    }
+    const claims = [];
+    for (const ref of refs) claims.push((await f.records.claim(ref))!);
+    const allReady = barrier<void>(); let admitted = 0;
+    // Hold every final transaction until all four have sampled the same actual size. This
+    // reproduced the review failure (4,308,992 bytes under a 2,000,000-byte budget) before the fix.
+    const concurrent = withDb(f, async (statements) => {
+      if (++admitted === 4) allReady.resolve();
+      await allReady.promise; return f.db.batch(statements);
+    });
+    const outcomes = await Promise.all(claims.map((claim) => concurrent.index(claim)));
+    expect(outcomes.filter((result) => result.outcome === "indexed")).toHaveLength(1);
+    expect(outcomes.filter((result) => result.outcome === "paused")).toHaveLength(3);
+    expect(outcomes.every((result) => result.textBytes === 524_288)).toBe(true);
+    expect(extract).toHaveBeenCalledTimes(4);
+    const actual = await f.db.prepare("SELECT count(*) AS n FROM document_text").all();
+    expect(actual.results).toEqual([{ n: 1 }]);
+    expect(actual.meta.size_after).toBeLessThan(2_000_000);
+    const storage = JSON.parse((await f.db.prepare("SELECT value FROM index_meta WHERE key='storage'").first<string>("value"))!);
+    expect(storage).toMatchObject({ paused: true, reason: "paused: index size budget" });
+    expect(await generation(f)).toBe(5);
+    for (const ref of refs) expect(await row(f, ref.id)).toMatchObject({ attempts: 0, claim_token: null });
+  }, 20_000);
+
+  it("recognizes D1's documented database-size error, pauses and releases without a retry loop", async () => {
+    const extract = vi.fn(async (doc: ResolvedDocument) => text(doc.summary.id, doc.summary.version, "body needle"));
+    const f = await setup({ now: () => 1000, extract });
+    const summary = await seed(f); await f.records.ingest(summary, 1000);
+    const owned = (await f.records.claim(summary))!; let fail = true;
+    const records = withDb(f, async (statements) => {
+      if (fail) { fail = false; throw new Error("D1_ERROR: Exceeded maximum DB size."); }
+      return f.db.batch(statements);
+    });
+    expect(await records.index(owned)).toEqual({ outcome: "paused", textBytes: 11 });
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 0, retry_at: null, claim_token: null });
+    expect(await generation(f)).toBe(1);
+    expect(await f.records.index((await f.records.claim(summary))!)).toEqual({ outcome: "paused", textBytes: 0 });
+    expect(extract).toHaveBeenCalledTimes(1);
+    const storage = JSON.parse((await f.db.prepare("SELECT value FROM index_meta WHERE key='storage'").first<string>("value"))!);
+    expect(storage).toMatchObject({ paused: true, reason: "paused: index size budget" });
+  }, 20_000);
+});
+
+describe("LibraryRecords paused retry state", () => {
+  it("leaves paused retry work visibly pending without consuming another failure attempt", async () => {
+    let now = 1000; const f = await setup({ now: () => now, extract: async () => { throw new Error("read failed"); } });
+    const summary = await seed(f); await f.records.ingest(summary, now);
+    expect(await f.records.index((await f.records.claim(summary))!)).toMatchObject({ outcome: "failed" });
+    const g = await generation(f); now = 61_000;
+    await f.db.prepare("INSERT INTO index_meta(key,value) VALUES ('storage',?)").bind(JSON.stringify({
+      bytes: 100, budgetBytes: 400_000_000, planningBytes: null, projectedBytes: null, paused: true, reason: "paused: index size budget",
+    })).run();
+    expect(await f.records.index((await f.records.claim(summary))!)).toEqual({ outcome: "paused", textBytes: 0 });
+    expect(await row(f, summary.id)).toMatchObject({ state: "pending", attempts: 1, claim_token: null });
+    expect(await generation(f)).toBe(g + 1);
   }, 20_000);
 });

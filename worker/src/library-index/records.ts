@@ -1,5 +1,6 @@
 import type { DocumentSummary, SelectionRef, TextRecord } from "../contracts";
 import { isUploadId } from "../documents";
+import { InvocationBudgetExceeded } from "../invocation-budget";
 import { LIBRARY_LIMITS } from "../library-contracts";
 import type { LibraryStatus } from "../library-contracts";
 import type { DeletionClaim, IndexRecordResult, LibraryDependencies, LibraryRecords,
@@ -122,10 +123,11 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
    * persisted pause, closing a concurrent maintenance pause. Source projections are estimates;
    * the bounded next body reserves growth headroom even before the 50-document measured estimate.
    */
-  async function capacity(nextBytes: number): Promise<boolean> {
+  async function capacity(nextBytes: number): Promise<{ allowed: boolean; generation: string }> {
     const result = await prepare(sql(`SELECT (SELECT value FROM index_meta WHERE key='storage') AS storage,
+      (SELECT value FROM index_meta WHERE key='generation') AS generation,
       (SELECT count(*) FROM documents WHERE state='indexed') AS indexed,
-      (SELECT count(*) FROM documents WHERE state='pending' OR state='failed') AS pending`)).all<{ storage: string | null; indexed: number; pending: number }>();
+      (SELECT count(*) FROM documents WHERE state='pending' OR state='failed') AS pending`)).all<{ storage: string | null; generation: string; indexed: number; pending: number }>();
     const info = result.results[0];
     const stored = info.storage ? JSON.parse(info.storage) as LibraryStatus["storage"] : null;
     const bytes = Math.max(result.meta.size_after, stored?.bytes ?? 0);
@@ -136,36 +138,46 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
       const storage: LibraryStatus["storage"] = { bytes, budgetBytes, planningBytes: stored?.planningBytes ?? null,
         projectedBytes, paused: true, reason: PAUSED };
       await prepare(sql(`INSERT INTO index_meta(key,value) VALUES ('storage',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, JSON.stringify(storage))).run();
-      return false;
+      return { allowed: false, generation: info.generation };
     }
-    return true;
+    return { allowed: true, generation: info.generation };
   }
 
-  async function release(claim: RecordClaim): Promise<void> {
-    await mutate(recordGuard(claim), false, [
-      sql("UPDATE documents SET claim_token=NULL, claim_until=NULL WHERE id=? AND @guard", claim.ref.id),
+  async function release(claim: RecordClaim, paused = false): Promise<void> {
+    // Storage pause is pending work, including a formerly failed retry or extractor upgrade.
+    // Retain available text/coverage and attempt history; only a visible state change bumps generation.
+    await mutate(recordGuard(claim), paused ? sql("EXISTS(SELECT 1 FROM documents WHERE id=? AND state!='pending')", claim.ref.id) : false, [
+      sql(`UPDATE documents SET state=CASE WHEN ? THEN 'pending' ELSE state END,
+        changed_at=CASE WHEN ? AND state!='pending' THEN ? ELSE changed_at END,
+        claim_token=NULL, claim_until=NULL WHERE id=? AND @guard`, Number(paused), Number(paused), deps.now(), claim.ref.id),
     ]);
   }
 
-  async function writeText(claim: RecordClaim, record: TextRecord): Promise<boolean> {
+  async function writeText(claim: RecordClaim, record: TextRecord, capacityGeneration: string): Promise<boolean> {
     const failed = record.coverage === "error";
     const state = failed ? "failed" : "indexed";
-    const same = sql(`NOT EXISTS (SELECT 1 FROM documents d LEFT JOIN document_text t ON d.doc=t.doc
+    const visibleChange = sql(`NOT EXISTS (SELECT 1 FROM documents d LEFT JOIN document_text t ON d.doc=t.doc
       WHERE d.id=? AND d.state=? AND d.coverage IS ? AND d.reason IS ? AND d.source_bytes=?
       AND d.indexed_bytes=? AND d.extractor=? AND coalesce(t.body,'')=?)`, claim.ref.id, state, record.coverage,
     record.reason, record.sourceBytes, record.indexedBytes, record.extractorVersion, record.text);
     const now = deps.now();
-    return mutate(combine(recordGuard(claim), storageGuard()), same, [
+    // The sampled generation and actual size come from the same D1 statement. Since every
+    // visible body/metadata write bumps it, only one concurrent writer can spend that capacity.
+    // A loser remeasures using its already-extracted text instead of bypassing the size gate.
+    return mutate(combine(recordGuard(claim), storageGuard(),
+      sql("(SELECT value FROM index_meta WHERE key='generation')=?", capacityGeneration)), visibleChange, [
+      // Read the old body when deciding changed_at, before replacing document_text. All
+      // subsequent effects use the transaction latch even though this clears the row's claim.
+      sql(`UPDATE documents SET state=?, coverage=?, reason=?, source_bytes=?, indexed_bytes=?, extractor=?,
+        attempts=CASE WHEN ? THEN attempts+1 ELSE 0 END,
+        retry_at=CASE WHEN ? AND attempts+1<? THEN ? + min(3600000,60000*(1 << min(attempts,6))) ELSE NULL END,
+        claim_token=NULL, claim_until=NULL, changed_at=CASE WHEN ${visibleChange.sql} THEN ? ELSE changed_at END
+        WHERE id=? AND @guard`, state, record.coverage, record.reason, record.sourceBytes, record.indexedBytes,
+      record.extractorVersion, Number(failed), Number(failed), deps.config.maxAttempts, now, ...visibleChange.values, now, claim.ref.id),
       sql(`INSERT INTO document_text(doc,body) SELECT doc,? FROM documents WHERE id=? AND @guard
         ON CONFLICT(doc) DO UPDATE SET body=excluded.body`, record.text, claim.ref.id),
       sql("DELETE FROM document_fts WHERE rowid IN (SELECT doc FROM documents WHERE id=?) AND @guard", claim.ref.id),
       sql("INSERT INTO document_fts(rowid,title,filename,body) SELECT doc,title,filename,? FROM documents WHERE id=? AND @guard", record.text, claim.ref.id),
-      sql(`UPDATE documents SET state=?, coverage=?, reason=?, source_bytes=?, indexed_bytes=?, extractor=?,
-        attempts=CASE WHEN ? THEN attempts+1 ELSE 0 END,
-        retry_at=CASE WHEN ? AND attempts+1<? THEN ? + min(3600000,60000*(1 << min(attempts,6))) ELSE NULL END,
-        claim_token=NULL, claim_until=NULL, changed_at=CASE WHEN ${same.sql} THEN ? ELSE changed_at END
-        WHERE id=? AND @guard`, state, record.coverage, record.reason, record.sourceBytes, record.indexedBytes,
-      record.extractorVersion, Number(failed), Number(failed), deps.config.maxAttempts, now, ...same.values, now, claim.ref.id),
     ]);
   }
 
@@ -173,7 +185,7 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
     let textBytes = 0;
     const stale = (): IndexRecordResult => ({ outcome: "stale", textBytes });
     if (!await prepare(sql(`SELECT 1 WHERE ${recordGuard(claim).sql}`, ...recordGuard(claim).values)).first()) return stale();
-    if (!await capacity(LIBRARY_LIMITS.bodyBytes)) { await release(claim); return { outcome: "paused", textBytes }; }
+    if (!(await capacity(LIBRARY_LIMITS.bodyBytes)).allowed) { await release(claim, true); return { outcome: "paused", textBytes }; }
     let record: TextRecord;
     try {
       const doc = await deps.documents.resolve(claim.ref.id);
@@ -184,19 +196,23 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
       // Admission is retryable orchestration, never an extraction attempt. Wrapped resources have
       // already accounted for every admitted operation; this module must not double-charge them.
       if (isAdmission(error)) throw error;
-      if (isStorageFull(error)) { await pauseStorage(); await release(claim); return { outcome: "paused", textBytes }; }
+      if (isStorageFull(error)) { await pauseStorage(); await release(claim, true); return { outcome: "paused", textBytes }; }
       record = { version: 1, id: claim.ref.id, documentVersion: claim.ref.version, coverage: "error",
         reason: "The document could not be read or parsed within the extraction limits.", text: "", sourceBytes: 0, indexedBytes: 0, extractorVersion: deps.config.extractorVersion };
     }
-    if (!await capacity(record.indexedBytes)) { await release(claim); return { outcome: "paused", textBytes }; }
     try {
-      if (await writeText(claim, record)) return { outcome: record.coverage === "error" ? "failed" : "indexed", textBytes };
-      if (await prepare(sql(`SELECT 1 WHERE ${recordGuard(claim).sql}`, ...recordGuard(claim).values)).first()) {
-        await release(claim); return { outcome: "paused", textBytes };
+      // At most one retry of finalization, retaining the extracted body. Resource wrappers still
+      // admit each whole batch before I/O; contention or budget refusal never spends an attempt.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const gate = await capacity(record.indexedBytes);
+        if (!gate.allowed) { await release(claim, true); return { outcome: "paused", textBytes }; }
+        if (await writeText(claim, record, gate.generation)) return { outcome: record.coverage === "error" ? "failed" : "indexed", textBytes };
+        if (!await prepare(sql(`SELECT 1 WHERE ${recordGuard(claim).sql}`, ...recordGuard(claim).values)).first()) return stale();
       }
+      await release(claim);
       return stale();
     } catch (error) {
-      if (isStorageFull(error)) { await pauseStorage(); await release(claim); return { outcome: "paused", textBytes }; }
+      if (isStorageFull(error)) { await pauseStorage(); await release(claim, true); return { outcome: "paused", textBytes }; }
       throw error;
     }
   }
@@ -298,6 +314,8 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
     },
     async retry(refs, lease) {
       if (refs.length > LIBRARY_LIMITS.snippetRefs) throw new LibraryIndexError("invalid_library_request", "Too many retry references.", false);
+      // One JSON-bound exact-ref update fits the shared invocation budget even at 48 refs;
+      // resetting attempts/retry timing never changes the visible failed state or generation.
       const leaseCheck = leaseGuard(lease);
       const result = await db.batch([prepare(sql(`UPDATE documents SET attempts=0,retry_at=NULL,claim_token=NULL,claim_until=NULL
         WHERE state='failed' AND (attempts!=0 OR retry_at IS NOT NULL)
@@ -329,8 +347,8 @@ function boundedText(record: TextRecord, ref: SelectionRef, extractor: TextRecor
     reason: limited && searchable ? "Extracted text was sanitized or limited to 512 KiB UTF-8." : record.reason?.slice(0, 1024) ?? null };
 }
 function unavailable() { return new LibraryIndexError("library_unavailable", "Document index upkeep could not complete; retry later.", true); }
-function isAdmission(error: unknown): boolean { return error instanceof Error && error.name === "InvocationBudgetExceeded"; }
+function isAdmission(error: unknown): boolean { return error instanceof InvocationBudgetExceeded; }
 function isStorageFull(error: unknown): boolean {
-  return error instanceof Error && /SQLITE_FULL|database or disk is full|storage (?:limit|quota)|database.*(?:size|storage).*limit/i.test(error.message);
+  return error instanceof Error && /SQLITE_FULL|Exceeded maximum DB size|database or disk is full|storage (?:limit|quota)|database.*(?:size|storage).*limit/i.test(error.message);
 }
 function safeLog(category: "upload-upkeep" | "deferred-index") { console.warn("library-records", { category }); }
