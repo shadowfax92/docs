@@ -19,6 +19,7 @@ describe("native persistent query large-body proof", () => {
       stdin: { contents: `
         import { createLibraryQueries } from './src/library-index/query';
         import { DEFAULT_LIBRARY_CONFIG } from './src/library-index';
+        import { createInvocationResources } from './src/invocation-budget';
         let identity;
         const forbidden = () => { throw new Error('Unexpected R2/extraction access'); };
         export default { async fetch(request, env) {
@@ -42,18 +43,24 @@ describe("native persistent query large-body proof", () => {
             ]);
             output = {bytes:new TextEncoder().encode(body).length};
           } else {
-            let used=0;
+            const resources=createInvocationResources(()=>db,env.DOCS_BUCKET);
+            let statements=0,rowsRead=0;
             const prepared=new WeakMap();
+            const record=result=>{
+              rowsRead+=result?.meta?.rows_read||0;
+              const rows=result?.results;
+              if(rows?.some(r=>typeof r.body==='string')) {
+                bodyReads.push({rows:rows.length,bytes:rows.reduce((n,r)=>n+new TextEncoder().encode(r.body||'').length,0)});
+              }
+            };
             const wrap=(s,sql)=> {
               const p=new Proxy(s,{get(target,key){
                 if(key==='bind') return (...args)=>wrap(target.bind(...args),sql);
                 if(['all','first','run','raw'].includes(key)) return async (...args)=>{
-                  used++;
-                  const result=await target[key](...args);
-                  const rows=result?.results;
-                  if(rows?.some(r=>typeof r.body==='string')) {
-                    bodyReads.push({rows:rows.length,bytes:rows.reduce((n,r)=>n+new TextEncoder().encode(r.body||'').length,0)});
-                  }
+                  statements++;
+                  const result=key==='first'?await target.all():await target[key](...args);
+                  record(result);
+                  if(key==='first') return typeof args[0]==='string' ? result.results[0]?.[args[0]]??null : result.results[0]??null;
                   return result;
                 };
                 const value=target[key]; return typeof value==='function'?value.bind(target):value;
@@ -61,17 +68,21 @@ describe("native persistent query large-body proof", () => {
               prepared.set(p,s);return p;
             };
             const bodyReads=[];
-            const traced=new Proxy(db,{get(target,key){
+            const traced=new Proxy(resources.db,{get(target,key){
               if(key==='prepare') return sql=>wrap(target.prepare(sql),sql);
-              if(key==='batch') return stmts=>{used+=stmts.length;return target.batch(stmts.map(s=>prepared.get(s)||s));};
+              if(key==='batch') return async stmts=>{
+                statements+=stmts.length;
+                const results=await target.batch(stmts.map(s=>prepared.get(s)||s));
+                results.forEach(record);return results;
+              };
               const value=target[key];return typeof value==='function'?value.bind(target):value;
             }});
-            const queries=createLibraryQueries({db:traced,now:Date.now,publicOrigin:'https://docs.example',
+            const queries=createLibraryQueries({db:traced,budget:resources.budget,now:Date.now,publicOrigin:'https://docs.example',
               config:DEFAULT_LIBRARY_CONFIG,documents:{page:forbidden,resolve:forbidden,create:forbidden,remove:forbidden},
               extract:forbidden,defer:forbidden,nonce:crypto.randomUUID});
             const start=performance.now();
             const result=await queries[data.op](data.request);
-            output={result,used,bodyReads,elapsedMs:performance.now()-start};
+            output={result,used:resources.budget.used,statements,rowsRead,bodyReads,elapsedMs:performance.now()-start};
           }
           return Response.json(output,{headers:{'x-query-isolate':identity}});
         }};
@@ -81,6 +92,7 @@ describe("native persistent query large-body proof", () => {
     const mf = new Miniflare({ modules: true, script: bundle.outputFiles[0].text,
       compatibilityDate: "2024-12-01", host: "127.0.0.1", port: 0, cf: false,
       d1Databases: { LIBRARY_DB: "query-native-proof" },
+      r2Buckets: ["DOCS_BUCKET"],
       outboundService: () => { throw new Error("No external fetch in query proof"); } });
     let peakDriverKiB = 0;
     let peakWorkerdKiB = 0;
@@ -112,16 +124,20 @@ describe("native persistent query large-body proof", () => {
     let isolate: string | null = null;
     const bodyReads: { rows: number; bytes: number }[] = [];
     const timings: Record<string, number[]> = {};
+    const sqlMetrics: Record<string, { statements: number; rowsRead: number }[]> = {};
     const invoke = async <T,>(op: string, data: Record<string, unknown>): Promise<T> => {
       const response = await mf.dispatchFetch("https://proof.invalid/", { method: "POST", body: JSON.stringify({ op, ...data }) });
       expect(response.status).toBe(200);
       const current = response.headers.get("x-query-isolate");
       if (isolate === null) isolate = current;
       expect(current).toBe(isolate);
-      const value = await response.json() as { result: T; elapsedMs: number; used: number; bodyReads: typeof bodyReads };
+      const value = await response.json() as { result: T; elapsedMs: number; used: number;
+        statements: number; rowsRead: number; bodyReads: typeof bodyReads };
       if (value.result) {
         bodyReads.push(...value.bodyReads);
         (timings[op] ??= []).push(value.elapsedMs);
+        (sqlMetrics[op] ??= []).push({ statements: value.statements, rowsRead: value.rowsRead });
+        expect(value.used).toBe(value.statements); // no R2 or duplicate admission charges
         expect(value.used).toBeLessThanOrEqual(40);
         return value.result;
       }
@@ -195,21 +211,25 @@ describe("native persistent query large-body proof", () => {
            FROM documents d JOIN document_text t ON t.doc=d.doc WHERE d.id LIKE 'S%'`,
       ];
       await invoke("migrate", { sql: scaleSQL });
-      const scale: Record<string, { hits: number; slices: number; totalMs: number; sliceMs: number[] }> = {};
+      const scale: Record<string, { hits: number; slices: number; totalMs: number; sliceMs: number[];
+        statements: number; rowsRead: number; sql: { statements: number; rowsRead: number }[] }> = {};
       for (const text of ["policy-handbook-2345", "Database policy", "definitely absent phrase"]) {
         let next: string | undefined;
         const sliceMs: number[] = [];
+        const sql: { statements: number; rowsRead: number }[] = [];
         let count = 0;
         for (let i = 0; i < 100; i++) {
           const result = await invoke<LibrarySearchResponse>("search", { request: { version: 1,
             query: { text, mode: "literal", ignoreCase: true }, filter, ...(next ? { cursor: next } : {}) } });
           count += result.hits.length;
           sliceMs.push(timings.search.at(-1)!);
+          sql.push(sqlMetrics.search.at(-1)!);
           if (result.complete) break;
           next = result.nextCursor!;
         }
         expect(count).toBe(text === "Database policy" ? 5000 : text === "policy-handbook-2345" ? 1 : 0);
-        scale[text] = { hits: count, slices: sliceMs.length, totalMs: sliceMs.reduce((a, b) => a + b, 0), sliceMs };
+        scale[text] = { hits: count, slices: sliceMs.length, totalMs: sliceMs.reduce((a, b) => a + b, 0), sliceMs,
+          statements: sql.reduce((n, s) => n + s.statements, 0), rowsRead: sql.reduce((n, s) => n + s.rowsRead, 0), sql };
       }
       await sample();
       const report = { runtime: "Miniflare 3.20250718.3 / workerd 1.20250718.0", documents: 100,
@@ -217,7 +237,7 @@ describe("native persistent query large-body proof", () => {
         peakDriverKiB, peakWorkerdKiB, peakTreeKiB, sampleIntervalMs: 50,
         maxStatementBodyRows: Math.max(...bodyReads.map((p) => p.rows)),
         maxStatementBodyBytes: Math.max(...bodyReads.map((p) => p.bytes)),
-        regexSliceMs: regexTimings, timings, scale: { documents: 5000, bodyBytes: prose.length, queries: scale },
+        regexSliceMs: regexTimings, timings, sqlMetrics, scale: { documents: 5000, bodyBytes: prose.length, queries: scale },
         limits: "Local process RSS is not per-isolate heap; no deployed CPU/latency claim." };
       const out = new URL("../../../.scratch/docs-index-query/", (import.meta as { url: string }).url);
       await mkdir(out, { recursive: true });

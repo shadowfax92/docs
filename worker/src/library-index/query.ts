@@ -78,12 +78,17 @@ export function createLibraryQueries(deps: LibraryDependencies): LibraryQueries 
         let bytes = 0;
         let pages = 0;
         let complete = false;
+        // SQL counts stay inside D1. Charge a conservative needle-comparison factor in
+        // addition to byte/time limits; long repetitive literals cannot hide unbounded SQL.
+        const byteBudget = strategy && admitted.query.text
+          ? Math.min(LIMIT.sliceBytes, Math.floor(128 * 1024 * 1024 / admitted.query.text.length)) : LIMIT.sliceBytes;
         // The local page cap also bounds host/test consumers without an invocation ledger.
         // HTTP's wrapper owns charging; leave room for lookahead and the generation recheck.
-        while (!clock.expired() && bytes < LIMIT.sliceBytes && pages < 32 && statementsRemaining(deps) >= 3) {
-          const limit = admitted.query.text ? Math.min(LIMIT.bodyRows, Math.floor((LIMIT.sliceBytes - bytes) / LIMIT.bodyBytes)) : LIMIT.metadataRows;
+        while (!clock.expired() && bytes < byteBudget && pages < 32 && statementsRemaining(deps) >= 3) {
+          const limit = !admitted.query.text || strategy ? LIMIT.metadataRows
+            : Math.min(LIMIT.bodyRows, Math.floor((byteBudget - bytes) / LIMIT.bodyBytes));
           if (limit < 1) break;
-          const page = await searchPage(deps, admitted.query, strategy, candidates, matcher, after, limit, clock);
+          const page = await searchPage(deps, admitted.query, strategy, candidates, matcher, after, limit, clock, byteBudget - bytes);
           pages++;
           after = page.after;
           bytes += page.bytes;
@@ -93,6 +98,14 @@ export function createLibraryQueries(deps: LibraryDependencies): LibraryQueries 
           if (page.stopped) break;
         }
         if (!complete) complete = !await hasMore(deps, after, candidates);
+        if (!complete && after === (cursor?.after ?? 0)) {
+          // A slow DB wait or an indivisible oversized work item must not yield the same
+          // cursor forever. Compact counts already computed are consumed even after a wait.
+          if (!clock.expired() && strategy && pages > 0) {
+            throw new LibraryIndexError("search_budget_exceeded", "A document exceeds the SQL counting work budget. Narrow the query.", false);
+          }
+          throw new LibraryIndexError("library_unavailable", "The query slice made no progress. Retry the request.", true);
+        }
         await recheckGeneration(deps, snapshot.generation);
         return {
           version: 1, generation: snapshot.generation, hits, complete,
@@ -215,8 +228,9 @@ async function readSnapshot(deps: LibraryDependencies): Promise<Snapshot> {
     status: {
       counts: visibleCounts, lastReconciledAt: last,
       anomalies: values.has("anomalies") ? generation(values.get("anomalies")) : 0,
-      storage: stored ?? { bytes, budgetBytes: deps.config.sizeBudgetBytes,
-        planningBytes: bytes + Math.ceil(3.2 * global.planning), projectedBytes: null, paused: false, reason: null },
+      storage: { bytes, budgetBytes: deps.config.sizeBudgetBytes,
+        planningBytes: bytes + Math.ceil(3.2 * global.planning), projectedBytes: stored?.projectedBytes ?? null,
+        paused: stored?.paused ?? false, reason: stored?.reason ?? null },
     },
   };
 }
@@ -284,8 +298,7 @@ type SliceClock = ReturnType<typeof sliceClock>;
 function statementsRemaining(deps: LibraryDependencies): number {
   // The optional ledger is supplied by HTTP after wrapping the actual D1/R2 resources.
   // Inspecting it never charges; SQL execution is charged exactly once by that wrapper.
-  const budget = (deps as LibraryDependencies & { budget?: { remaining: number } }).budget;
-  return budget?.remaining ?? Infinity;
+  return deps.budget?.remaining ?? Infinity;
 }
 
 /** Exact SQL admission is intentionally narrower than FTS folding. ASCII patterns use only
@@ -310,7 +323,7 @@ function foldedSQL(field: string, ignoreCase: boolean): string {
 interface SearchRow { doc: number; id: string; version: string; filename: string; title: string; body: string; bytes: number; matchCount: number }
 interface SearchPage { after: number; bytes: number; hits: LibraryHit[]; exhausted: boolean; stopped: boolean }
 async function searchPage(deps: LibraryDependencies, query: SearchQuery, sql: boolean, filter: Predicate,
-  matcher: CompiledSearchMatcher, after: number, limit: number, clock: SliceClock): Promise<SearchPage> {
+  matcher: CompiledSearchMatcher, after: number, limit: number, clock: SliceClock, byteBudget: number): Promise<SearchPage> {
   const body = "CASE WHEN d.state='indexed' AND d.coverage IN ('full','truncated') THEN coalesce(t.body,'') ELSE '' END";
   let statement: D1PreparedStatement;
   if (!query.text) {
@@ -318,18 +331,26 @@ async function searchPage(deps: LibraryDependencies, query: SearchQuery, sql: bo
       FROM documents d WHERE ${visible} AND d.doc>? AND ${filter.sql} ORDER BY d.doc LIMIT ?`)
       .bind(after, ...filter.args, limit);
   } else if (sql) {
-    // Materialize the bounded keyset BEFORE touching large text. Counts return no bodies,
-    // but limiting SQL work still matters: a common term must not scan 5k x 512 KiB at once.
-    const fields = ["filename", "title", "body"].map((field) => foldedSQL(field, query.ignoreCase));
-    const counts = fields.map((field) => `(length(CAST(${field} AS BLOB))-length(CAST(replace(${field},q.term,'') AS BLOB)))/length(q.term)`).join("+");
+    // First materialize small candidate keys and their prefix byte totals. Only that bounded
+    // prefix joins text: at most 4 MiB per SQL count statement, up to 500 compact result rows.
+    // records owns indexed_bytes == stored UTF8 body bytes. Unlike RE2/snippets, no bodies
+    // cross the D1 boundary, so applying the eight-returned-body cap here wastes SQL calls.
+    const counts = ["filename", "title", "body"].map((field) =>
+      `(length(CAST(${field} AS BLOB))-length(CAST(replace(${field},q.term,'') AS BLOB)))/length(q.term)`).join("+");
     const term = query.ignoreCase ? query.text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32)) : query.text;
-    statement = deps.db.prepare(`WITH selected AS MATERIALIZED (
-      SELECT d.doc,d.id,d.version,d.filename,d.title,d.state,d.coverage FROM documents d
+    statement = deps.db.prepare(`WITH candidates AS MATERIALIZED (
+      SELECT d.doc,1+length(CAST(d.filename AS BLOB))+length(CAST(d.title AS BLOB))+
+        CASE WHEN d.state='indexed' AND d.coverage IN ('full','truncated') THEN d.indexed_bytes ELSE 0 END AS bytes FROM documents d
       WHERE ${visible} AND d.doc>? AND ${filter.sql} ORDER BY d.doc LIMIT ?
-    ), fields AS MATERIALIZED (SELECT d.doc,d.id,d.version,d.filename,d.title,${body} AS body
-      FROM selected d LEFT JOIN document_text t ON t.doc=d.doc), q AS (SELECT ? AS term)
-      SELECT doc,id,version,length(CAST(body AS BLOB)) AS bytes,${counts} AS matchCount FROM fields,q ORDER BY doc`)
-      .bind(after, ...filter.args, limit, term);
+    ), bounded AS MATERIALIZED (
+      SELECT doc,bytes,sum(bytes) OVER (ORDER BY doc ROWS UNBOUNDED PRECEDING) AS total FROM candidates
+    ), selected AS MATERIALIZED (SELECT doc,bytes FROM bounded WHERE total<=?),
+    fields AS MATERIALIZED (SELECT d.doc,d.id,d.version,s.bytes,
+      ${foldedSQL("d.filename", query.ignoreCase)} AS filename,${foldedSQL("d.title", query.ignoreCase)} AS title,
+      ${foldedSQL(body, query.ignoreCase)} AS body FROM selected s JOIN documents d ON d.doc=s.doc
+      LEFT JOIN document_text t ON t.doc=d.doc), q AS (SELECT ? AS term)
+      SELECT doc,id,version,bytes,${counts} AS matchCount,(SELECT count(*) FROM candidates) AS candidates FROM fields,q ORDER BY doc`)
+      .bind(after, ...filter.args, limit, Math.min(byteBudget, 4 * 1024 * 1024), term);
   } else {
     statement = deps.db.prepare(`SELECT d.doc,d.id,d.version,d.filename,d.title,${body} AS body,
       length(CAST(${body} AS BLOB)) AS bytes FROM documents d LEFT JOIN document_text t ON t.doc=d.doc
@@ -338,10 +359,11 @@ async function searchPage(deps: LibraryDependencies, query: SearchQuery, sql: bo
   }
   // This function owns the only page reference. It returns compact values, releasing D1's
   // body strings/results before the caller awaits its next read. One matcher spans all pages.
-  const rows = (await statement.all<SearchRow>()).results;
-  const result: SearchPage = { after, bytes: 0, hits: [], exhausted: rows.length < limit, stopped: false };
+  const rows = (await statement.all<SearchRow & { candidates?: number }>()).results;
+  const exhausted = sql && query.text ? rows.length > 0 && rows[0].candidates === rows.length && rows.length < limit : rows.length < limit;
+  const result: SearchPage = { after, bytes: 0, hits: [], exhausted, stopped: rows.length === 0 };
   for (const row of rows) {
-    if (clock.expired()) { result.stopped = true; result.exhausted = false; break; }
+    if (!sql && query.text && clock.expired()) { result.stopped = true; result.exhausted = false; break; }
     const matchCount = sql || !query.text ? row.matchCount : matcher.match(row)?.matchCount;
     if (matchCount !== undefined && (matchCount > 0 || !query.text)) {
       result.hits.push({ id: row.id, version: row.version, matchCount });

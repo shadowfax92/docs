@@ -80,13 +80,15 @@ describe("persistent library queries", () => {
         f.db.prepare("INSERT INTO index_meta(key,value) VALUES ('last-reconciled-at',?)").bind(JSON.stringify("2026-10-15T00:00:00Z")),
         f.db.prepare("INSERT INTO index_meta(key,value) VALUES ('anomalies','2')"),
       ]);
+      const currentSize = (await f.db.prepare("SELECT 1").all()).meta.size_after;
       const trace = observeQueryDB(f.db);
       const forbidden = () => { throw new Error("R2/extraction is forbidden in query reads"); };
-      const deps = { ...f.deps, db: trace.db,
+      const deps = { ...f.deps, db: trace.db, config: { ...f.deps.config, sizeBudgetBytes: 123456789 },
         documents: { create: forbidden, page: forbidden, resolve: forbidden, remove: forbidden }, extract: forbidden, defer: forbidden };
       const state = await readLibraryState(deps);
       expect(trace.reads.length).toBe(3);
-      expect(state).toMatchObject({ generation: 0, status: { anomalies: 2, storage, lastReconciledAt: "2026-10-15T00:00:00Z" } });
+      expect(state).toMatchObject({ generation: 0, status: { anomalies: 2, lastReconciledAt: "2026-10-15T00:00:00Z" } });
+      expect(state.status.storage).toEqual({ ...storage, bytes: currentSize, budgetBytes: 123456789, planningBytes: currentSize });
       expect(trace.bodyPages).toEqual([]);
       const library = createLibraryIndex(deps);
       expect((await library.page()).items.length).toBe(1);
@@ -180,7 +182,7 @@ describe("persistent library queries", () => {
         let mutated = false;
         const trace = observeQueryDB(f.db, async (sql) => {
           if (!mutated && sql.some((s) => op === "page" ? s.includes("uploaded_at_iso")
-            : op === "search" ? s.includes("WITH selected") : s.includes("WITH requested"))) {
+            : op === "search" ? s.includes("WITH candidates") : s.includes("WITH requested"))) {
             mutated = true;
             await f.db.prepare("UPDATE index_meta SET value='1' WHERE key='generation'").run();
           }
@@ -202,16 +204,19 @@ describe("persistent library queries", () => {
       const query = { text: "target", mode: "literal" as const, ignoreCase: false };
       const makeLibrary = () => createLibraryIndex({ ...f.deps,
         db: observeQueryDB(f.db, async (sql) => {
-          if (sql.some((s) => s.includes("WITH selected") || s.includes("WITH requested"))) {
+          if (sql.some((s) => s.includes("WITH candidates") || s.includes("WITH requested"))) {
             await Promise.resolve();
             epoch += 1001;
           }
         }).db });
       const result = await makeLibrary().search({ version: 1, query, filter: all });
-      expect(result).toMatchObject({ hits: [], complete: false });
-      expect(result.nextCursor).toBeTypeOf("string");
-      expect((await f.library.search({ version: 1, query, filter: all, cursor: result.nextCursor! })).hits)
-        .toEqual([{ id: querySummary(1).id, version: querySummary(1).version, matchCount: 1 }]);
+      expect(result).toMatchObject({ complete: true, nextCursor: null,
+        hits: [{ id: querySummary(1).id, version: querySummary(1).version, matchCount: 1 }] });
+      const stalled = createLibraryIndex({ ...f.deps, db: observeQueryDB(f.db, async (sql) => {
+        if (sql.length > 1) { await Promise.resolve(); epoch += 1001; }
+      }).db });
+      await expect(stalled.search({ version: 1, query, filter: all }))
+        .rejects.toMatchObject({ code: "library_unavailable", retryable: true });
       expect(await makeLibrary().snippets({ version: 1, generation: 0, query, refs: [querySummary(1)] }))
         .toMatchObject({ hits: [], unavailable: [], remaining: [{ id: querySummary(1).id, version: querySummary(1).version }] });
     } finally { await f.dispose(); }
