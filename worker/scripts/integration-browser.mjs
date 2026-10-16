@@ -107,6 +107,9 @@ async function catalogProof(context,shot,check) {
   await p.getByLabel('Password',{exact:true}).fill(password);await p.getByRole('button',{name:'Unlock',exact:true}).click();
   await p.locator('#library-title').waitFor({state:'visible'});
   await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);
+  // Full fixture deliberately retains failed DOCX versions. Frozen contracts require the
+  // all-matching gate even for an empty query; metadata discovery alone is insufficient.
+  assert(await p.getByRole('button',{name:'Select all matching',exact:true}).isDisabled());
   assert(lists.length>=1);assert.equal(await p.locator('[data-vh-ui]').count(),0);
   await p.reload();await p.locator('#library-title').waitFor({state:'visible'});
   await p.waitForFunction(()=>document.querySelector('.scan-line')?.textContent.includes('Refresh')&&document.querySelectorAll('article[data-id]').length>0);

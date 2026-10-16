@@ -71,7 +71,7 @@ try {
   assert(responses.some(r => r.path.endsWith('/search') && r.query === 'BodySentinel' && r.complete === false));
   assert(responses.some(r => r.path.endsWith('/search') && r.query === 'BodySentinel' && r.complete === true));
   assert((await page.locator('article[data-id]').first().innerText()).includes('2 matches'));
-  assert(await page.locator('article[data-id] mark').count() > 0);
+  await page.locator('article[data-id] mark').first().waitFor();
   check('real bounded regex continuations, exact counts and snippet highlights');
   // Pause one real response to exercise the browser's async handoff with newer input.
   let release, arrived;
