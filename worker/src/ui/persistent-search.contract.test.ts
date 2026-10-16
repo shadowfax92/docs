@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createLibraryFixture } from "./library-index.test-support";
-import { querySummary, seedQueryRows, type QuerySeed } from "./library-index/query-test-support";
-import { LibraryIndexError } from "./library-index";
-import type { LibraryErrorCode } from "./library-contracts";
-import { CatalogClient } from "./ui/catalog-client";
+import { createLibraryFixture } from "../library-index.test-support";
+import { querySummary, seedQueryRows, type QuerySeed } from "../library-index/query-test-support";
+import { LibraryIndexError } from "../library-index";
+import type { LibraryErrorCode } from "../library-contracts";
+import { CatalogClient } from "./catalog-client";
 
 /**
  * Contract check between the browser catalog client and the REAL LibraryIndex query module over
