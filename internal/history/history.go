@@ -17,6 +17,7 @@ type Entry struct {
 	URL        string    `json:"url"`
 	ID         string    `json:"id,omitempty"`
 	Path       string    `json:"path,omitempty"`
+	Folder     bool      `json:"folder,omitempty"`
 }
 
 type Filter struct {
@@ -63,6 +64,24 @@ func (s *Store) Append(entry Entry) error {
 		}
 		entries = append(entries, entry)
 		return s.write(entries)
+	})
+}
+
+// Upsert replaces the record for one public URL after a confirmed remote update. Comparing
+// URLs keeps equal short IDs on different Workers separate; the file lock prevents lost uploads.
+func (s *Store) Upsert(entry Entry) error {
+	return s.withExclusiveLock(func() error {
+		entries, err := s.read()
+		if err != nil {
+			return err
+		}
+		kept := make([]Entry, 0, len(entries)+1)
+		for _, previous := range entries {
+			if previous.URL != entry.URL {
+				kept = append(kept, previous)
+			}
+		}
+		return s.write(append(kept, entry))
 	})
 }
 

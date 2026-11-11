@@ -19,9 +19,13 @@ var httpClient = &http.Client{Timeout: 2 * time.Minute}
 
 const deleteResultHeader = "X-Docs-Delete-Result"
 
+// Response retains the original upload identity and adds the authoritative title/version used
+// by in-place updates and machine-readable CLI output. Older upload responses may omit both.
 type Response struct {
-	URL string `json:"url"`
-	ID  string `json:"id"`
+	URL     string `json:"url"`
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 var extToContentType = map[string]string{
@@ -75,8 +79,18 @@ func detectContentType(filename string, f *os.File) (string, error) {
 
 // UploadContent sends an already-prepared document body through the upload API.
 func UploadContent(cfg *config.Config, filename string, contentType string, content io.Reader, docName string) (*Response, error) {
-	url := strings.TrimRight(cfg.URL, "/") + "/upload"
-	req, err := http.NewRequest(http.MethodPut, url, content)
+	return writeContent(cfg, "/upload", filename, contentType, content, docName, "")
+}
+
+// writeContent shares the fixed-length streaming contract between new uploads and replacements.
+// Replacements carry the server's exact version; the caller must never retry them as new uploads.
+func writeContent(cfg *config.Config, endpoint, filename, contentType string, content io.Reader, docName, version string) (*Response, error) {
+	action := "upload"
+	if version != "" {
+		action = "update"
+	}
+	endpoint = strings.TrimRight(cfg.URL, "/") + endpoint
+	req, err := http.NewRequest(http.MethodPut, endpoint, content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -107,19 +121,28 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 	if docName != "" {
 		req.Header.Set("X-Doc-Name", docName)
 	}
+	if version != "" {
+		req.Header.Set("If-Match", `"`+version+`"`)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("upload failed: %w", err)
+		if version != "" {
+			return nil, fmt.Errorf("update response unavailable; check the existing URL before retrying: %w", err)
+		}
+		return nil, fmt.Errorf("%s failed: %w", action, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, fmt.Errorf("failed to read %s response: %w", action, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if version != "" {
+			return nil, updateError(resp.StatusCode, resp.Header.Get("X-Docs-Update-Result"), string(body))
+		}
 		return nil, fmt.Errorf("upload failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 

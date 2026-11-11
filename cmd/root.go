@@ -7,7 +7,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:          "docs",
 	Short:        "Share files with short URLs",
-	Long:         "Upload files and folders to get a short, shareable URL. Renderable documents open in the browser; other files get a download page.",
+	Long:         "Upload files and folders to get a short, shareable URL. Use 'docs update <id-or-url> [file]' to replace content at the same URL. Renderable documents open in the browser; other files get a download page.",
 	SilenceUsage: true,
 }
 

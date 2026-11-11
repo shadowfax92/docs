@@ -84,7 +84,7 @@ describe("persistent library queries", () => {
       const trace = observeQueryDB(f.db);
       const forbidden = () => { throw new Error("R2/extraction is forbidden in query reads"); };
       const deps = { ...f.deps, db: trace.db, config: { ...f.deps.config, sizeBudgetBytes: 123456789 },
-        documents: { create: forbidden, page: forbidden, resolve: forbidden, remove: forbidden }, extract: forbidden, defer: forbidden };
+        documents: { create: forbidden, update: forbidden, page: forbidden, resolve: forbidden, remove: forbidden }, extract: forbidden, defer: forbidden };
       const state = await readLibraryState(deps);
       expect(trace.reads.length).toBe(3);
       expect(state).toMatchObject({ generation: 0, status: { anomalies: 2, lastReconciledAt: "2026-10-15T00:00:00Z" } });

@@ -1,4 +1,4 @@
-import type { Env, PublicEnv } from "./contracts";
+import type { DocumentSummary, Env, PublicEnv } from "./contracts";
 import { createCatalog } from "./catalog";
 import { createDocuments, isUploadId, type Documents } from "./documents";
 import { extractText } from "./extract";
@@ -67,9 +67,11 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
   }
   const upload = request.method === "PUT" && path === "upload";
   const deletion = request.method === "DELETE" && path.startsWith("upload/");
-  if (upload || deletion) {
+  const updating = request.method === "PUT" && path.startsWith("upload/");
+  const metadata = request.method === "GET" && path.startsWith("upload/");
+  if (upload || deletion || updating || metadata) {
     const id = path.slice("upload/".length);
-    if (deletion && !isUploadId(id)) return new Response("Not found", { status: 404 });
+    if (!upload && !isUploadId(id)) return new Response("Not found", { status: 404 });
     if (!(await isAuthorized(request, env.AUTH_TOKEN))) return new Response("Unauthorized", { status: 401 });
     try {
       if (upload) {
@@ -78,6 +80,26 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
           mime: request.headers.get("Content-Type") || "", title: request.headers.get("X-Doc-Name") || "",
         });
         return Response.json({ url: doc.publicUrl, id: doc.id });
+      }
+      if (metadata) {
+        const current = await documents.resolve(id);
+        return current ? documentResponse(current.summary)
+          : new Response("Upload not found", { status: 404, headers: { "X-Docs-Update-Result": "not-found", "Cache-Control": "no-store" } });
+      }
+      if (updating) {
+        // Freeze the version before accepting replacement bytes. Wildcards and weak ETags
+        // would silently allow an agent to overwrite another publisher's intervening edits.
+        const expectedVersion = /^"([a-f0-9]{64})"$/.exec(request.headers.get("If-Match") ?? "")?.[1];
+        if (!expectedVersion) return new Response("Read GET /upload/:id and send its ETag in If-Match", { status: 428 });
+        const result = await writes().update(id, expectedVersion, {
+          body: request.body, filename: request.headers.get("X-Filename") || "file",
+          mime: request.headers.get("Content-Type") || "", title: request.headers.get("X-Doc-Name") ?? undefined,
+        });
+        if (result.status === "updated") return documentResponse(result.document);
+        return new Response(result.status === "not-found" ? "Upload not found" : "Upload changed; retry after reviewing the current version", {
+          status: result.status === "not-found" ? 404 : 412,
+          headers: { "X-Docs-Update-Result": result.status, "Cache-Control": "no-store" },
+        });
       }
       const result = await writes().remove(id);
       // A decorator may refuse an overlapping delete as changed. The CLI must retain history
@@ -108,7 +130,13 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
   }
 }
 
-// Upload and legacy bearer deletion share one authorization implementation. Digesting equal-length
+function documentResponse(document: DocumentSummary): Response {
+  return Response.json({ url: document.publicUrl, id: document.id, name: document.title, version: document.version }, {
+    headers: { ETag: `"${document.version}"`, "Cache-Control": "no-store", "X-Docs-Update-Result": "ok" },
+  });
+}
+
+// Upload, update and legacy bearer deletion share one authorization implementation. Digesting equal-length
 // bytes also avoids the old space-padding comparison treating a trailing-space token as equivalent.
 async function isAuthorized(request: Request, token: string): Promise<boolean> {
   const auth = request.headers.get("Authorization");

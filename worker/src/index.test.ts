@@ -27,12 +27,15 @@ interface ListedPage {
 
 /** In-memory R2 boundary used to exercise deletion through the Worker's fetch handler. */
 class FakeBucket {
+  private readonly publications = new MemoryBucket();
   readonly deletedBatches: string[][] = [];
   readonly listCalls: Array<{ prefix?: string; cursor?: string }> = [];
   failList = false;
   failDelete = false;
 
   constructor(private readonly pages: Record<string, ListedPage>) {}
+
+  put(...args: Parameters<MemoryBucket["put"]>) { return this.publications.put(...args); }
 
   async list(options: { prefix?: string; cursor?: string }): Promise<ListedPage> {
     this.listCalls.push(options);
@@ -80,10 +83,11 @@ describe("DELETE /upload/:id", () => {
     expect(response.status).toBe(204);
     expect(response.headers.get("X-Docs-Delete-Result")).toBe("deleted");
     expect(bucket.listCalls).toEqual([
-      { prefix: `${uploadId}/`, cursor: undefined },
-      { prefix: `${uploadId}/`, cursor: "next-page" },
+      { prefix: `${uploadId}/`, cursor: undefined, include: ["customMetadata", "httpMetadata"] },
+      { prefix: `${uploadId}/`, cursor: "next-page", include: ["customMetadata", "httpMetadata"] },
     ]);
-    expect(bucket.deletedBatches).toEqual([firstKeys, remainingKeys]);
+    expect(bucket.deletedBatches.map((batch) => batch.length)).toEqual([1000, 2]);
+    expect(bucket.deletedBatches.flat().sort()).toEqual([...firstKeys, ...remainingKeys].sort());
   });
 
   it("returns not found without deleting when the ID has no objects", async () => {

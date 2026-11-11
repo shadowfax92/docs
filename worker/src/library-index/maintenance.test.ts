@@ -235,7 +235,14 @@ it("reports permanent deleted-ID rewrites once per pass without indexing or dele
   const f = await createLibraryFixture();
   try {
     await f.bucket.put("Gone0001/note.txt", "original");
-    const records = createLibraryRecords({ ...f.deps, extract: extractText });
+    // Legacy deletions left only a D1 tombstone, before ID/ publication markers existed.
+    // Keep this original repair contract covered using native R2's old physical-delete path.
+    const records = createLibraryRecords({ ...f.deps, extract: extractText, documents: {
+      ...f.documents, async remove(id) {
+        await f.bucket.delete(`${id}/note.txt`);
+        return { status: "deleted", deletedObjectCount: 1 };
+      },
+    } });
     const summary = (await f.documents.resolve("Gone0001"))!.summary;
     await records.ingest(summary, f.deps.now());
     await records.index((await records.claim(summary))!);

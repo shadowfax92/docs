@@ -26,6 +26,7 @@ var folderUpload bool
 var uploadCmd = &cobra.Command{
 	Use:   "upload [--folder] <file-or-folder>",
 	Short: "Upload a file or folder and get a short URL",
+	Long:  "Upload a file or folder and get a new short URL. To replace content at an existing URL, use 'docs update <id-or-url> [file-or-folder]' instead.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runUpload,
 }
@@ -95,6 +96,13 @@ func uploadPath(cfg *config.Config, filePath string, info os.FileInfo, docName s
 
 // uploadFolder creates a temporary archive so a directory still fits the one-object upload API.
 func uploadFolder(cfg *config.Config, filePath string, docName string) (*upload.Response, error) {
+	return withFolderArchive(filePath, func(archivePath string) (*upload.Response, error) {
+		return upload.Upload(cfg, archivePath, docName)
+	})
+}
+
+// withFolderArchive keeps the temporary zip alive until either publication operation finishes.
+func withFolderArchive(filePath string, publish func(string) (*upload.Response, error)) (*upload.Response, error) {
 	tempDir, err := os.MkdirTemp("", "docs-folder-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temporary archive directory: %w", err)
@@ -105,10 +113,14 @@ func uploadFolder(cfg *config.Config, filePath string, docName string) (*upload.
 	if err := folderarchive.WriteZip(filePath, archivePath, maxFolderUploadBytes); err != nil {
 		return nil, err
 	}
-	return upload.Upload(cfg, archivePath, docName)
+	return publish(archivePath)
 }
 
 func recordUploadHistory(filePath string, info os.FileInfo, docName string, resp *upload.Response) error {
+	absolutePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return err
+	}
 	store, err := history.NewDefaultStore()
 	if err != nil {
 		return err
@@ -118,7 +130,8 @@ func recordUploadHistory(filePath string, info os.FileInfo, docName string, resp
 		Name:       uploadHistoryName(filePath, info, docName),
 		URL:        resp.URL,
 		ID:         resp.ID,
-		Path:       filePath,
+		Path:       absolutePath,
+		Folder:     info.IsDir(),
 	})
 }
 
