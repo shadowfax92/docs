@@ -14,6 +14,7 @@ import (
 )
 
 func TestRunUploadAcceptsFolderArchive(t *testing.T) {
+	stubUploadClipboard(t)
 	sourceDir := t.TempDir()
 	writeUploadTestFile(t, filepath.Join(sourceDir, "intro.md"), "hello\n")
 	writeUploadTestFile(t, filepath.Join(sourceDir, "nested", "image.bin"), "\x00\x01\x02")
@@ -56,7 +57,7 @@ func TestRunUploadAcceptsFolderArchive(t *testing.T) {
 		folderUpload = previousFolderUpload
 	})
 
-	if err := runUpload(nil, []string{sourceDir}); err != nil {
+	if err := runUpload(uploadCmd, []string{sourceDir}); err != nil {
 		t.Fatalf("runUpload returned error: %v", err)
 	}
 }
@@ -71,7 +72,7 @@ func TestRunUploadRequiresFolderFlagForDirectory(t *testing.T) {
 		folderUpload = previousFolderUpload
 	})
 
-	err := runUpload(nil, []string{sourceDir})
+	err := runUpload(uploadCmd, []string{sourceDir})
 	if err == nil {
 		t.Fatal("runUpload returned nil error")
 	}
@@ -108,7 +109,7 @@ func TestRunUploadRejectsFolderOverSizeLimitBeforeUpload(t *testing.T) {
 		folderUpload = previousFolderUpload
 	})
 
-	err = runUpload(nil, []string{sourceDir})
+	err = runUpload(uploadCmd, []string{sourceDir})
 	if err == nil {
 		t.Fatal("runUpload returned nil error")
 	}
@@ -121,6 +122,7 @@ func TestRunUploadRejectsFolderOverSizeLimitBeforeUpload(t *testing.T) {
 }
 
 func TestRunUploadAcceptsArbitraryRegularFile(t *testing.T) {
+	stubUploadClipboard(t)
 	sourceDir := t.TempDir()
 	filePath := filepath.Join(sourceDir, "archive.unknown")
 	if err := os.WriteFile(filePath, []byte{0, 1, 2, 3, 4}, 0o644); err != nil {
@@ -156,12 +158,13 @@ func TestRunUploadAcceptsArbitraryRegularFile(t *testing.T) {
 		folderUpload = previousFolderUpload
 	})
 
-	if err := runUpload(nil, []string{filePath}); err != nil {
+	if err := runUpload(uploadCmd, []string{filePath}); err != nil {
 		t.Fatalf("runUpload returned error: %v", err)
 	}
 }
 
 func TestRunUploadRecordsHistory(t *testing.T) {
+	stubUploadClipboard(t)
 	sourceDir := t.TempDir()
 	filePath := filepath.Join(sourceDir, "notes.md")
 	if err := os.WriteFile(filePath, []byte("# Notes\n"), 0o644); err != nil {
@@ -184,7 +187,7 @@ func TestRunUploadRecordsHistory(t *testing.T) {
 		folderUpload = previousFolderUpload
 	})
 
-	if err := runUpload(nil, []string{filePath}); err != nil {
+	if err := runUpload(uploadCmd, []string{filePath}); err != nil {
 		t.Fatalf("runUpload returned error: %v", err)
 	}
 

@@ -19,6 +19,12 @@ var updateName string
 var updateFolder bool
 var updateJSON bool
 
+type updateOptions struct {
+	folder bool
+	name   string
+	json   bool
+}
+
 // updateCmd explicitly targets a published identity. Optional source reuse comes only from local
 // history for that exact public URL; it never guesses which remote upload belongs to a filename.
 var updateCmd = &cobra.Command{
@@ -69,29 +75,38 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		}
 		filePath, rememberedFolder = source.Path, source.Folder
 	}
+	return updatePath(cmd, cfg, id, filePath, updateOptions{
+		folder: updateFolder || rememberedFolder,
+		name:   updateName,
+		json:   updateJSON,
+	})
+}
+
+// updatePath publishes to a resolved upload ID and records the source only
+// after the Worker confirms the new revision at the same URL.
+func updatePath(cmd *cobra.Command, cfg *config.Config, id, filePath string, opts updateOptions) error {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return fmt.Errorf("cannot access source %s: %w; pass its current path: docs update %s <file>", filePath, err, id)
 	}
 	// Remembered folders are already known publication sources; explicit directories retain
 	// upload's --folder guard so a mistyped path cannot accidentally publish a whole directory.
-	folder := updateFolder || rememberedFolder
-	if info.IsDir() && !folder {
+	if info.IsDir() && !opts.folder {
 		return fmt.Errorf("%s is a directory; pass --folder to update it as a zip archive", filePath)
 	}
-	if !info.IsDir() && folder {
+	if !info.IsDir() && opts.folder {
 		return fmt.Errorf("--folder requires a directory")
 	}
 	if !info.IsDir() && !info.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", filePath)
 	}
-	if cmd.Flags().Changed("name") && updateName == "" {
+	if cmd.Flags().Changed("name") && opts.name == "" {
 		return fmt.Errorf("--name must not be empty")
 	}
-	if !updateJSON {
+	if !opts.json {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Updating %s from %s...\n", id, filePath)
 	}
-	publish := func(source string) (*upload.Response, error) { return upload.Update(cfg, id, source, updateName) }
+	publish := func(source string) (*upload.Response, error) { return upload.Update(cfg, id, source, opts.name) }
 	var response *upload.Response
 	if info.IsDir() {
 		response, err = withFolderArchive(filePath, publish)
@@ -101,7 +116,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if updateJSON {
+	if opts.json {
 		err = json.NewEncoder(cmd.OutOrStdout()).Encode(response)
 	} else {
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), response.URL)
@@ -118,7 +133,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	if pathErr != nil || storeErr != nil {
 		fmt.Fprintln(cmd.ErrOrStderr(), "Updated remotely, but could not save local history; pass the source path on the next update")
 	}
-	if !updateJSON {
+	if !opts.json {
 		fmt.Fprintln(cmd.ErrOrStderr(), "Updated in place; URL unchanged")
 	}
 	return nil

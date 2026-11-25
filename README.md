@@ -148,6 +148,7 @@ docs upload notes.md             # upload Markdown (safe self-hosted renderer)
 docs upload archive.zip          # upload any file with a download page
 docs upload --folder ./guides    # upload folder as a zip archive
 docs upload --folder ./guides --name Docs # set link preview title
+docs upload --overwrite report.pdf # replace the uniquely recorded upload for this path
 docs update xK9mRt2p report.pdf   # replace content, keep the same URL and title
 docs update https://your-domain.com/xK9mRt2p report.pdf # pasted links work too
 docs update xK9mRt2p              # reuse the recorded source file or folder
@@ -158,7 +159,7 @@ docs list --days 30              # show uploads from the last 30 days
 docs delete xK9mRt2p             # delete an upload by its short ID
 ```
 
-The URL is printed and copied to your clipboard automatically. Regular file uploads
+Fresh uploads print the URL and copy it to your clipboard. Regular file uploads
 stream with an explicit remaining Content-Length, including zero-byte files.
 Standard in-memory readers retain net/http length inference. Unknown-length streams
 are not buffered: the native local R2 harness rejects them with HTTP 500. The
@@ -172,8 +173,10 @@ Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history 
 
 ### Update an existing link
 
-Use `upload` to make a new link; use `update` (or `reupload`) to publish revised
-content at a link you already shared. For example:
+Use `docs upload --overwrite ./report.html` to revise the one URL recorded for
+that absolute source path on the configured Worker. Include `--folder` for a
+directory. If history has no match or several URLs, use `docs update` (or
+`reupload`) and specify the link you want to revise.
 
 ```sh
 docs update https://docs.shadowfax92.workers.dev/vPNW0l6j ./report.html
@@ -487,6 +490,9 @@ docs delete xK9mRt2p   ──▶  DELETE /upload/xK9mRt2p  ──▶  Worker res
 |---------|-------------|
 | `docs upload <file>` | Upload a file and get a short URL |
 | `docs upload --folder <folder>` | Zip and upload a folder |
+| `docs upload --overwrite <file-or-folder>` | Replace the upload uniquely recorded for this source path |
+| `docs update <id-or-url> [file-or-folder]` | Replace a specific upload and keep its URL |
+| `docs --skill` | Print the agent usage guide |
 | `docs list` | Show the last 10 uploads |
 | `docs list --days <n>` | Show uploads from the last `n` days |
 | `docs delete <id>` | Delete a remote upload and reconcile matching local history |
