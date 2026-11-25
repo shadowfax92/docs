@@ -34,7 +34,8 @@ var updateCmd = &cobra.Command{
 	Long: `Update an existing upload without changing its short URL.
 
 Accepts an upload ID or a full URL from the configured Worker. Omit the source
-to reuse its path from local history. Use --folder to publish a folder as a zip.
+to reuse the absolute path recorded in local history. Use --folder to publish a
+folder as a zip.
 The existing title is preserved unless --name is supplied. Concurrent changes
 cause an error; missing uploads never create a new link. Prints the same URL
 without changing the clipboard. Reload an open browser tab to see new content.`,
@@ -149,10 +150,12 @@ func rememberedSource(cfg *config.Config, id string) (history.Entry, error) {
 		return history.Entry{}, fmt.Errorf("cannot read local source history: %w; pass a source path explicitly", err)
 	}
 	url := strings.TrimRight(cfg.URL, "/") + "/" + id
+	// Older CLIs recorded paths as typed. A relative path names a different file from any other
+	// directory, so only an absolute recorded path identifies the source that was published.
 	for _, entry := range entries {
-		if entry.URL == url && entry.Path != "" {
+		if entry.URL == url && filepath.IsAbs(entry.Path) {
 			return entry, nil
 		}
 	}
-	return history.Entry{}, fmt.Errorf("no local source recorded for %s; pass a file: docs update %s <file>", id, id)
+	return history.Entry{}, fmt.Errorf("no absolute source path recorded for %s; pass a file: docs update %s <file>", id, id)
 }

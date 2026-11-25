@@ -125,3 +125,38 @@ func TestRunUpdateFailureLeavesHistoryAndDoesNotPrintSuccess(t *testing.T) {
 	}
 	assertDeleteHistoryIDs(t, store, []string{"Ab12Cd34"})
 }
+
+// Older CLIs stored paths as typed. Updating from another directory must not publish whatever
+// file happens to share that relative name; the caller has to name the source explicitly.
+func TestRunUpdateRefusesRelativeRememberedSource(t *testing.T) {
+	elsewhere := t.TempDir()
+	writeUploadTestFile(t, filepath.Join(elsewhere, "index.html"), "unrelated file in the current directory")
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("update sent %s %s for an unverifiable source", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	home := writeUploadConfigWithHome(t, server.URL, "fixture")
+	appendDeleteHistory(t, home, history.Entry{URL: server.URL + "/Ab12Cd34", ID: "Ab12Cd34", Path: "index.html"})
+	before, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
+	var out bytes.Buffer
+	command := &cobra.Command{}
+	command.SetOut(&out)
+	command.SetErr(io.Discard)
+	err = runUpdate(command, []string{"Ab12Cd34"})
+	if err == nil || !strings.Contains(err.Error(), "docs update Ab12Cd34 <file>") || out.Len() != 0 {
+		t.Fatalf("runUpdate = %v, output %q; want refusal asking for an explicit source", err, out.String())
+	}
+	after, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
+	if !bytes.Equal(before, after) {
+		t.Fatal("refused update changed history")
+	}
+}

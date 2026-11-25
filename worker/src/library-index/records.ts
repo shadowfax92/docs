@@ -272,8 +272,8 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
         await upkeep(summary);
         return summary;
       },
-      async update(id, expectedVersion, input) {
-        const result = await deps.documents.update(id, expectedVersion, input);
+      async update(id, input) {
+        const result = await deps.documents.update(id, input);
         if (result.status === "updated") await upkeep(result.document);
         return result;
       },

@@ -474,14 +474,13 @@ describe("Documents stable-URL updates", () => {
     await seed(bucket, `${firstId}/report.html`, "old", { customMetadata: { filename: "report.html", docName: "Original title", contentType: "text/html" } });
     const documents = createDocuments(bucket.binding(), origin);
     const before = (await documents.resolve(firstId))!.summary;
-    const result = await documents.update(firstId, before.version, input());
+    const result = await documents.update(firstId, input());
     expect(result).toMatchObject({ status: "updated", document: { publicUrl: before.publicUrl, id: firstId, filename: "revised.md", title: "Original title", objectCount: 1 } });
     const current = (await documents.resolve(firstId))!;
     expect(await (await current.openBody())!.text()).toBe("replacement");
     expect((await discover(bucket))).toEqual([current.summary]);
-    expect(await documents.update(firstId, before.version, input("stale"))).toEqual({ status: "changed" });
     expect((await documents.remove(firstId, before.version)).status).toBe("changed");
-    const next = await documents.update(firstId, current.summary.version, { ...input("second"), title: "Revised title" });
+    const next = await documents.update(firstId, { ...input("second"), title: "Revised title" });
     expect(next).toMatchObject({ status: "updated", document: { title: "Revised title", publicUrl: before.publicUrl } });
     expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toHaveLength(1);
   });
@@ -496,22 +495,21 @@ describe("Documents stable-URL updates", () => {
       expect(await (await current.openBody())!.text()).toBe("original");
       if (key.startsWith("__docs_internal/revisions/")) throw new Error("staging failed");
     };
-    await expect(documents.update(firstId, before.version, input())).rejects.toThrow("staging failed");
+    await expect(documents.update(firstId, input())).rejects.toThrow("staging failed");
     expect((await documents.resolve(firstId))!.summary).toEqual(before);
   });
 
-  it("allows only one concurrent update to publish the same expected version", async () => {
+  it("allows only one of two concurrent updates to publish over the marker both read", async () => {
     const bucket = new LocalBucket();
     await seed(bucket, `${firstId}/report.txt`, "original");
     const documents = createDocuments(bucket.binding(), origin);
-    const before = (await documents.resolve(firstId))!.summary;
     let arrivals = 0;
     let release!: () => void;
     const both = new Promise<void>((resolve) => { release = resolve; });
     bucket.beforePut = async (key) => {
       if (key === `${firstId}/`) { if (++arrivals === 2) release(); await both; }
     };
-    const outcomes = await Promise.all([documents.update(firstId, before.version, input("one")), documents.update(firstId, before.version, input("two"))]);
+    const outcomes = await Promise.all([documents.update(firstId, input("one")), documents.update(firstId, input("two"))]);
     expect(outcomes.map((result) => result.status).sort()).toEqual(["changed", "updated"]);
     expect(["one", "two"]).toContain(await (await (await documents.resolve(firstId))!.openBody())!.text());
     expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toHaveLength(1);
@@ -526,14 +524,14 @@ describe("Documents stable-URL updates", () => {
     const paused = new Promise<void>((resolve) => { arrived = resolve; });
     const release = new Promise<void>((resolve) => { resume = resolve; });
     bucket.beforePut = async (key) => { if (key === `${firstId}/`) { bucket.beforePut = undefined; arrived(); await release; } };
-    const update = documents.update(firstId, before.version, input());
+    const update = documents.update(firstId, input());
     await paused;
     expect((await documents.remove(firstId, before.version)).status).toBe("deleted");
     resume();
     expect(await update).toEqual({ status: "changed" });
     expect(await documents.resolve(firstId)).toBeNull();
     expect(await discover(bucket)).toEqual([]);
-    expect(await documents.update(firstId, before.version, input())).toEqual({ status: "not-found" });
+    expect(await documents.update(firstId, input())).toEqual({ status: "not-found" });
     expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toEqual([]);
   });
 
@@ -541,8 +539,7 @@ describe("Documents stable-URL updates", () => {
     const bucket = new LocalBucket();
     await seed(bucket, `${firstId}/report.txt`, "original");
     const documents = createDocuments(bucket.binding(), origin);
-    const initial = (await documents.resolve(firstId))!.summary;
-    await documents.update(firstId, initial.version, input("first revision"));
+    await documents.update(firstId, input("first revision"));
     const before = (await documents.resolve(firstId))!.summary;
     let arrived!: () => void, resume!: () => void;
     const paused = new Promise<void>((resolve) => { arrived = resolve; });
@@ -550,7 +547,7 @@ describe("Documents stable-URL updates", () => {
     bucket.beforePut = async (key) => { if (key === `${firstId}/`) { bucket.beforePut = undefined; arrived(); await release; } };
     const deletion = documents.remove(firstId, before.version);
     await paused;
-    expect((await documents.update(firstId, before.version, input("latest revision"))).status).toBe("updated");
+    expect((await documents.update(firstId, input("latest revision"))).status).toBe("updated");
     resume();
     expect((await deletion).status).toBe("changed");
     const current = (await documents.resolve(firstId))!;
@@ -563,7 +560,7 @@ describe("Documents stable-URL updates", () => {
   it("never creates an ID when the requested upload is absent", async () => {
     const bucket = new LocalBucket();
     const documents = createDocuments(bucket.binding(), origin);
-    expect(await documents.update(firstId, "a".repeat(64), input())).toEqual({ status: "not-found" });
+    expect(await documents.update(firstId, input())).toEqual({ status: "not-found" });
     expect(bucket.entries.size).toBe(0);
   });
 
@@ -573,8 +570,7 @@ describe("Documents stable-URL updates", () => {
     for (let index = 0; index < 45; index++) {
       const id = `Upd${String(index).padStart(5, "0")}`;
       await seed(bucket, `${id}/source.txt`, "original");
-      const current = (await documents.resolve(id))!.summary;
-      expect((await documents.update(id, current.version, input())).status).toBe("updated");
+      expect((await documents.update(id, input())).status).toBe("updated");
     }
     const resources = createInvocationResources(() => { throw new Error("Discovery must not use D1"); }, bucket.binding());
     const page = await createDocuments(resources.bucket, origin).page();
@@ -587,14 +583,13 @@ describe("Documents stable-URL updates", () => {
     const bucket = new LocalBucket();
     await seed(bucket, `${firstId}/source.txt`, "original");
     const documents = createDocuments(bucket.binding(), origin);
-    const current = (await documents.resolve(firstId))!.summary;
     const put = bucket.put.bind(bucket);
     vi.spyOn(bucket, "put").mockImplementation(async (...args) => {
       const result = await put(...args);
       if (args[0] === `${firstId}/`) throw new Error("publish response lost");
       return result;
     });
-    await expect(documents.update(firstId, current.version, input())).rejects.toThrow("publish response lost");
+    await expect(documents.update(firstId, input())).rejects.toThrow("publish response lost");
     const published = (await documents.resolve(firstId))!;
     expect(await (await published.openBody())!.text()).toBe("replacement");
   });

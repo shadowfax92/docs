@@ -78,7 +78,7 @@ async function nativeHttp(migrate = true) {
 }
 
 describe("compiled native HTTP roles", () => {
-  it("updates the same URL with auth/version guards, fresh raw validators, search upkeep and reviewed deletion", async () => {
+  it("updates the same URL in one authenticated PUT with fresh raw validators, search upkeep and reviewed deletion", async () => {
     const fixture = await nativeHttp();
     try {
       const uploaded = await fixture.upload("<h1>Original body OriginalSentinel</h1>");
@@ -87,21 +87,16 @@ describe("compiled native HTTP roles", () => {
       const oldRaw = await fixture.fetchPublic(new Request(uploaded.url + "/raw"));
       const oldETag = oldRaw.headers.get("ETag")!;
       await oldRaw.text();
-      for (const method of ["GET", "PUT"]) {
-        expect((await fixture.fetchPublic(new Request(endpoint, { method }))).status).toBe(401);
-      }
-      expect((await fixture.fetchPublic(new Request(endpoint, { method: "PUT", headers: auth }))).status).toBe(428);
-      const metadata = await fixture.fetchPublic(new Request(endpoint, { headers: auth }));
-      expect(metadata.status).toBe(200);
-      expect(metadata.headers.get("Cache-Control")).toBe("no-store");
-      const previous = await metadata.json() as { version: string };
-      const headers = { ...auth, "If-Match": metadata.headers.get("ETag")!, "X-Filename": "revision.md", "Content-Type": "text/markdown" };
+      expect((await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: "anonymous" }))).status).toBe(401);
+      expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe("<h1>Original body OriginalSentinel</h1>");
+      const headers = { ...auth, "X-Filename": "revision.md", "Content-Type": "text/markdown" };
       const replacement = "# Revised\n\nRevisionSentinel";
       const updated = await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: replacement, headers }));
       expect(updated.status).toBe(200);
+      expect(updated.headers.get("Cache-Control")).toBe("no-store");
       const current = await updated.json() as { id: string; url: string; version: string; name: string };
       expect(current).toMatchObject({ ...uploaded, name: "Needle title" });
-      expect(current.version).not.toBe(previous.version);
+      expect(current.version).toMatch(/^[a-f0-9]{64}$/);
       const revalidated = await fixture.fetchPublic(new Request(uploaded.url + "/raw", { headers: { "If-None-Match": oldETag } }));
       expect(revalidated.status).toBe(200);
       expect(revalidated.headers.get("Cache-Control")).toBe("public, max-age=0, must-revalidate");
@@ -109,26 +104,29 @@ describe("compiled native HTTP roles", () => {
       expect(await revalidated.text()).toBe(replacement);
       const preview = await fixture.fetchPublic(new Request(uploaded.url));
       expect(await preview.text()).toContain("<h1>Revised</h1>");
-      expect((await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: "stale overwrite", headers }))).status).toBe(412);
       const credentials = await fixture.login();
       await vi.waitFor(async () => {
         const response = await fixture.catalog.fetch(request("/all-docs/api/search", { version: 1, query: { ...query, text: "RevisionSentinel" }, filter }, credentials));
         const search = await response.json() as LibrarySearchResponse;
         expect(search.hits).toContainEqual(expect.objectContaining({ id: uploaded.id, version: current.version }));
       }, { timeout: 10000, interval: 25 });
-      const staleDelete = await fixture.catalog.fetch(request("/all-docs/api/delete", { version: 1, items: [{ id: uploaded.id, version: previous.version }], confirmCount: 1, confirmation: "DELETE 1 documents" }, credentials));
-      expect(await staleDelete.json()).toEqual({ version: 1, outcomes: [{ id: uploaded.id, status: "changed" }] });
-      expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe(replacement);
       const empty = await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: "", headers: {
-        ...auth, "If-Match": `"${current.version}"`, "X-Filename": "empty.txt", "Content-Type": "text/plain", "X-Doc-Name": "Renamed title",
+        ...auth, "X-Filename": "empty.txt", "Content-Type": "text/plain", "X-Doc-Name": "Renamed title",
       } }));
       expect(empty.status).toBe(200);
-      expect(await empty.json()).toMatchObject({ ...uploaded, name: "Renamed title" });
+      const latest = await empty.json() as { version: string };
+      expect(latest).toMatchObject({ ...uploaded, name: "Renamed title" });
+      expect(latest.version).not.toBe(current.version);
+      expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe("");
+      const staleDelete = await fixture.catalog.fetch(request("/all-docs/api/delete", { version: 1, items: [{ id: uploaded.id, version: current.version }], confirmCount: 1, confirmation: "DELETE 1 documents" }, credentials));
+      expect(await staleDelete.json()).toEqual({ version: 1, outcomes: [{ id: uploaded.id, status: "changed" }] });
       expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe("");
       const deletion = await fixture.fetchPublic(new Request(endpoint, { method: "DELETE", headers: auth }));
       expect(deletion.status).toBe(204);
       expect((await fixture.fetchPublic(new Request(uploaded.url, { headers: { "If-None-Match": oldETag } }))).status).toBe(404);
-      expect((await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: "revive", headers }))).status).toBe(404);
+      const revived = await fixture.fetchPublic(new Request(endpoint, { method: "PUT", body: "revive", headers }));
+      expect(revived.status).toBe(404);
+      expect(revived.headers.get("X-Docs-Update-Result")).toBe("not-found");
     } finally { await fixture.dispose(); }
   }, 30_000);
 
@@ -146,9 +144,8 @@ describe("compiled native HTTP roles", () => {
       expect(await page.text()).not.toMatch(/SELECT|no such table|D1_ERROR|__docs_internal/);
       const uploaded = await fixture.upload("upload survives derived-index failure", "note.txt");
       expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe("upload survives derived-index failure");
-      const current = await fixture.fetchPublic(new Request(publicOrigin + `/upload/${uploaded.id}`, { headers: { Authorization: "Bearer fixture-bearer" } }));
       const updated = await fixture.fetchPublic(new Request(publicOrigin + `/upload/${uploaded.id}`, { method: "PUT", body: "update survives derived-index failure",
-        headers: { Authorization: "Bearer fixture-bearer", "If-Match": current.headers.get("ETag")!, "X-Filename": "revised.txt", "Content-Type": "text/plain" } }));
+        headers: { Authorization: "Bearer fixture-bearer", "X-Filename": "revised.txt", "Content-Type": "text/plain" } }));
       expect(updated.status).toBe(200);
       expect(await (await fixture.fetchPublic(new Request(uploaded.url + "/raw"))).text()).toBe("update survives derived-index failure");
       const deletion = await fixture.fetchPublic(new Request(publicOrigin + "/upload/Legacy01", { method: "DELETE", headers: { Authorization: "Bearer fixture-bearer" } }));

@@ -79,17 +79,17 @@ func detectContentType(filename string, f *os.File) (string, error) {
 
 // UploadContent sends an already-prepared document body through the upload API.
 func UploadContent(cfg *config.Config, filename string, contentType string, content io.Reader, docName string) (*Response, error) {
-	return writeContent(cfg, "/upload", filename, contentType, content, docName, "")
+	return writeContent(cfg, "", filename, contentType, content, docName)
 }
 
-// writeContent shares the fixed-length streaming contract between new uploads and replacements.
-// Replacements carry the server's exact version; the caller must never retry them as new uploads.
-func writeContent(cfg *config.Config, endpoint, filename, contentType string, content io.Reader, docName, version string) (*Response, error) {
-	action := "upload"
-	if version != "" {
-		action = "update"
+// writeContent shares the fixed-length streaming contract between new uploads (empty id) and
+// in-place replacements of an existing id. Replacements must never be retried as new uploads.
+func writeContent(cfg *config.Config, id, filename, contentType string, content io.Reader, docName string) (*Response, error) {
+	base := strings.TrimRight(cfg.URL, "/")
+	endpoint := base + "/upload"
+	if id != "" {
+		endpoint += "/" + id
 	}
-	endpoint = strings.TrimRight(cfg.URL, "/") + endpoint
 	req, err := http.NewRequest(http.MethodPut, endpoint, content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -121,33 +121,36 @@ func writeContent(cfg *config.Config, endpoint, filename, contentType string, co
 	if docName != "" {
 		req.Header.Set("X-Doc-Name", docName)
 	}
-	if version != "" {
-		req.Header.Set("If-Match", `"`+version+`"`)
-	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		if version != "" {
-			return nil, fmt.Errorf("update response unavailable; check the existing URL before retrying: %w", err)
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, err)
 		}
-		return nil, fmt.Errorf("%s failed: %w", action, err)
+		return nil, fmt.Errorf("upload failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s response: %w", action, err)
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, err)
+		}
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		if version != "" {
-			return nil, updateError(resp.StatusCode, resp.Header.Get("X-Docs-Update-Result"), string(body))
+		if id != "" {
+			return nil, updateError(base+"/"+id, resp.StatusCode, resp.Header.Get("X-Docs-Update-Result"), string(body))
 		}
 		return nil, fmt.Errorf("upload failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var result Response
 	if err := json.Unmarshal(body, &result); err != nil {
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, fmt.Errorf("invalid response: %w", err))
+		}
 		return nil, fmt.Errorf("invalid response: %w", err)
 	}
 	return &result, nil

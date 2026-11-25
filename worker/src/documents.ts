@@ -41,7 +41,7 @@ export type UpdateResult = { status: "updated"; document: DocumentSummary }
  */
 export interface Documents {
   create(input: DocumentInput): Promise<DocumentSummary>;
-  update(id: UploadId, expectedVersion: string, input: Omit<DocumentInput, "title"> & { title?: string }): Promise<UpdateResult>;
+  update(id: UploadId, input: Omit<DocumentInput, "title"> & { title?: string }): Promise<UpdateResult>;
   page(cursor?: string): Promise<CatalogPage>;
   resolve(id: UploadId): Promise<ResolvedDocument | null>;
   remove(id: UploadId, expectedVersion?: string): Promise<RemoveResult>;
@@ -200,15 +200,14 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       if (!object) throw new Error("Upload did not create an object");
       return summarize(id, [object], publicOrigin, { filename, contentType: mime, docName: input.title });
     },
-    async update(id, expectedVersion, input) {
+    async update(id, input) {
       if (!isUploadId(id)) return { status: "not-found" };
       const owned = await ownedObjects(id, true);
       const current = publication(id, owned);
       if (current.kind === "deleted" || current.kind === "legacy" && !owned.some((object) => object.key !== `${id}/`)) return { status: "not-found" };
-      const before = await summarize(id, current.objects, publicOrigin);
-      if (before.version !== expectedVersion) return { status: "changed" };
+      const { title } = await summarize(id, current.objects, publicOrigin);
       const filename = input.filename.replace(/[^\w.\-]/g, "_") || "file";
-      const metadata = { filename, contentType: input.mime || contentType(filename), docName: input.title ?? before.title };
+      const metadata = { filename, contentType: input.mime || contentType(filename), docName: input.title ?? title };
       const revision = crypto.randomUUID();
       const key = revisionKey(id, revision);
       const object = await bucket.put(key, input.body, { ...absentOnly(), customMetadata: metadata });

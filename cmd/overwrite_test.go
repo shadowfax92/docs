@@ -16,6 +16,7 @@ import (
 	"github.com/shadowfax/docs/internal/history"
 	"github.com/shadowfax/docs/internal/upload"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 func TestUploadOverwriteKeepsOriginalLink(t *testing.T) {
@@ -43,11 +44,10 @@ func TestUploadOverwriteKeepsOriginalLink(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == "/upload":
 			created++
 			id = fmt.Sprintf("Doc%05d", created)
-		case r.Method == http.MethodGet && id == "Doc00001":
 		case r.Method == http.MethodPut && id == "Doc00001":
-			if r.Header.Get("If-Match") != `"`+version+`"` || r.Header.Get("X-Doc-Name") != "" {
-				t.Error("overwrite must use the current version and preserve the title by default")
-				w.WriteHeader(http.StatusPreconditionFailed)
+			if r.Header.Get("X-Doc-Name") != "" {
+				t.Error("overwrite must preserve the title by default")
+				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 		default:
@@ -116,7 +116,7 @@ func TestUploadOverwriteRequiresOneRecordedTarget(t *testing.T) {
 			source := filepath.Join(t.TempDir(), "report.html")
 			writeUploadTestFile(t, source, "revised")
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if len(tc.ids) != 1 || r.Method != http.MethodGet || r.URL.Path != "/upload/Doc00001" {
+				if len(tc.ids) != 1 || r.Method != http.MethodPut || r.URL.Path != "/upload/Doc00001" {
 					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 				}
 				w.Header().Set("X-Docs-Update-Result", "not-found")
@@ -142,8 +142,7 @@ func TestSkillAndHelpWithoutConfig(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{args: []string{"--skill"}, want: []string{"docs upload ./report.html", "docs upload --overwrite", "docs update <id-or-url>", "revised content"}},
-		{args: []string{"--help"}, want: []string{"--skill", "print the agent usage guide"}},
+		{args: []string{"--help"}, want: []string{"--skill", "SKILL.md"}},
 		{args: []string{"upload", "--help"}, want: []string{"--overwrite", "docs update <id-or-url>"}},
 	} {
 		out, err := executeDocsCLI(t, tc.args...)
@@ -156,9 +155,44 @@ func TestSkillAndHelpWithoutConfig(t *testing.T) {
 			}
 		}
 	}
+	// docs --skill output is the SKILL.md contract: YAML frontmatter delimited by --- lines,
+	// with the name and model-facing description an agent harness loads.
+	out, err := executeDocsCLI(t, "--skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.SplitN(out, "---\n", 3)
+	if len(parts) != 3 || parts[0] != "" {
+		t.Fatalf("--skill output is not a SKILL.md with frontmatter: %q", out)
+	}
+	var meta struct {
+		Name        string `yaml:"name"`
+		Description string `yaml:"description"`
+	}
+	if err := yaml.Unmarshal([]byte(parts[1]), &meta); err != nil {
+		t.Fatalf("invalid SKILL.md frontmatter: %v", err)
+	}
+	if meta.Name != "docs" || meta.Description == "" || len(meta.Description) > 1024 {
+		t.Fatalf("SKILL.md frontmatter = %+v", meta)
+	}
+	for _, command := range []string{"docs upload ./report.html", "docs upload --overwrite", "docs update <id-or-url>"} {
+		if !strings.Contains(parts[2], command) {
+			t.Errorf("SKILL.md body missing %q", command)
+		}
+	}
 	entries, err := os.ReadDir(home)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("guide or help changed the local home: %v, %v", entries, err)
+	}
+}
+
+func TestUnknownCommandsAreRejectedWithSuggestions(t *testing.T) {
+	_, err := executeDocsCLI(t, "uplod", "report.html")
+	if err == nil || !strings.Contains(err.Error(), `unknown command "uplod"`) || !strings.Contains(err.Error(), "Did you mean this?\n\tupload") {
+		t.Fatalf("typo error = %v; want unknown command with an upload suggestion", err)
+	}
+	if _, err := executeDocsCLI(t, "--skill", "extra"); err == nil || !strings.Contains(err.Error(), `unknown command "extra"`) {
+		t.Fatalf("root accepted a stray argument: %v", err)
 	}
 }
 

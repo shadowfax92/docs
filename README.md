@@ -193,23 +193,25 @@ with the new source path and upload time. Other URLs are preserved, including
 identical IDs on other Workers. `docs update <id-or-url>` reuses that entry's source
 path; a missing path/history entry tells you to provide a file explicitly. Explicit
 directories require `--folder`; remembered folders are archived automatically.
-Older relative history paths are resolved from your current directory; pass a
-source path once to save an absolute path for future updates. Older folder entries
-need `--folder` once to record their source kind.
+Relative paths recorded by older versions are never reused, because they would
+resolve against whatever directory you run from; pass the source path once to
+record its absolute path for future updates. Older folder entries need `--folder`
+once to record their source kind.
 
 Only links from the configured Worker are accepted. A missing upload, unsupported
 Worker, failed request, or concurrent edit never falls back to creating a new
-link. The CLI reads the current version before streaming and sends it as
-`If-Match`; concurrent updates/deletes refuse a stale write. Review the current
-document before retrying a version conflict. A network failure can leave the
-publication outcome uncertain; check the existing URL before retrying.
+link. When updates or a deletion race on one link, the Worker publishes at most
+one of them and refuses the rest as a conflict; review the current document before
+retrying. A network failure, unreadable response, or server error (5xx) leaves the
+outcome unknown: the revision may already be live, so check the existing URL
+before retrying. The CLI never retries an update automatically.
 
-The authenticated API is `GET /upload/:id` → JSON metadata with a quoted version
-`ETag`, followed by `PUT /upload/:id` with that `If-Match`, the same upload body,
-`X-Filename`, `Content-Type`, and an optional `X-Doc-Name`. Missing uploads return
-404, stale versions 412, and missing/invalid preconditions 428. Metadata is
-`no-store`. Public responses revalidate against the current revision before
-returning 304; updates do not require a new URL or cache-busting query string.
+The authenticated API is a single `PUT /upload/:id` with the same upload body,
+`X-Filename`, `Content-Type`, and an optional `X-Doc-Name`. It returns `no-store`
+JSON `{url,id,name,version}`. Missing uploads return 404 and a lost concurrent
+publication returns 409, both marked with `X-Docs-Update-Result`. Public responses
+revalidate against the current revision before returning 304; updates do not
+require a new URL or cache-busting query string.
 
 R2 revision bytes are immutable and staged privately. A conditional write to the
 permanent `ID/` marker publishes the revision or tombstones a deletion. Deletion
@@ -492,7 +494,7 @@ docs delete xK9mRt2p   ──▶  DELETE /upload/xK9mRt2p  ──▶  Worker res
 | `docs upload --folder <folder>` | Zip and upload a folder |
 | `docs upload --overwrite <file-or-folder>` | Replace the upload uniquely recorded for this source path |
 | `docs update <id-or-url> [file-or-folder]` | Replace a specific upload and keep its URL |
-| `docs --skill` | Print the agent usage guide |
+| `docs --skill` | Print a `SKILL.md` that teaches agents to publish and revise links (save it as `<skills-dir>/docs/SKILL.md`) |
 | `docs list` | Show the last 10 uploads |
 | `docs list --days <n>` | Show uploads from the last `n` days |
 | `docs delete <id>` | Delete a remote upload and reconcile matching local history |

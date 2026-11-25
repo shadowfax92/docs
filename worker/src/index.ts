@@ -68,8 +68,7 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
   const upload = request.method === "PUT" && path === "upload";
   const deletion = request.method === "DELETE" && path.startsWith("upload/");
   const updating = request.method === "PUT" && path.startsWith("upload/");
-  const metadata = request.method === "GET" && path.startsWith("upload/");
-  if (upload || deletion || updating || metadata) {
+  if (upload || deletion || updating) {
     const id = path.slice("upload/".length);
     if (!upload && !isUploadId(id)) return new Response("Not found", { status: 404 });
     if (!(await isAuthorized(request, env.AUTH_TOKEN))) return new Response("Unauthorized", { status: 401 });
@@ -81,23 +80,16 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
         });
         return Response.json({ url: doc.publicUrl, id: doc.id });
       }
-      if (metadata) {
-        const current = await documents.resolve(id);
-        return current ? documentResponse(current.summary)
-          : new Response("Upload not found", { status: 404, headers: { "X-Docs-Update-Result": "not-found", "Cache-Control": "no-store" } });
-      }
       if (updating) {
-        // Freeze the version before accepting replacement bytes. Wildcards and weak ETags
-        // would silently allow an agent to overwrite another publisher's intervening edits.
-        const expectedVersion = /^"([a-f0-9]{64})"$/.exec(request.headers.get("If-Match") ?? "")?.[1];
-        if (!expectedVersion) return new Response("Read GET /upload/:id and send its ETag in If-Match", { status: 428 });
-        const result = await writes().update(id, expectedVersion, {
+        // documents.update publishes with a conditional write on the marker it read, so a racing
+        // update or deletion loses with 409 instead of being silently overwritten.
+        const result = await writes().update(id, {
           body: request.body, filename: request.headers.get("X-Filename") || "file",
           mime: request.headers.get("Content-Type") || "", title: request.headers.get("X-Doc-Name") ?? undefined,
         });
         if (result.status === "updated") return documentResponse(result.document);
         return new Response(result.status === "not-found" ? "Upload not found" : "Upload changed; retry after reviewing the current version", {
-          status: result.status === "not-found" ? 404 : 412,
+          status: result.status === "not-found" ? 404 : 409,
           headers: { "X-Docs-Update-Result": result.status, "Cache-Control": "no-store" },
         });
       }
@@ -132,7 +124,7 @@ async function publicFetch(request: Request, env: PublicEnv, documents: Document
 
 function documentResponse(document: DocumentSummary): Response {
   return Response.json({ url: document.publicUrl, id: document.id, name: document.title, version: document.version }, {
-    headers: { ETag: `"${document.version}"`, "Cache-Control": "no-store", "X-Docs-Update-Result": "ok" },
+    headers: { "Cache-Control": "no-store", "X-Docs-Update-Result": "ok" },
   });
 }
 
