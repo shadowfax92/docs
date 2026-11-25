@@ -13,6 +13,10 @@ import (
 	"github.com/shadowfax/docs/internal/config"
 )
 
+// ErrNotFound marks the Worker's authoritative answer that an upload no longer exists. Unmarked
+// 404s, auth failures and transport errors never wrap it, so callers may reconcile history on it.
+var ErrNotFound = errors.New("upload not found")
+
 var uploadID = regexp.MustCompile(`^[A-Za-z0-9]{8}$`)
 var uploadVersion = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -73,7 +77,7 @@ func uncertainUpdate(link string, cause error) error {
 func updateError(link string, status int, marker, body string) error {
 	switch {
 	case status == http.StatusNotFound && marker == "not-found":
-		return fmt.Errorf("upload not found; check its ID or URL (use 'docs upload <file>' to create a new link)")
+		return fmt.Errorf("%w; check its ID or URL (use 'docs upload <file>' to create a new link)", ErrNotFound)
 	case status == http.StatusNotFound:
 		return fmt.Errorf("Worker does not support updates yet; deploy the latest docs Worker, then retry")
 	case status == http.StatusConflict:

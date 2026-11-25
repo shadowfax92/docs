@@ -102,6 +102,77 @@ func TestUploadOverwriteKeepsOriginalLink(t *testing.T) {
 	}
 }
 
+// Regression: a link deleted elsewhere (catalog or another machine) used to stay in local history.
+// Following the not-found hint then recorded a second link for the path, and every later
+// --overwrite failed as ambiguous. Marked absence now forgets exactly that Worker URL.
+func TestUploadOverwriteForgetsRemotelyDeletedLink(t *testing.T) {
+	stubUploadClipboard(t)
+	source := filepath.Join(t.TempDir(), "report.html")
+	writeUploadTestFile(t, source, "original")
+	var mu sync.Mutex
+	created := 0
+	deleted := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		id := strings.TrimPrefix(r.URL.Path, "/upload/")
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/upload":
+			created++
+			id = fmt.Sprintf("Doc%05d", created)
+		case r.Method == http.MethodPut && deleted[id]:
+			w.Header().Set("X-Docs-Update-Result", "not-found")
+			http.NotFound(w, r)
+			return
+		case r.Method != http.MethodPut || id != "Doc00002":
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = json.NewEncoder(w).Encode(upload.Response{
+			ID: id, URL: "http://" + r.Host + "/" + id, Name: "Report", Version: strings.Repeat("b", 64),
+		})
+	}))
+	defer server.Close()
+	home := writeUploadConfigWithHome(t, server.URL, "fixture")
+	otherWorker := history.Entry{URL: "https://other.example/Doc00001", ID: "Doc00001", Path: source}
+	unrelated := history.Entry{URL: server.URL + "/Unrel001", ID: "Unrel001", Path: "/elsewhere/notes.md"}
+	store := appendDeleteHistory(t, home, otherWorker, unrelated)
+
+	first, err := executeDocsCLI(t, "upload", source)
+	if err != nil || first != server.URL+"/Doc00001\n" {
+		t.Fatalf("fresh upload = %q, %v", first, err)
+	}
+	mu.Lock()
+	deleted["Doc00001"] = true
+	mu.Unlock()
+	out, err := executeDocsCLI(t, "upload", "--overwrite", source)
+	if err == nil || !strings.Contains(err.Error(), "upload not found") || out != "" {
+		t.Fatalf("overwrite of deleted link = %q, %v; want not-found and no URL", out, err)
+	}
+	second, err := executeDocsCLI(t, "upload", source)
+	if err != nil || second != server.URL+"/Doc00002\n" {
+		t.Fatalf("fresh upload after deletion = %q, %v", second, err)
+	}
+	writeUploadTestFile(t, source, "revised")
+	result, err := executeDocsCLI(t, "upload", "--overwrite", source)
+	if err != nil || result != second {
+		t.Fatalf("overwrite after re-upload = %q, %v; want %q", result, err, second)
+	}
+	entries, err := store.List(history.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	urls := map[string]bool{}
+	for _, entry := range entries {
+		urls[entry.URL] = true
+	}
+	if len(entries) != 3 || !urls[otherWorker.URL] || !urls[unrelated.URL] || !urls[strings.TrimSpace(second)] {
+		t.Fatalf("history = %+v; want only the other Worker, unrelated and current entries", entries)
+	}
+}
+
 func TestUploadOverwriteRequiresOneRecordedTarget(t *testing.T) {
 	for _, tc := range []struct {
 		name string

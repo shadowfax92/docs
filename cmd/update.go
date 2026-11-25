@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,8 +38,9 @@ Accepts an upload ID or a full URL from the configured Worker. Omit the source
 to reuse the absolute path recorded in local history. Use --folder to publish a
 folder as a zip.
 The existing title is preserved unless --name is supplied. Concurrent changes
-cause an error; missing uploads never create a new link. Prints the same URL
-without changing the clipboard. Reload an open browser tab to see new content.`,
+cause an error; missing uploads never create a new link, and their local history
+entries are removed. Prints the same URL without changing the clipboard. Reload
+an open browser tab to see new content.`,
 	Example: `  docs update vPNW0l6j ./report.html
   docs update https://docs.shadowfax92.workers.dev/vPNW0l6j ./report.html
   docs update vPNW0l6j
@@ -113,6 +115,20 @@ func updatePath(cmd *cobra.Command, cfg *config.Config, id, filePath string, opt
 		response, err = withFolderArchive(filePath, publish)
 	} else {
 		response, err = publish(filePath)
+	}
+	if errors.Is(err, upload.ErrNotFound) {
+		// Same authority as docs delete: a marked absence is definitive, so forget this exact URL.
+		// Otherwise a fresh upload of the same source would leave --overwrite ambiguous forever.
+		store, storeErr := history.NewDefaultStore()
+		removed := 0
+		if storeErr == nil {
+			removed, storeErr = store.RemoveByURL(strings.TrimRight(cfg.URL, "/") + "/" + id)
+		}
+		if storeErr != nil {
+			return deleteHistoryError(id, false, storeErr)
+		}
+		fmt.Fprintln(cmd.ErrOrStderr(), missingMessage(id, removed))
+		return err
 	}
 	if err != nil {
 		return err

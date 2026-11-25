@@ -198,6 +198,12 @@ resolve against whatever directory you run from; pass the source path once to
 record its absolute path for future updates. Older folder entries need `--folder`
 once to record their source kind.
 
+If the Worker reports the link no longer exists (for example, it was deleted from
+the catalog or another machine), the update fails and, as with `docs delete`,
+removes local history entries for that exact URL. A fresh `docs upload` of the
+same source then becomes its only `--overwrite` target. Other errors leave local
+history unchanged.
+
 Only links from the configured Worker are accepted. A missing upload, unsupported
 Worker, failed request, or concurrent edit never falls back to creating a new
 link. When updates or a deletion race on one link, the Worker publishes at most

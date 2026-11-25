@@ -91,7 +91,19 @@ func (s *Store) RemoveByID(id string) (int, error) {
 	if id == "" {
 		return 0, nil
 	}
+	return s.removeWhere(func(entry Entry) bool { return entry.ID == id })
+}
 
+// RemoveByURL forgets one public URL after its Worker reports it missing. Matching the full URL
+// also clears legacy entries without IDs and keeps equal short IDs on other Workers.
+func (s *Store) RemoveByURL(url string) (int, error) {
+	if url == "" {
+		return 0, nil
+	}
+	return s.removeWhere(func(entry Entry) bool { return entry.URL == url })
+}
+
+func (s *Store) removeWhere(match func(Entry) bool) (int, error) {
 	removed := 0
 	err := s.withExclusiveLock(func() error {
 		entries, err := s.read()
@@ -100,7 +112,7 @@ func (s *Store) RemoveByID(id string) (int, error) {
 		}
 		kept := make([]Entry, 0, len(entries))
 		for _, entry := range entries {
-			if entry.ID == id {
+			if match(entry) {
 				removed++
 				continue
 			}

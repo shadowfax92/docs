@@ -104,26 +104,48 @@ func TestRunUpdatePublishesFolderAndReturnsJSON(t *testing.T) {
 	}
 }
 
+// Only the Worker's marked not-found proves absence. Every other failure leaves local history
+// untouched, because the link may still exist (or the update may even have been published).
 func TestRunUpdateFailureLeavesHistoryAndDoesNotPrintSuccess(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "source.html")
-	writeUploadTestFile(t, file, "content")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
-	defer server.Close()
-	home := writeUploadConfigWithHome(t, server.URL, "fixture")
-	store := appendDeleteHistory(t, home, history.Entry{ID: "Ab12Cd34", URL: server.URL + "/Ab12Cd34", Path: file})
-	before, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
-	var out bytes.Buffer
-	command := &cobra.Command{}
-	command.SetOut(&out)
-	command.SetErr(io.Discard)
-	if err := runUpdate(command, []string{"Ab12Cd34", file}); err == nil {
-		t.Fatal("update unexpectedly succeeded")
+	for _, tc := range []struct {
+		name, marker string
+		status       int
+		unreachable  bool
+	}{
+		{name: "auth failure", status: http.StatusUnauthorized},
+		{name: "unmarked 404 from an older Worker", status: http.StatusNotFound},
+		{name: "concurrent change", marker: "changed", status: http.StatusConflict},
+		{name: "storage error", status: http.StatusInternalServerError},
+		{name: "transport failure", unreachable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "source.html")
+			writeUploadTestFile(t, file, "content")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Docs-Update-Result", tc.marker)
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+			home := writeUploadConfigWithHome(t, server.URL, "fixture")
+			if tc.unreachable {
+				server.Close()
+			}
+			store := appendDeleteHistory(t, home, history.Entry{ID: "Ab12Cd34", URL: server.URL + "/Ab12Cd34", Path: file})
+			before, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
+			var out bytes.Buffer
+			command := &cobra.Command{}
+			command.SetOut(&out)
+			command.SetErr(io.Discard)
+			if err := runUpdate(command, []string{"Ab12Cd34", file}); err == nil {
+				t.Fatal("update unexpectedly succeeded")
+			}
+			after, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
+			if !bytes.Equal(before, after) || out.Len() != 0 {
+				t.Fatal("failed update changed history or advertised success")
+			}
+			assertDeleteHistoryIDs(t, store, []string{"Ab12Cd34"})
+		})
 	}
-	after, _ := os.ReadFile(filepath.Join(home, ".config", "docs", "uploads.json"))
-	if !bytes.Equal(before, after) || out.Len() != 0 {
-		t.Fatal("failed update changed history or advertised success")
-	}
-	assertDeleteHistoryIDs(t, store, []string{"Ab12Cd34"})
 }
 
 // Older CLIs stored paths as typed. Updating from another directory must not publish whatever
