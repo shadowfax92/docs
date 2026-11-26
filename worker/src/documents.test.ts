@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDocuments } from "./documents";
 import type { DocumentSummary } from "./contracts";
+import { createInvocationResources } from "./invocation-budget";
 
 const origin = "https://docs.example";
 const firstId = "Ab12Cd34";
@@ -417,10 +418,10 @@ describe("Documents reviewed removal", () => {
     expect(bucket.deletedBatches.map((keys) => keys.length)).toEqual([1000]);
     bucket.beforeList = undefined;
     bucket.beforeDelete = undefined;
-    const remaining = (await documents.resolve(firstId))!.summary;
-    expect(remaining.objectCount).toBe(1005);
-    expect((await documents.remove(firstId, summary.version)).status).toBe("changed");
-    expect(await documents.remove(firstId, remaining.version)).toEqual({ status: "deleted", deletedObjectCount: 1005 });
+    // Publication is already tombstoned even when physical reclamation is interrupted.
+    // Retrying finishes the remaining bytes without ever making the ID readable again.
+    expect(await documents.resolve(firstId)).toBeNull();
+    expect(await documents.remove(firstId, summary.version)).toEqual({ status: "not-found", deletedObjectCount: 0 });
     expect(bucket.deletedBatches.map((keys) => keys.length)).toEqual([1000, 1000, 5]);
   });
 
@@ -459,7 +460,138 @@ describe("Documents reviewed removal", () => {
       await seed(bucket, `${firstId}/external-new.txt`);
     };
     expect(await documents.remove(firstId)).toEqual({ status: "deleted", deletedObjectCount: 1 });
-    expect((await documents.resolve(firstId))?.summary.filename).toBe("external-new.txt");
+    expect(bucket.entries.has(`${firstId}/external-new.txt`)).toBe(true);
+    expect(await documents.resolve(firstId)).toBeNull();
+  });
+});
+
+describe("Documents stable-URL updates", () => {
+  const input = (body = "replacement") => ({ body: new Response(body).body, filename: "revised.md", mime: "text/markdown" });
+
+  it("migrates a legacy upload, preserves its title and discovers one current document across page seams", async () => {
+    const bucket = new LocalBucket();
+    bucket.pageSize = 1;
+    await seed(bucket, `${firstId}/report.html`, "old", { customMetadata: { filename: "report.html", docName: "Original title", contentType: "text/html" } });
+    const documents = createDocuments(bucket.binding(), origin);
+    const before = (await documents.resolve(firstId))!.summary;
+    const result = await documents.update(firstId, input());
+    expect(result).toMatchObject({ status: "updated", document: { publicUrl: before.publicUrl, id: firstId, filename: "revised.md", title: "Original title", objectCount: 1 } });
+    const current = (await documents.resolve(firstId))!;
+    expect(await (await current.openBody())!.text()).toBe("replacement");
+    expect((await discover(bucket))).toEqual([current.summary]);
+    expect((await documents.remove(firstId, before.version)).status).toBe("changed");
+    const next = await documents.update(firstId, { ...input("second"), title: "Revised title" });
+    expect(next).toMatchObject({ status: "updated", document: { title: "Revised title", publicUrl: before.publicUrl } });
+    expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toHaveLength(1);
+  });
+
+  it("keeps the original public until commit and after a failed staging write", async () => {
+    const bucket = new LocalBucket();
+    await seed(bucket, `${firstId}/report.html`, "original");
+    const documents = createDocuments(bucket.binding(), origin);
+    const before = (await documents.resolve(firstId))!.summary;
+    bucket.beforePut = async (key) => {
+      const current = (await documents.resolve(firstId))!;
+      expect(await (await current.openBody())!.text()).toBe("original");
+      if (key.startsWith("__docs_internal/revisions/")) throw new Error("staging failed");
+    };
+    await expect(documents.update(firstId, input())).rejects.toThrow("staging failed");
+    expect((await documents.resolve(firstId))!.summary).toEqual(before);
+  });
+
+  it("allows only one of two concurrent updates to publish over the marker both read", async () => {
+    const bucket = new LocalBucket();
+    await seed(bucket, `${firstId}/report.txt`, "original");
+    const documents = createDocuments(bucket.binding(), origin);
+    let arrivals = 0;
+    let release!: () => void;
+    const both = new Promise<void>((resolve) => { release = resolve; });
+    bucket.beforePut = async (key) => {
+      if (key === `${firstId}/`) { if (++arrivals === 2) release(); await both; }
+    };
+    const outcomes = await Promise.all([documents.update(firstId, input("one")), documents.update(firstId, input("two"))]);
+    expect(outcomes.map((result) => result.status).sort()).toEqual(["changed", "updated"]);
+    expect(["one", "two"]).toContain(await (await (await documents.resolve(firstId))!.openBody())!.text());
+    expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toHaveLength(1);
+  });
+
+  it("never revives an upload when deletion wins against a paused first update", async () => {
+    const bucket = new LocalBucket();
+    await seed(bucket, `${firstId}/report.txt`, "original");
+    const documents = createDocuments(bucket.binding(), origin);
+    const before = (await documents.resolve(firstId))!.summary;
+    let arrived!: () => void, resume!: () => void;
+    const paused = new Promise<void>((resolve) => { arrived = resolve; });
+    const release = new Promise<void>((resolve) => { resume = resolve; });
+    bucket.beforePut = async (key) => { if (key === `${firstId}/`) { bucket.beforePut = undefined; arrived(); await release; } };
+    const update = documents.update(firstId, input());
+    await paused;
+    expect((await documents.remove(firstId, before.version)).status).toBe("deleted");
+    resume();
+    expect(await update).toEqual({ status: "changed" });
+    expect(await documents.resolve(firstId)).toBeNull();
+    expect(await discover(bucket)).toEqual([]);
+    expect(await documents.update(firstId, input())).toEqual({ status: "not-found" });
+    expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toEqual([]);
+  });
+
+  it("refuses a reviewed deletion when an update publishes after its version check", async () => {
+    const bucket = new LocalBucket();
+    await seed(bucket, `${firstId}/report.txt`, "original");
+    const documents = createDocuments(bucket.binding(), origin);
+    await documents.update(firstId, input("first revision"));
+    const before = (await documents.resolve(firstId))!.summary;
+    let arrived!: () => void, resume!: () => void;
+    const paused = new Promise<void>((resolve) => { arrived = resolve; });
+    const release = new Promise<void>((resolve) => { resume = resolve; });
+    bucket.beforePut = async (key) => { if (key === `${firstId}/`) { bucket.beforePut = undefined; arrived(); await release; } };
+    const deletion = documents.remove(firstId, before.version);
+    await paused;
+    expect((await documents.update(firstId, input("latest revision"))).status).toBe("updated");
+    resume();
+    expect((await deletion).status).toBe("changed");
+    const current = (await documents.resolve(firstId))!;
+    expect(await (await current.openBody())!.text()).toBe("latest revision");
+    expect((await documents.remove(firstId, current.summary.version)).status).toBe("deleted");
+    expect(await documents.resolve(firstId)).toBeNull();
+    expect([...bucket.entries.keys()].filter((key) => key.startsWith("__docs_internal/revisions/"))).toEqual([]);
+  });
+
+  it("never creates an ID when the requested upload is absent", async () => {
+    const bucket = new LocalBucket();
+    const documents = createDocuments(bucket.binding(), origin);
+    expect(await documents.update(firstId, input())).toEqual({ status: "not-found" });
+    expect(bucket.entries.size).toBe(0);
+  });
+
+  it("discovers more updated IDs than the invocation operation limit in one bounded page", async () => {
+    const bucket = new LocalBucket();
+    const documents = createDocuments(bucket.binding(), origin);
+    for (let index = 0; index < 45; index++) {
+      const id = `Upd${String(index).padStart(5, "0")}`;
+      await seed(bucket, `${id}/source.txt`, "original");
+      expect((await documents.update(id, input())).status).toBe("updated");
+    }
+    const resources = createInvocationResources(() => { throw new Error("Discovery must not use D1"); }, bucket.binding());
+    const page = await createDocuments(resources.bucket, origin).page();
+    expect(page.items).toHaveLength(45);
+    expect(page.scanComplete).toBe(true);
+    expect(resources.budget.remaining).toBeGreaterThan(0);
+  });
+
+  it("retains published bytes when R2 commits the marker but its response is lost", async () => {
+    const bucket = new LocalBucket();
+    await seed(bucket, `${firstId}/source.txt`, "original");
+    const documents = createDocuments(bucket.binding(), origin);
+    const put = bucket.put.bind(bucket);
+    vi.spyOn(bucket, "put").mockImplementation(async (...args) => {
+      const result = await put(...args);
+      if (args[0] === `${firstId}/`) throw new Error("publish response lost");
+      return result;
+    });
+    await expect(documents.update(firstId, input())).rejects.toThrow("publish response lost");
+    const published = (await documents.resolve(firstId))!;
+    expect(await (await published.openBody())!.text()).toBe("replacement");
   });
 });
 

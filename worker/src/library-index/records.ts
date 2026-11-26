@@ -254,19 +254,28 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
       FROM deleted_ids WHERE id=?`, id)).first<DeletionClaim & { state: string }>();
   }
 
+  async function upkeep(summary: DocumentSummary): Promise<void> {
+    try {
+      await ingest(summary, deps.now());
+      // Attach the rejection handler before handing lifetime to waitUntil. R2 publication
+      // remains successful even if derived-index maintenance or defer itself refuses work.
+      const work = (async () => { const owned = await claim(summary); if (owned) await index(owned); })()
+        .catch(() => { safeLog("deferred-index"); });
+      deps.defer(work);
+    } catch { safeLog("upload-upkeep"); }
+  }
+
   const records: LibraryRecords = {
     documents: {
       async create(input) {
         const summary = await deps.documents.create(input);
-        try {
-          await ingest(summary, deps.now());
-          // Attach the rejection handler before handing lifetime to waitUntil. It never leaks raw
-          // backend errors or loses a successful R2 response, even when defer itself refuses work.
-          const work = (async () => { const owned = await claim(summary); if (owned) await index(owned); })()
-            .catch(() => { safeLog("deferred-index"); });
-          deps.defer(work);
-        } catch { safeLog("upload-upkeep"); }
+        await upkeep(summary);
         return summary;
+      },
+      async update(id, input) {
+        const result = await deps.documents.update(id, input);
+        if (result.status === "updated") await upkeep(result.document);
+        return result;
       },
       page: (cursor) => deps.documents.page(cursor),
       resolve: (id) => deps.documents.resolve(id),
@@ -289,6 +298,12 @@ export function createLibraryRecords(deps: LibraryDependencies): LibraryRecords 
         const result = await deps.documents.remove(id, expectedVersion);
         const completed = result.status === "changed" ? await restoreDeletion(owned) : await finalizeDeletion(owned);
         if (!completed) throw unavailable(); // A late loser must never advertise another operation's success.
+        if (result.status === "changed") {
+          // An update may have published while this delete temporarily hid the index row.
+          // Restore first, then ingest the current version so its new body/name can be indexed.
+          try { const current = await deps.documents.resolve(id); if (current) await upkeep(current.summary); }
+          catch { safeLog("update-upkeep"); }
+        }
         return result;
       },
     },
@@ -358,4 +373,4 @@ function isAdmission(error: unknown): boolean { return error instanceof Invocati
 function isStorageFull(error: unknown): boolean {
   return error instanceof Error && /SQLITE_FULL|Exceeded maximum DB size|database or disk is full|storage (?:limit|quota)|database.*(?:size|storage).*limit/i.test(error.message);
 }
-function safeLog(category: "upload-upkeep" | "deferred-index") { console.warn("library-records", { category }); }
+function safeLog(category: "upload-upkeep" | "update-upkeep" | "deferred-index") { console.warn("library-records", { category }); }

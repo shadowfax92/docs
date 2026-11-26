@@ -18,6 +18,14 @@ export interface RemoveResult {
   status: "deleted" | "not-found" | "changed";
   deletedObjectCount: number;
 }
+export interface DocumentInput {
+  body: ReadableStream | null;
+  filename: string;
+  mime: string;
+  title: string;
+}
+export type UpdateResult = { status: "updated"; document: DocumentSummary }
+  | { status: "not-found" | "changed" };
 
 /** Owns R2 key resolution and mutation. Native R2 is the external dependency, replaced only in tests.
  * Create streams must have a known length, as required by native R2 (pass the original Request.body).
@@ -26,13 +34,14 @@ export interface RemoveResult {
  * groups over 10,000 objects or 128 prefix pages fail explicitly rather than returning partial IDs.
  * Catalog signs the opaque continuation before exposing it. Pages observe a changing corpus, not
  * an atomic snapshot; even empty pages must be followed while nextCursor is non-null.
- * Reviewed removal requires permanent ID ownership and checks the captured version again before
- * deleting. R2 has no conditional delete: this relies on all writers using immutable reservations,
- * and cannot protect against concurrent out-of-band/S3 replacement. Legacy versionless removal
- * retains its weaker captured-prefix semantics. Partial batch failures throw; refresh before retry.
+ * An updated ID has a permanent ID/ publication marker and immutable private revision bytes.
+ * Updates and deletions conditionally replace that marker; deleting a captured payload can never
+ * remove a concurrent replacement. A deletion marker is terminal, even if byte cleanup fails.
+ * All deployed writers must understand this protocol; out-of-band/S3 writes remain unsupported.
  */
 export interface Documents {
-  create(input: { body: ReadableStream | null; filename: string; mime: string; title: string }): Promise<DocumentSummary>;
+  create(input: DocumentInput): Promise<DocumentSummary>;
+  update(id: UploadId, input: Omit<DocumentInput, "title"> & { title?: string }): Promise<UpdateResult>;
   page(cursor?: string): Promise<CatalogPage>;
   resolve(id: UploadId): Promise<ResolvedDocument | null>;
   remove(id: UploadId, expectedVersion?: string): Promise<RemoveResult>;
@@ -48,6 +57,18 @@ const MAX_PREFIX_PAGES = 128;
 const METADATA: ("customMetadata" | "httpMetadata")[] = ["customMetadata", "httpMetadata"];
 const reservationKey = (id: UploadId) => `__docs_internal/reservations/${id}`;
 const absentOnly = () => ({ onlyIf: new Headers({ "If-None-Match": "*" }) });
+const revisionKey = (id: UploadId, revision: string) => `__docs_internal/revisions/${id}/${revision}`;
+type DocumentObject = Pick<R2Object, "key" | "version" | "etag" | "size" | "uploaded" | "customMetadata" | "httpMetadata">;
+
+/** The marker is the publication boundary, never document content. Its body contains a fresh
+ * nonce so even repeated deletes/identical bytes have distinct ETags for compare-and-swap.
+ * Private staged bytes stay invisible until publication, including during a legacy ID's first update.
+ */
+type Publication = { kind: "legacy"; marker: R2Object | null; objects: DocumentObject[] }
+  | { kind: "active"; marker: R2Object; revision: string; objects: [DocumentObject] }
+  | { kind: "deleted"; marker: R2Object; revision: string | null };
+type PublicationChange = { state: "active"; revision: string; object: DocumentObject }
+  | { state: "deleted"; revision: string | null };
 
 /** Only traversal state crosses requests, never client-supplied keys or buffered object metadata.
  * The trailing ID is resolved completely on the page that first observes it, then skipped on later
@@ -115,6 +136,53 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
     throw new Error("Could not reserve a unique upload ID");
   }
 
+  function publication(id: UploadId, objects: R2Object[]): Publication {
+    const marker = objects.find((object) => object.key === `${id}/`) ?? null;
+    const state = marker?.customMetadata?.docsState;
+    if (state === undefined) return { kind: "legacy", marker, objects };
+    const revision = marker?.customMetadata?.docsRevision ?? "";
+    if (marker && state === "deleted" && (!revision || /^[a-f0-9-]{36}$/.test(revision))) return { kind: "deleted", marker, revision: revision || null };
+    if (!marker || state !== "active" || !/^[a-f0-9-]{36}$/.test(revision)) throw new Error("Invalid publication marker");
+    // Publication copies the immutable payload's server-returned identity/metadata atomically.
+    // Discovery can summarize 200 updated IDs without 200 extra R2 HEADs (one invocation has
+    // a shared 40-operation budget). openBody still checks the actual payload version and ETag.
+    const meta = marker.customMetadata ?? {};
+    const size = Number(meta.docsPayloadSize);
+    const uploaded = new Date(meta.docsPayloadUploadedAt);
+    if (!meta.docsPayloadVersion || !meta.docsPayloadEtag || !/^\d+$/.test(meta.docsPayloadSize ?? "")
+      || !Number.isSafeInteger(size) || !Number.isFinite(uploaded.getTime())) throw new Error("Invalid revision metadata");
+    const object: DocumentObject = {
+      key: revisionKey(id, revision), version: meta.docsPayloadVersion, etag: meta.docsPayloadEtag,
+      size, uploaded, customMetadata: meta,
+    };
+    return { kind: "active", marker, revision, objects: [object] };
+  }
+
+  function publish(id: UploadId, previous: R2Object | null, change: PublicationChange) {
+    const { state, revision } = change;
+    return bucket.put(`${id}/`, JSON.stringify({ state, revision, nonce: crypto.randomUUID() }), {
+      ...(previous ? { onlyIf: { etagMatches: previous.etag } } : absentOnly()),
+      customMetadata: {
+        ...(change.state === "active" ? {
+          ...change.object.customMetadata,
+          docsPayloadVersion: change.object.version, docsPayloadEtag: change.object.etag,
+          docsPayloadSize: String(change.object.size), docsPayloadUploadedAt: change.object.uploaded.toISOString(),
+        } : {}),
+        docsState: state, ...(revision ? { docsRevision: revision } : {}),
+      },
+    });
+  }
+
+  async function deleteObjects(keys: string[]): Promise<void> {
+    for (let offset = 0; offset < keys.length; offset += 1000) await bucket.delete(keys.slice(offset, offset + 1000));
+  }
+
+  async function discard(keys: string[]): Promise<void> {
+    // Publication already decided the result. Cleanup failure must not report an update as
+    // failed after its new bytes became public; retained obsolete bytes have no public route.
+    try { await deleteObjects(keys); } catch { /* Best-effort reclamation of immutable objects. */ }
+  }
+
   return {
     async create(input) {
       const { id, reservation } = await reserveUpload();
@@ -131,6 +199,28 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       // Keep the claim and fail closed rather than buffer/replay owner document bytes.
       if (!object) throw new Error("Upload did not create an object");
       return summarize(id, [object], publicOrigin, { filename, contentType: mime, docName: input.title });
+    },
+    async update(id, input) {
+      if (!isUploadId(id)) return { status: "not-found" };
+      const owned = await ownedObjects(id, true);
+      const current = publication(id, owned);
+      if (current.kind === "deleted" || current.kind === "legacy" && !owned.some((object) => object.key !== `${id}/`)) return { status: "not-found" };
+      const { title } = await summarize(id, current.objects, publicOrigin);
+      const filename = input.filename.replace(/[^\w.\-]/g, "_") || "file";
+      const metadata = { filename, contentType: input.mime || contentType(filename), docName: input.title ?? title };
+      const revision = crypto.randomUUID();
+      const key = revisionKey(id, revision);
+      const object = await bucket.put(key, input.body, { ...absentOnly(), customMetadata: metadata });
+      if (!object) throw new Error("Revision did not create an object");
+      // Do not delete staged bytes on an ambiguous publish exception: an in-flight R2 write
+      // can still commit. Only a definitive conditional refusal proves these bytes are unreferenced.
+      if (!await publish(id, current.marker, { state: "active", revision, object: { ...object, customMetadata: metadata } })) {
+        await discard([key]);
+        return { status: "changed" };
+      }
+      await discard([...owned.filter((item) => item.key !== `${id}/`).map((item) => item.key),
+        ...(current.kind === "active" ? [current.objects[0].key] : [])]);
+      return { status: "updated", document: await summarize(id, [object], publicOrigin, metadata) };
     },
     async page(cursor) {
       const state = cursor === undefined ? null : readCursor(cursor);
@@ -150,9 +240,13 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       if (next && tail) groups.set(tail, await ownedObjects(tail, true));
       const items: DocumentSummary[] = [];
       for (const [id, objects] of groups) {
-        // An ID/ marker alone is not an upload. Beside a file it is still an owned key, so include
-        // it in the version/count exactly as resolve/remove do, even across a cursor page seam.
-        if (objects.some((object) => object.key.length > id.length + 1)) items.push(await summarize(id, objects, publicOrigin));
+        // Legacy ID/ markers count only beside files. Managed markers instead publish one
+        // private revision, or hide the entire ID after deletion, including across page seams.
+        const state = publication(id, objects);
+        if (state.kind !== "deleted" && (state.kind === "active"
+          || objects.some((object) => object.key.length > id.length + 1))) {
+          items.push(await summarize(id, state.objects, publicOrigin));
+        }
       }
       return {
         version: 1, items, scanComplete: !next, observedAt,
@@ -160,8 +254,10 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       };
     },
     async resolve(id) {
-      const objects = await ownedObjects(id, true);
-      if (!objects.length) return null;
+      const owned = await ownedObjects(id, true);
+      const state = publication(id, owned);
+      if (state.kind === "deleted" || state.kind === "legacy" && !owned.some((object) => object.key !== `${id}/`)) return null;
+      const objects = state.objects;
       const summary = await summarize(id, objects, publicOrigin);
       const primary = objects[0];
       let opened = false;
@@ -197,10 +293,21 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
       if (!isUploadId(id)) return { status: "not-found", deletedObjectCount: 0 };
       if (expectedVersion !== undefined && !/^[a-f0-9]{64}$/.test(expectedVersion)) return { status: "changed", deletedObjectCount: 0 };
       const reviewed = expectedVersion !== undefined;
-      const objects = await ownedObjects(id, reviewed);
-      if (!objects.length) return { status: "not-found", deletedObjectCount: 0 };
+      const owned = await ownedObjects(id, true);
+      const state = publication(id, owned);
+      if (state.kind === "deleted") {
+        // Retrying an interrupted deletion finishes captured legacy-byte cleanup without ever
+        // releasing the tombstone or making this ID publishable again.
+        await deleteObjects([...owned.filter((object) => object.key !== `${id}/`).map((object) => object.key),
+          ...(state.revision ? [revisionKey(id, state.revision)] : [])]);
+        return { status: "not-found", deletedObjectCount: 0 };
+      }
+      const objects = state.objects;
+      if (state.kind === "legacy" && !owned.some((object) => object.key !== `${id}/`)) return { status: "not-found", deletedObjectCount: 0 };
       if (reviewed) {
         if (await versionOf(objects) !== expectedVersion) return { status: "changed", deletedObjectCount: 0 };
+      }
+      if (reviewed && state.kind === "legacy") {
         // Claim legacy IDs before deletion so no managed creator can acquire their now-empty
         // prefix. A lost conditional claim is retriable but never authority to proceed this time.
         const claim = await bucket.head(reservationKey(id)) ?? await bucket.put(reservationKey(id), "", {
@@ -218,25 +325,27 @@ export function createDocuments(bucket: R2Bucket, publicOrigin: string): Documen
         const current = await ownedObjects(id, true);
         if (!current.length) return { status: "not-found", deletedObjectCount: 0 };
         if (await versionOf(current) !== expectedVersion) return { status: "changed", deletedObjectCount: 0 };
-        // This is an immutable-writer preflight, not compare-and-delete. External writers must
-        // coordinate before bulk removal; another head/get would not close R2's delete race.
+      }
+      // Tombstone first using the same conditional boundary as updates. The marker survives
+      // cleanup forever; a paused updater can no longer republish after this delete succeeds.
+      if (!await publish(id, state.marker, { state: "deleted", revision: state.kind === "active" ? state.revision : null })) {
+        return { status: "changed", deletedObjectCount: 0 };
       }
       // Freeze every key before the first batch. Listing while deleting can shift cursor pages
       // and skip owned objects. Private claims live outside this prefix and survive every removal.
-      for (let offset = 0; offset < objects.length; offset += 1000) {
-        await bucket.delete(objects.slice(offset, offset + 1000).map((object) => object.key));
-      }
+      await deleteObjects([...owned.filter((object) => object.key !== `${id}/`).map((object) => object.key),
+        ...(state.kind === "active" ? [objects[0].key] : [])]);
       return { status: "deleted", deletedObjectCount: objects.length };
     },
   };
 }
 
-async function versionOf(objects: R2Object[]): Promise<string> {
+async function versionOf(objects: DocumentObject[]): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(objects.map((o) => [o.key, o.version]))));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function summarize(id: UploadId, objects: R2Object[], origin: string, suppliedMetadata?: Record<string, string>): Promise<DocumentSummary> {
+async function summarize(id: UploadId, objects: DocumentObject[], origin: string, suppliedMetadata?: Record<string, string>): Promise<DocumentSummary> {
   const primary = objects[0];
   const meta = suppliedMetadata ?? primary.customMetadata ?? {};
   const filename = meta.filename || primary.key.split("/").pop() || "file";

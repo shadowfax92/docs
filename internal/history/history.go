@@ -17,6 +17,7 @@ type Entry struct {
 	URL        string    `json:"url"`
 	ID         string    `json:"id,omitempty"`
 	Path       string    `json:"path,omitempty"`
+	Folder     bool      `json:"folder,omitempty"`
 }
 
 type Filter struct {
@@ -66,13 +67,43 @@ func (s *Store) Append(entry Entry) error {
 	})
 }
 
+// Upsert replaces the record for one public URL after a confirmed remote update. Comparing
+// URLs keeps equal short IDs on different Workers separate; the file lock prevents lost uploads.
+func (s *Store) Upsert(entry Entry) error {
+	return s.withExclusiveLock(func() error {
+		entries, err := s.read()
+		if err != nil {
+			return err
+		}
+		kept := make([]Entry, 0, len(entries)+1)
+		for _, previous := range entries {
+			if previous.URL != entry.URL {
+				kept = append(kept, previous)
+			}
+		}
+		return s.write(append(kept, entry))
+	})
+}
+
 // RemoveByID atomically removes every entry for one remote upload while preserving unrelated history.
 // An empty ID is never a deletion key because legacy entries may not have stored IDs at all.
 func (s *Store) RemoveByID(id string) (int, error) {
 	if id == "" {
 		return 0, nil
 	}
+	return s.removeWhere(func(entry Entry) bool { return entry.ID == id })
+}
 
+// RemoveByURL forgets one public URL after its Worker reports it missing. Matching the full URL
+// also clears legacy entries without IDs and keeps equal short IDs on other Workers.
+func (s *Store) RemoveByURL(url string) (int, error) {
+	if url == "" {
+		return 0, nil
+	}
+	return s.removeWhere(func(entry Entry) bool { return entry.URL == url })
+}
+
+func (s *Store) removeWhere(match func(Entry) bool) (int, error) {
 	removed := 0
 	err := s.withExclusiveLock(func() error {
 		entries, err := s.read()
@@ -81,7 +112,7 @@ func (s *Store) RemoveByID(id string) (int, error) {
 		}
 		kept := make([]Entry, 0, len(entries))
 		for _, entry := range entries {
-			if entry.ID == id {
+			if match(entry) {
 				removed++
 				continue
 			}

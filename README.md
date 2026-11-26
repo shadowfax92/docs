@@ -15,9 +15,10 @@ Upload any regular file, HTML page, Markdown file, PDF, or folder and get a shor
 - **Downloads when it should** — unknown file types show a download page instead of raw bytes
 - **Folder uploads** — point at a folder to publish one downloadable zip archive
 - **Safe deletion** — remove a shared upload and its matching local history with `docs delete <id>`
+- **Stable links** — `docs update <id-or-url> [file]` replaces content at the same short URL
 - **Short URLs** — `https://your-domain.com/xK9mRt2p` — clean and shareable
 - **Fast & global** — served from Cloudflare's edge network via R2 + Workers
-- **Simple auth** — bearer token for uploads and deletion, public read for viewing
+- **Simple auth** — bearer token for uploads, updates and deletion, public read for viewing
 
 ---
 
@@ -147,12 +148,18 @@ docs upload notes.md             # upload Markdown (safe self-hosted renderer)
 docs upload archive.zip          # upload any file with a download page
 docs upload --folder ./guides    # upload folder as a zip archive
 docs upload --folder ./guides --name Docs # set link preview title
+docs upload --overwrite report.pdf # replace the uniquely recorded upload for this path
+docs update xK9mRt2p report.pdf   # replace content, keep the same URL and title
+docs update https://your-domain.com/xK9mRt2p report.pdf # pasted links work too
+docs update xK9mRt2p              # reuse the recorded source file or folder
+docs reupload xK9mRt2p page.html  # alias for update; keeps the URL
+docs update xK9mRt2p --folder ./guides --name Docs --json # folder, title, machine output
 docs list                        # show the last 10 uploads
 docs list --days 30              # show uploads from the last 30 days
 docs delete xK9mRt2p             # delete an upload by its short ID
 ```
 
-The URL is printed and copied to your clipboard automatically. Regular file uploads
+Fresh uploads print the URL and copy it to your clipboard. Regular file uploads
 stream with an explicit remaining Content-Length, including zero-byte files.
 Standard in-memory readers retain net/http length inference. Unknown-length streams
 are not buffered: the native local R2 harness rejects them with HTTP 500. The
@@ -162,7 +169,78 @@ The mediator owns before/after live compatibility proof and any global CLI insta
 
 When uploading a directory with `--folder`, `docs` recursively packages regular files into a zip archive and uploads that archive. Folder uploads are limited to 200 MB total across all regular files before compression.
 
-Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history file stores the upload time, display name, URL, ID, and source path. If history recording fails, the upload still succeeds.
+Uploads are also recorded locally at `~/.config/docs/uploads.json`. The history file stores the upload time, display name, URL, ID, absolute source path, and whether the source is a folder. If history recording fails, the upload still succeeds.
+
+### Update an existing link
+
+Use `docs upload --overwrite ./report.html` to revise the one URL recorded for
+that absolute source path on the configured Worker. Include `--folder` for a
+directory. If history has no match or several URLs, use `docs update` (or
+`reupload`) and specify the link you want to revise.
+
+```sh
+docs update https://docs.shadowfax92.workers.dev/vPNW0l6j ./report.html
+```
+
+The filename and format may change; the public page, `/raw`, and `/download`
+URLs stay the same. The existing preview title is preserved unless you supply
+`--name`. The command prints the URL to stdout and leaves the clipboard alone.
+For agents, `--json` prints `{url,id,name,version}` with no progress messages.
+Reload an open browser tab to see the new revision.
+
+After a successful update, local history contains one current entry for that URL,
+with the new source path and upload time. Other URLs are preserved, including
+identical IDs on other Workers. `docs update <id-or-url>` reuses that entry's source
+path; a missing path/history entry tells you to provide a file explicitly. Explicit
+directories require `--folder`; remembered folders are archived automatically.
+Relative paths recorded by older versions are never reused, because they would
+resolve against whatever directory you run from; pass the source path once to
+record its absolute path for future updates. Older folder entries need `--folder`
+once to record their source kind.
+
+If the Worker reports the link no longer exists (for example, it was deleted from
+the catalog or another machine), the update fails and, as with `docs delete`,
+removes local history entries for that exact URL. A fresh `docs upload` of the
+same source then becomes its only `--overwrite` target. Other errors leave local
+history unchanged.
+
+Only links from the configured Worker are accepted. A missing upload, unsupported
+Worker, failed request, or concurrent edit never falls back to creating a new
+link. When updates or a deletion race on one link, the Worker publishes at most
+one of them and refuses the rest as a conflict; review the current document before
+retrying. A network failure, unreadable response, or server error (5xx) leaves the
+outcome unknown: the revision may already be live, so check the existing URL
+before retrying. The CLI never retries an update automatically.
+
+The authenticated API is a single `PUT /upload/:id` with the same upload body,
+`X-Filename`, `Content-Type`, and an optional `X-Doc-Name`. It returns `no-store`
+JSON `{url,id,name,version}`. Missing uploads return 404 and a lost concurrent
+publication returns 409, both marked with `X-Docs-Update-Result`. Public responses
+revalidate against the current revision before returning 304; updates do not
+require a new URL or cache-busting query string.
+
+R2 revision bytes are immutable and staged privately. A conditional write to the
+permanent `ID/` marker publishes the revision or tombstones a deletion. Deletion
+can only reclaim its captured immutable objects; it cannot remove another
+publisher's replacement. Successful updates reclaim superseded bytes. Cleanup
+failure or an interrupted/ambiguous publication can retain private orphan bytes;
+there is no automatic orphan collector. Keep publication markers and reservations
+permanent; removing a tombstone would permit a delayed writer to revive the ID.
+
+For the **first rollout of update support**, deploy this source to the catalog
+before the public Worker, retaining the existing bindings and secrets:
+
+```sh
+cd worker
+npx --no-install wrangler deploy --config wrangler.catalog.toml --no-bundle
+npm run deploy:public
+```
+
+Wait for old invocations to finish before issuing updates. Both roles must
+understand publication markers before any are written; the earlier catalog
+cannot safely read/delete them. After this first rollout, the regular deployment
+recipe is safe again. Do not roll either role back to a version without marker
+support once updates or deletions have used this protocol.
 
 `docs delete <id>` authenticates to the Worker, resolves the stored filename from the ID, deletes every object belonging to that upload, and removes only exact matching IDs from local history. If the remote upload is already missing, the command says so and still cleans stale matching history. Authentication, network, or storage errors leave local history unchanged. If remote deletion succeeds but the local history update fails, the error explicitly reports that partial outcome.
 
@@ -170,7 +248,7 @@ A successful deletion makes subsequent requests return `404 Not Found`, includin
 
 ## Preview and search capabilities
 
-The public origin serves documents and bearer uploads/deletes. The separate catalog
+The public origin serves documents and bearer uploads/updates/deletes. The separate catalog
 origin serves only the trusted `/all-docs` app/assets and authenticated inert JSON.
 The catalog never hosts uploaded HTML, raw files, thumbnails or upload fallback.
 Password sessions last 12 hours; locking clears this browser's cookie. Copied
@@ -239,7 +317,8 @@ exact Origin, same-origin Fetch Metadata, catalog header and CSRF. Responses are
 no-store/noindex; uploaded HTML cannot read the index. Deletes hide behind durable
 D1 tombstones before R2 removal; failed R2 deletion stays hidden for later repair.
 Deleted markers and upload reservations are permanent. Unsupported out-of-band
-R2 recreation is reported as an anomaly and never silently indexed.
+R2 recreation under legacy D1-only tombstones is reported as an anomaly and never
+silently indexed; publication tombstones also keep those rewritten IDs unreadable.
 
 ### Persistent index rollout and backfill (operator only)
 
@@ -314,7 +393,7 @@ concurrent storage rather than an atomic snapshot. Selection/review freezes
 explicit ID/version refs and the age cutoff. The server admits at most 100 refs
 per request; the catalog sends one frozen ref per sequential POST so each request
 gets its own bounded SQL/R2 allowance. A single review/global confirmation still
-controls the whole selection; changed/failed/unprocessed selections are preserved. Coordinated immutable
+controls the whole selection; changed/failed/unprocessed selections are preserved. Coordinated publication
 writers and permanent claims are prerequisites described above.
 
 Public raw/download bytes stay exact and support single byte ranges, ETag/If-Range
@@ -419,6 +498,9 @@ docs delete xK9mRt2p   ──▶  DELETE /upload/xK9mRt2p  ──▶  Worker res
 |---------|-------------|
 | `docs upload <file>` | Upload a file and get a short URL |
 | `docs upload --folder <folder>` | Zip and upload a folder |
+| `docs upload --overwrite <file-or-folder>` | Replace the upload uniquely recorded for this source path |
+| `docs update <id-or-url> [file-or-folder]` | Replace a specific upload and keep its URL |
+| `docs --skill` | Print a `SKILL.md` that teaches agents to publish and revise links (save it as `<skills-dir>/docs/SKILL.md`) |
 | `docs list` | Show the last 10 uploads |
 | `docs list --days <n>` | Show uploads from the last `n` days |
 | `docs delete <id>` | Delete a remote upload and reconcile matching local history |

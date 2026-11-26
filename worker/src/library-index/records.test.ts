@@ -344,10 +344,11 @@ describe("LibraryRecords durable deletion races", () => {
     expect(await row(f, summary.id)).toBeNull();
     expect(await generation(f)).toBe(g);
     expect(await f.records.ingest(summary, now, held)).toBe("tombstoned");
-    // Unsupported recreation is an anomaly for maintenance, never authority to index or delete.
-    await seed(f);
+    // Unsupported out-of-band recreation cannot override the permanent R2 publication tombstone.
+    await f.bucket.put(`${summary.id}/note.txt`, "external recreation");
     expect(await f.records.documents.remove(summary.id)).toMatchObject({ status: "not-found" });
-    expect(await f.documents.resolve(summary.id)).not.toBeNull();
+    expect(await f.documents.resolve(summary.id)).toBeNull();
+    expect(await (await f.bucket.get(`${summary.id}/note.txt`))!.text()).toBe("external recreation");
     expect(await matches(f, "needle")).toHaveLength(0);
   }, 20_000);
 
@@ -520,7 +521,7 @@ describe("LibraryRecords shared invocation accounting", () => {
     expect(await f.db.prepare("SELECT count(*) AS n FROM deleted_ids").first("n")).toBe(0);
     const rejectedFinish = invocation(f); await consume(rejectedFinish.db, 25);
     await expect(rejectedFinish.records.documents.remove(summary.id, summary.version)).rejects.toBeInstanceOf(InvocationBudgetExceeded);
-    expect(rejectedFinish.budget.used).toBe(35);
+    expect(rejectedFinish.budget.used).toBe(36); // Includes the conditional R2 tombstone publication.
     expect(await f.documents.resolve(summary.id)).toBeNull();
     expect(await row(f, summary.id)).toMatchObject({ state: "deleting" });
     const owner = await deleting(f, summary.id); now += 600_000;

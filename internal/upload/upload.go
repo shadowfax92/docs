@@ -19,9 +19,13 @@ var httpClient = &http.Client{Timeout: 2 * time.Minute}
 
 const deleteResultHeader = "X-Docs-Delete-Result"
 
+// Response retains the original upload identity and adds the authoritative title/version used
+// by in-place updates and machine-readable CLI output. Older upload responses may omit both.
 type Response struct {
-	URL string `json:"url"`
-	ID  string `json:"id"`
+	URL     string `json:"url"`
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 var extToContentType = map[string]string{
@@ -75,8 +79,18 @@ func detectContentType(filename string, f *os.File) (string, error) {
 
 // UploadContent sends an already-prepared document body through the upload API.
 func UploadContent(cfg *config.Config, filename string, contentType string, content io.Reader, docName string) (*Response, error) {
-	url := strings.TrimRight(cfg.URL, "/") + "/upload"
-	req, err := http.NewRequest(http.MethodPut, url, content)
+	return writeContent(cfg, "", filename, contentType, content, docName)
+}
+
+// writeContent shares the fixed-length streaming contract between new uploads (empty id) and
+// in-place replacements of an existing id. Replacements must never be retried as new uploads.
+func writeContent(cfg *config.Config, id, filename, contentType string, content io.Reader, docName string) (*Response, error) {
+	base := strings.TrimRight(cfg.URL, "/")
+	endpoint := base + "/upload"
+	if id != "" {
+		endpoint += "/" + id
+	}
+	req, err := http.NewRequest(http.MethodPut, endpoint, content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -110,21 +124,33 @@ func UploadContent(cfg *config.Config, filename string, contentType string, cont
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, err)
+		}
 		return nil, fmt.Errorf("upload failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, err)
+		}
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if id != "" {
+			return nil, updateError(base+"/"+id, resp.StatusCode, resp.Header.Get("X-Docs-Update-Result"), string(body))
+		}
 		return nil, fmt.Errorf("upload failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var result Response
 	if err := json.Unmarshal(body, &result); err != nil {
+		if id != "" {
+			return nil, uncertainUpdate(base+"/"+id, fmt.Errorf("invalid response: %w", err))
+		}
 		return nil, fmt.Errorf("invalid response: %w", err)
 	}
 	return &result, nil

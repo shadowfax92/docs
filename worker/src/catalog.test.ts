@@ -38,7 +38,7 @@ function setup(overrides: Partial<CatalogSecurity> = {}, bucket = new AuthBucket
   const page = vi.fn<LibraryIndex["page"]>().mockResolvedValue(libraryPage());
   const resolve = vi.fn<Documents["resolve"]>().mockResolvedValue(null);
   const remove = vi.fn<Documents["remove"]>().mockResolvedValue({ status: "deleted", deletedObjectCount: 1 });
-  const documents: Documents = { create: vi.fn(), page, resolve, remove };
+  const documents: Documents = { create: vi.fn(), update: vi.fn(), page, resolve, remove };
   const search = vi.fn<LibraryIndex["search"]>().mockResolvedValue(searchPage());
   const snippets = vi.fn<LibraryIndex["snippets"]>().mockResolvedValue({ version: 1, generation: 1, hits: [], unavailable: [], remaining: [] });
   const maintain = vi.fn<LibraryIndex["maintain"]>().mockResolvedValue({ version: 1, outcome: "complete", generation: 1, processed: 0, indexed: 0, failed: 0, repaired: 0, reconciledPages: 0, textBytes: 0, status: libraryStatus() });
